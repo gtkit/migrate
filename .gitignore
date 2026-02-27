@@ -1,0 +1,7 @@
+.idea/
+.idea/workspace.xml
+logs/
+/workspace/
+.Ds_Store
+deployment.sh
+.gitlab-ci.yml

@@ -1,0 +1,48 @@
+package {{PackageName}}
+
+import (
+    "context"
+
+    "{{ProjectName}}/internal/models"
+	"{{ProjectName}}/internal/pkg/paginator"
+)
+
+func (r *reposit) Get(ctx context.Context, idstr string) ({{VariableName}} models.{{StructName}}) {
+    r.mdbCtx(ctx).Where("id", idstr).First(&{{VariableName}})
+    return
+}
+
+func (r *reposit) GetBy(ctx context.Context, field, value string) ({{VariableName}} models.{{StructName}}) {
+    r.mdbCtx(ctx).Where("? = ?", field, value).First(&{{VariableName}})
+    return
+}
+
+func (r *reposit) All(ctx context.Context) ({{VariableNamePlural}} []models.{{StructName}}) {
+    r.mdbCtx(ctx).Find(&{{VariableNamePlural}})
+    return
+}
+
+func (r *reposit) IsExist(ctx context.Context, field, value string) bool {
+    var count int64
+    r.mdbCtx(ctx).Model(models.{{StructName}}{}).Where("? = ?", field, value).Count(&count)
+    return count > 0
+}
+
+func (r *reposit) Paginate(ctx context.Context, baseURL string, pagination paginator.Pagination, args ...any) (*models.{{StructName}}ListPaging, error) {
+    var (
+    		{{VariableNamePlural}} []*models.{{StructName}}
+    		paging  paginator.Paging
+    	)
+
+    db := r.mdbCtx(ctx).Model(models.{{StructName}}{})
+    paging = paginator.Paginate(db, &{{VariableNamePlural}}, baseURL, paginator.Pagination{
+    		Page:     pagination.Page,
+    		PageSize: pagination.PageSize,
+    		Order:    "desc",
+    	}, args)
+
+    return &models.{{StructName}}ListPaging{
+    		List:   {{VariableNamePlural}},
+    		Paging: paging,
+    	}, nil
+}

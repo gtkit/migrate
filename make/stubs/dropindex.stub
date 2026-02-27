@@ -1,0 +1,23 @@
+package migrations
+
+import (
+    "github.com/gtkit/logger"
+    "gorm.io/gorm"
+
+    "{{ProjectName}}/internal/models"
+
+    "github.com/gtkit/migrate/console"
+    "github.com/gtkit/migrate/migration"
+)
+
+func init() {
+    up := func(db *gorm.DB) {
+        if err := db.Migrator().DropIndex(&models.{{StructName}}{}, "{{ColumnName}}"); err != nil {
+            logger.Errorf("failed to auto migrate {{StructName}} table: %v", err)
+        }
+    }
+
+
+    migration.Add("{{FileName}}", up, nil)
+    console.Success("{{FileName}} migration added")
+}
