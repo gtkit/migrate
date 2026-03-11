@@ -7,24 +7,51 @@ import (
 	"{{ProjectName}}/internal/pkg/paginator"
 )
 
-func (r *reposit) Get(ctx context.Context, idstr string) ({{VariableName}} models.{{StructName}}) {
-    r.mdbCtx(ctx).Where("id", idstr).First(&{{VariableName}})
+func (r *reposit) Get(ctx context.Context, idstr string) ({{VariableName}} *models.{{StructName}}) {
+    if err := r.mdbCtx(ctx).Where("id", idstr).First(&{{VariableName}}).Error; err != nil {
+        return nil
+    }
     return
 }
 
-func (r *reposit) GetBy(ctx context.Context, field, value string) ({{VariableName}} models.{{StructName}}) {
-    r.mdbCtx(ctx).Where("? = ?", field, value).First(&{{VariableName}})
+func (r *reposit) GetBy(ctx context.Context, field, value string) ({{VariableName}} *models.{{StructName}}) {
+    allowedFields := map[string]bool{
+            "id":    true,
+            // ... 其他允许的字段
+        }
+
+    if !allowedFields[field] {
+        // 处理非法字段名
+        return
+    }
+
+    if err := r.mdbCtx(ctx).Where(fmt.Sprintf("%s = ?", field), value).First(&{{VariableName}}).Error; err != nil {
+        return nil
+    }
     return
 }
 
 func (r *reposit) All(ctx context.Context) ({{VariableNamePlural}} []models.{{StructName}}) {
-    r.mdbCtx(ctx).Find(&{{VariableNamePlural}})
+    if err := r.mdbCtx(ctx).Find(&{{VariableNamePlural}}).Error; err != nil {
+        return nil
+    }
     return
 }
 
 func (r *reposit) IsExist(ctx context.Context, field, value string) bool {
     var count int64
-    r.mdbCtx(ctx).Model(models.{{StructName}}{}).Where("? = ?", field, value).Count(&count)
+
+    allowedFields := map[string]bool{
+                "id":    true,
+                // ... 其他允许的字段
+            }
+
+    if !allowedFields[field] {
+        // 处理非法字段名
+        return
+    }
+
+    r.mdbCtx(ctx).Model(models.{{StructName}}{}).Where(fmt.Sprintf("%s = ?", field), value).Count(&count)
     return count > 0
 }
 
