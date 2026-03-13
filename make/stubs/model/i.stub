@@ -17,9 +17,9 @@ func _() {
 
 type Repositer interface {
 	i()
-	Get(ctx context.Context, idstr string) ({{VariableName}} models.{{StructName}})
-	GetBy(ctx context.Context, field, value string) ({{VariableName}} models.{{StructName}})
-	All(ctx context.Context) ({{VariableName}} []models.{{StructName}})
+	Get(ctx context.Context, idstr string, fields ...string) ({{VariableName}} models.{{StructName}}, err error)
+	GetBy(ctx context.Context, field, value string) ({{VariableName}} models.{{StructName}}, err error)
+	All(ctx context.Context, fields ...string) ([]*models.{{StructName}}, error)
 	IsExist(ctx context.Context, field, value string) bool
 	Paginate(ctx context.Context, baseURL string, pagination paginator.Pagination, args ...any) (*models.{{StructName}}ListPaging, error)
 }
