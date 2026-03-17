@@ -1,4 +1,4 @@
-// Package make 命令行的 make 命令
+// Package make 命令行的 make 命令.
 package make
 
 import (
@@ -13,36 +13,24 @@ import (
 )
 
 // Model 参数解释
-// 单个词，用户命令传参，以 User 模型为例：
-//   - user
-//   - User
-//   - users
-//   - Users
 //
-// 整理好的数据：
+// 单个词，以 User 模型为例：
 //
 //	{
 //	    "TableName": "users",
 //	    "StructName": "User",
-//	    "StructNamePlural": "Users"
+//	    "StructNamePlural": "Users",
 //	    "VariableName": "user",
 //	    "VariableNamePlural": "users",
 //	    "PackageName": "user"
 //	}
 //
-// -
-// 两个词或者以上，用户命令传参，以 TopicComment 模型为例：
-//   - topic_comment
-//   - topic_comments
-//   - TopicComment
-//   - TopicComments
-//
-// 整理好的数据：
+// 两个词以上，以 TopicComment 模型为例：
 //
 //	{
 //	    "TableName": "topic_comments",
 //	    "StructName": "TopicComment",
-//	    "StructNamePlural": "TopicComments"
+//	    "StructNamePlural": "TopicComments",
 //	    "VariableName": "topicComment",
 //	    "VariableNamePlural": "topicComments",
 //	    "PackageName": "topic_comment"
@@ -59,8 +47,6 @@ type Model struct {
 	ColumnName         string
 }
 
-// stubsFS 方便我们后面打包这些 .stub 为后缀名的文件
-
 //go:embed stubs
 var stubsFS embed.FS
 
@@ -71,7 +57,6 @@ var CmdMake = &cobra.Command{
 }
 
 func init() {
-	// 注册 make 的子命令
 	CmdMake.AddCommand(
 		CmdMakeCMD,
 		CmdMakeModel,
@@ -95,18 +80,19 @@ func makeModelFromString(project, action, name, column string) Model {
 	return model
 }
 
-// createFileFromStub 读取 stub 文件并进行变量替换
-// 最后一个选项可选，如若传参，应传 map[string]string 类型，作为附加的变量搜索替换.
-func createFileFromStub(filePath string, stubName string, model Model, variables ...any) {
-	// 实现最后一个参数可选
+// createFileFromStub 读取 stub 文件并进行变量替换.
+// 最后一个选项可选，如若传参，应传 map[string]string 类型作为附加的变量替换.
+func createFileFromStub(filePath, stubName string, model Model, variables ...any) {
 	replaces := make(map[string]string)
 	if len(variables) > 0 {
-		replaces = variables[0].(map[string]string)
+		if m, ok := variables[0].(map[string]string); ok {
+			replaces = m
+		}
 	}
 
 	// 目标文件已存在
 	if file.Exists(filePath) {
-		if strings.Contains(filePath, "models") { // 若是 models 文件，则不提示覆盖
+		if strings.Contains(filePath, "models") {
 			return
 		}
 		console.Exit(filePath + " already exists!")
@@ -120,7 +106,7 @@ func createFileFromStub(filePath string, stubName string, model Model, variables
 
 	modelStub := string(modelData)
 
-	// 添加默认的替换变量
+	// 默认替换变量
 	replaces["{{VariableName}}"] = model.VariableName
 	replaces["{{VariableNamePlural}}"] = model.VariableNamePlural
 	replaces["{{StructName}}"] = model.StructName
@@ -131,17 +117,13 @@ func createFileFromStub(filePath string, stubName string, model Model, variables
 	replaces["{{ProjectName}}"] = model.ProjectName
 	replaces["{{ColumnName}}"] = model.ColumnName
 
-	// 对模板内容做变量替换
 	for search, replace := range replaces {
 		modelStub = strings.ReplaceAll(modelStub, search, replace)
 	}
 
-	// 存储到目标文件中
-	err = file.Put([]byte(modelStub), filePath)
-	if err != nil {
+	if err := file.Put([]byte(modelStub), filePath); err != nil {
 		console.Exit(err.Error())
 	}
 
-	// 提示成功
 	console.Success(fmt.Sprintf("[%s] created.", filePath))
 }

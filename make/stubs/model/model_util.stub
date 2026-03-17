@@ -19,7 +19,7 @@ func (r *reposit) Get(ctx context.Context, idstr string, fields ...string) ({{Va
     return
 }
 
-func (r *reposit) GetBy(ctx context.Context, field, value string) ({{VariableName}} *models.{{StructName}}) {
+func (r *reposit) GetBy(ctx context.Context, field, value string) ({{VariableName}} *models.{{StructName}}, err error) {
     allowedFields := map[string]bool{
             "id":    true,
             // ... 其他允许的字段
@@ -31,7 +31,7 @@ func (r *reposit) GetBy(ctx context.Context, field, value string) ({{VariableNam
     }
 
     if err := r.mdbCtx(ctx).Where(fmt.Sprintf("%s = ?", field), value).First(&{{VariableName}}).Error; err != nil {
-        return nil
+        return nil, err
     }
     return
 }

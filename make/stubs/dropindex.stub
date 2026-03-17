@@ -6,18 +6,17 @@ import (
 
     "{{ProjectName}}/internal/models"
 
-    "github.com/gtkit/migrate/console"
     "github.com/gtkit/migrate/migration"
 )
 
 func init() {
-    up := func(db *gorm.DB) {
+    up := func(db *gorm.DB) error {
         if err := db.Migrator().DropIndex(&models.{{StructName}}{}, "{{ColumnName}}"); err != nil {
-            logger.Errorf("failed to auto migrate {{StructName}} table: %v", err)
+            logger.Errorf("failed to drop index {{ColumnName}} from {{StructName}}: %v", err)
+            return err
         }
+        return nil
     }
 
-
     migration.Add("{{FileName}}", up, nil)
-    console.Success("{{FileName}} migration added")
 }

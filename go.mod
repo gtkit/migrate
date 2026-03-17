@@ -6,7 +6,6 @@ require (
 	github.com/gtkit/logger v1.3.0
 	github.com/gtkit/stringx v1.1.5
 	github.com/mgutz/ansi v0.0.0-20200706080929-d51e80ef957d
-	github.com/pkg/errors v0.9.1
 	github.com/spf13/cobra v1.10.2
 	gorm.io/gorm v1.31.1
 )

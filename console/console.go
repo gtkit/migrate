@@ -1,4 +1,4 @@
-// Package console 命令行辅助方法
+// Package console 命令行辅助方法.
 package console
 
 import (
@@ -24,12 +24,14 @@ func Warning(msg string) {
 }
 
 // Exit 打印一条报错消息，并退出 os.Exit(1).
+// 注意：仅限 CLI 入口使用，库代码不应调用此方法.
 func Exit(msg string) {
 	Error(msg)
 	os.Exit(1)
 }
 
 // ExitIf 语法糖，自带 err != nil 判断.
+// 注意：仅限 CLI 入口使用，库代码不应调用此方法.
 func ExitIf(err error) {
 	if err != nil {
 		Exit(err.Error())

@@ -1,20 +1,17 @@
-.PHONY: tool check  tag gittag
+.PHONY: lint check tag gittag
 
 GO ?= go
-GO_VERSION=$(shell $(GO) version | cut -c 14- | cut -d' ' -f1 | cut -d'.' -f2)
-
 LINT_TARGETS ?= ./...
-tool: ## Lint Go code with the installed golangci-lint
-	@ echo "▶️ golangci-lint run"
+
+lint:
+	@echo "▶️  golangci-lint run"
 	golangci-lint run $(LINT_TARGETS)
 	gofumpt -l -w .
-	@ echo "✅ golangci-lint run"
+	@echo "✅ golangci-lint run"
 
-## govulncheck 检查漏洞 go install golang.org/x/vuln/cmd/govulncheck@latest
 check:
 	govulncheck $(LINT_TARGETS)
 
-## 推送标签到远程仓库时，通常不需要指定分支
 tag:
 	@current=$$(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' version.go | head -n1 | tr -d 'v'); \
 	if [ -z "$$current" ]; then echo "version not found in version.go"; exit 1; fi; \

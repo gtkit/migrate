@@ -1,93 +1,128 @@
 package migration
 
 import (
-	"errors"
+	"fmt"
 
-	"github.com/gtkit/migrate/console"
 	"gorm.io/gorm"
 )
 
-// SQLDB DB 对象
-// var DB *gorm.DB.
-//var SQLDB *sql.DB
+// DBType 数据库类型.
+type DBType string
 
-// 获取当前数据库名称.
-func CurrentDatabase(db *gorm.DB) (dbname string) {
-	dbname = db.Migrator().CurrentDatabase()
+const (
+	DBTypeMySQL    DBType = "mysql"
+	DBTypePostgres DBType = "postgres"
+	DBTypeSQLite   DBType = "sqlite"
+)
 
-	return
-}
-
-func DeleteAllTables(dbType string, db *gorm.DB) error {
-	var err error
-	switch dbType {
+// DetectDBType 从 GORM Dialector 自动检测数据库类型.
+func DetectDBType(db *gorm.DB) DBType {
+	name := db.Dialector.Name()
+	switch name {
 	case "mysql":
-		err = deleteMySQLTables(db)
+		return DBTypeMySQL
+	case "postgres":
+		return DBTypePostgres
 	case "sqlite":
-		err = deleteAllSqliteTables(db)
+		return DBTypeSQLite
 	default:
-		panic(errors.New("database connection not supported"))
+		return DBType(name)
 	}
-
-	return err
 }
 
-// 删除所有 sqlite 表.
-func deleteAllSqliteTables(db *gorm.DB) error {
-	tables := []string{}
-
-	// 读取所有数据表
-	err := db.Select(&tables, "SELECT name FROM sqlite_master WHERE type='table'").Error
-	if err != nil {
-		return err
-	}
-
-	// 删除所有表
-	for _, table := range tables {
-		err := db.Migrator().DropTable(table)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+// CurrentDatabase 获取当前数据库名称.
+func CurrentDatabase(db *gorm.DB) string {
+	return db.Migrator().CurrentDatabase()
 }
 
-// 删除所有 MySQL 表.
+// DeleteAllTables 删除所有用户表.
+func DeleteAllTables(db *gorm.DB) error {
+	dbType := DetectDBType(db)
+	switch dbType {
+	case DBTypeMySQL:
+		return deleteMySQLTables(db)
+	case DBTypePostgres:
+		return deletePostgresTables(db)
+	case DBTypeSQLite:
+		return deleteSQLiteTables(db)
+	default:
+		return fmt.Errorf("unsupported database type: %s", dbType)
+	}
+}
+
 func deleteMySQLTables(db *gorm.DB) error {
 	dbname := CurrentDatabase(db)
-	tables := []string{}
 
-	// 读取所有数据表
+	var tables []string
 	err := db.Table("information_schema.tables").
 		Where("table_schema = ?", dbname).
 		Pluck("table_name", &tables).
 		Error
 	if err != nil {
-		return err
+		return fmt.Errorf("list mysql tables: %w", err)
 	}
 
-	// 暂时关闭外键检测
-	db.Exec("SET foreign_key_checks = 0;")
+	if len(tables) == 0 {
+		return nil
+	}
 
-	// 删除所有表
+	// 关闭外键检测
+	if err := db.Exec("SET foreign_key_checks = 0").Error; err != nil {
+		return fmt.Errorf("disable foreign key checks: %w", err)
+	}
+
 	for _, table := range tables {
-		err := db.Migrator().DropTable(table)
-		if err != nil {
-			return err
+		if err := db.Migrator().DropTable(table); err != nil {
+			// 恢复外键检测后再返回错误
+			_ = db.Exec("SET foreign_key_checks = 1").Error
+			return fmt.Errorf("drop table %s: %w", table, err)
 		}
 	}
 
-	// 开启 MySQL 外键检测
-	db.Exec("SET foreign_key_checks = 1;")
+	if err := db.Exec("SET foreign_key_checks = 1").Error; err != nil {
+		return fmt.Errorf("enable foreign key checks: %w", err)
+	}
+
 	return nil
 }
 
-// TableName 获取表名称.
-func TableName(obj any, db *gorm.DB) string {
-	stmt := &gorm.Statement{DB: db}
-	if err := stmt.Parse(obj); err != nil {
-		console.Error("parse table name error: " + err.Error())
-		return ""
+func deletePostgresTables(db *gorm.DB) error {
+	var tables []string
+	err := db.Raw(`
+		SELECT tablename FROM pg_tables 
+		WHERE schemaname = 'public'
+	`).Scan(&tables).Error
+	if err != nil {
+		return fmt.Errorf("list postgres tables: %w", err)
 	}
-	return stmt.Schema.Table
+
+	if len(tables) == 0 {
+		return nil
+	}
+
+	// CASCADE 删除所有表及其依赖
+	for _, table := range tables {
+		if err := db.Exec("DROP TABLE IF EXISTS \"" + table + "\" CASCADE").Error; err != nil {
+			return fmt.Errorf("drop table %s: %w", table, err)
+		}
+	}
+
+	return nil
+}
+
+func deleteSQLiteTables(db *gorm.DB) error {
+	var tables []string
+	err := db.Raw("SELECT name FROM sqlite_master WHERE type='table' AND name != 'sqlite_sequence'").
+		Scan(&tables).Error
+	if err != nil {
+		return fmt.Errorf("list sqlite tables: %w", err)
+	}
+
+	for _, table := range tables {
+		if err := db.Migrator().DropTable(table); err != nil {
+			return fmt.Errorf("drop table %s: %w", table, err)
+		}
+	}
+
+	return nil
 }

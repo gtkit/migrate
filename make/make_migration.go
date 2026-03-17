@@ -5,76 +5,91 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gtkit/logger"
-	"github.com/gtkit/migrate"
 	"github.com/gtkit/migrate/console"
 	"github.com/spf13/cobra"
 )
+
+// projectName 用于代码生成的项目名称.
+// 通过 SetProjectName 设置.
+var projectName = "project_name"
+
+// SetProjectName 设置项目名称（由 migrate.Setup 调用）.
+func SetProjectName(name string) {
+	if name != "" {
+		projectName = name
+	}
+}
 
 var CmdMakeMigration = &cobra.Command{
 	Use:   "migration",
 	Short: "Create a migration file, example: make migration add_users_table",
 	Run:   runMakeMigration,
-	Args:  cobra.ExactArgs(1), // 只允许且必须传 1 个参数
+	Args:  cobra.ExactArgs(1),
 }
 
-func runMakeMigration(cmd *cobra.Command, args []string) {
+func runMakeMigration(_ *cobra.Command, args []string) {
 	var tableName, columnName, objectName string
 	arg := args[0]
+
 	index := strings.Index(arg, "_")
+	if index < 0 {
+		console.Error("Invalid migration name: " + arg)
+		return
+	}
 
 	action := arg[:index]
-	if action != "add" && action != "drop" && action != "update" && action != "create" {
-		logger.Errorf("Invalid action: %s", action)
-
+	validActions := map[string]bool{
+		"add": true, "drop": true, "update": true, "create": true,
+	}
+	if !validActions[action] {
+		console.Error(fmt.Sprintf("Invalid action: %s (expected: add, drop, update, create)", action))
 		return
 	}
 
 	lastIndex := strings.LastIndex(arg, "_")
-
-	sufffix := arg[lastIndex+1:]
-	if sufffix != "table" {
-		logger.Errorf("Invalid sufffix: %s", sufffix)
-
+	suffix := arg[lastIndex+1:]
+	if suffix != "table" {
+		console.Error(fmt.Sprintf("Invalid suffix: %s (expected: table)", suffix))
 		return
 	}
 
-	if action == "add" && strings.Index(arg, "_to_") > 0 {
-		toindex := strings.Index(arg, "_to_")
-		tableName = arg[toindex+4 : lastIndex]
-	} else if action == "drop" && strings.Index(arg, "_from_") > 0 {
-		toindex := strings.Index(arg, "_from_")
-		tableName = arg[toindex+6 : lastIndex]
-		if strings.Contains(arg, "_index_") {
-			columnName = arg[strings.Index(arg, "_index_")+7 : toindex]
+	if action == "add" && strings.Contains(arg, "_to_") {
+		toIndex := strings.Index(arg, "_to_")
+		tableName = arg[toIndex+4 : lastIndex]
+	} else if action == "drop" && strings.Contains(arg, "_from_") {
+		toIndex := strings.Index(arg, "_from_")
+		tableName = arg[toIndex+6 : lastIndex]
+		if idx := strings.Index(arg, "_index_"); idx > 0 {
+			columnName = arg[idx+7 : toIndex]
 			objectName = "index"
 		}
-		if strings.Contains(arg, "_column_") {
-			columnName = arg[strings.Index(arg, "_column_")+8 : toindex]
+		if idx := strings.Index(arg, "_column_"); idx > 0 {
+			columnName = arg[idx+8 : toIndex]
 			objectName = "column"
 		}
 	} else {
 		tableName = arg[index+1 : lastIndex]
 	}
-	fmt.Printf("Table name: %s, action: %s, column name: %s\n", tableName, action, columnName)
 
 	if tableName == "" {
-		logger.Errorf("Invalid table name: %s", tableName)
-
+		console.Error("Could not parse table name from: " + arg)
 		return
 	}
 
-	// 日期格式化
-	timeStr := TimenowInTimezone().Format("2006_01_02_150405")
-	// 创建 model 对象
-	model := makeModelFromString(migrate.ProjectName, action, tableName, columnName)
+	fmt.Printf("Table: %s, Action: %s", tableName, action)
+	if columnName != "" {
+		fmt.Printf(", Column: %s", columnName)
+	}
 
-	// 创建 model 文件
+	// 使用 UTC 时间，避免时区硬编码
+	timeStr := time.Now().UTC().Format("2006_01_02_150405")
+	model := makeModelFromString(projectName, action, tableName, columnName)
+
+	// create 操作同时生成 model 文件
 	if action == "create" {
 		createFileFromStub("internal/models/"+model.PackageName+".go", "model/model", model)
 	}
 
-	// 创建 migration 文件
 	fileName := timeStr + "_" + arg
 	filePath := fmt.Sprintf("database/migrations/%s.go", fileName)
 
@@ -87,12 +102,5 @@ func runMakeMigration(cmd *cobra.Command, args []string) {
 		createFileFromStub(filePath, "migration", model, map[string]string{"{{FileName}}": fileName})
 	}
 
-	console.Success("Migration file created，after modify it, use `migrate up` to migrate database.")
-}
-
-// TimenowInTimezone 获取当前时间，支持时区.
-func TimenowInTimezone() time.Time {
-	chinaTimezone, _ := time.LoadLocation("Asia/Shanghai")
-
-	return time.Now().In(chinaTimezone)
+	console.Success("Migration file created. After modifying it, use `migrate up` to run.")
 }

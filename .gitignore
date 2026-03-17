@@ -1,7 +1,11 @@
 .idea/
-.idea/workspace.xml
-logs/
-/workspace/
-.Ds_Store
-deployment.sh
-.gitlab-ci.yml
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.bak
+__MACOSX/
+.DS_Store

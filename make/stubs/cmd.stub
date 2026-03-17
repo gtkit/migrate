@@ -9,18 +9,18 @@ import (
 
 var Cmd{{StructName}} = &cobra.Command{
     Use:   "{{PackageName}}",
-    Short:  "HERE PUTS THE COMMAND DESCRIPTION",
-    Run: run{{StructName}},
-    Args:  cobra.ExactArgs(1), // 只允许且必须传 1 个参数
+    Short: "HERE PUTS THE COMMAND DESCRIPTION",
+    Run:   run{{StructName}},
+    Args:  cobra.ExactArgs(1),
 }
 
 func run{{StructName}}(cmd *cobra.Command, args []string) {
-    console.Success("这是一条成功的提示")
-    console.Warning("这是一条提示")
-    console.Error("这是一条错误信息")
-    console.Warning("终端输出最好使用英文，这样兼容性会更好~")
-    console.Exit("exit 方法可以用来打印消息并中断程序！")
-    console.ExitIf(errors.New("在 err != nil 的时候打印并退出"))
+    console.Success("This is a success message")
+    console.Warning("This is a warning message")
+    console.Error("This is an error message")
+    console.Warning("Use English for better terminal compatibility")
+    console.Exit("exit will print a message and terminate the program")
+    console.ExitIf(errors.New("prints and exits when err != nil"))
 }
 
 func init() {
