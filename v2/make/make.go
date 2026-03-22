@@ -1,4 +1,4 @@
-// Package make 鍛戒护琛岀殑 make 鍛戒护.
+// Package make 命令行的 make 命令.
 package make
 
 import (
@@ -12,9 +12,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// Model 鍙傛暟瑙ｉ噴
+// Model 参数解释
 //
-// 鍗曚釜璇嶏紝浠?User 妯″瀷涓轰緥锛?
+// 单个词，以 User 模型为例：
 //
 //	{
 //	    "TableName": "users",
@@ -25,7 +25,7 @@ import (
 //	    "PackageName": "user"
 //	}
 //
-// 涓や釜璇嶄互涓婏紝浠?TopicComment 妯″瀷涓轰緥锛?
+// 两个词以上，以 TopicComment 模型为例：
 //
 //	{
 //	    "TableName": "topic_comments",
@@ -50,7 +50,7 @@ type Model struct {
 //go:embed stubs
 var stubsFS embed.FS
 
-// CmdMake 璇存槑 cobra 鍛戒护.
+// CmdMake 说明 cobra 命令.
 var CmdMake = &cobra.Command{
 	Use:   "make",
 	Short: "Generate file and code",
@@ -64,7 +64,7 @@ func init() {
 	)
 }
 
-// makeModelFromString 鏍煎紡鍖栫敤鎴疯緭鍏ョ殑鍐呭.
+// makeModelFromString 格式化用户输入的内容.
 func makeModelFromString(project, action, name, column string) Model {
 	model := Model{}
 	model.StructName = stringx.Singular(stringx.ToCamel(name))
@@ -80,8 +80,8 @@ func makeModelFromString(project, action, name, column string) Model {
 	return model
 }
 
-// createFileFromStub 璇诲彇 stub 鏂囦欢骞惰繘琛屽彉閲忔浛鎹?
-// 鏈€鍚庝竴涓€夐」鍙€夛紝濡傝嫢浼犲弬锛屽簲浼?map[string]string 绫诲瀷浣滀负闄勫姞鐨勫彉閲忔浛鎹?
+// createFileFromStub 读取 stub 文件并进行变量替换.
+// 最后一个选项可选，如若传参，应传 map[string]string 类型作为附加的变量替换.
 func createFileFromStub(filePath, stubName string, model Model, variables ...any) {
 	replaces := make(map[string]string)
 	if len(variables) > 0 {
@@ -90,7 +90,7 @@ func createFileFromStub(filePath, stubName string, model Model, variables ...any
 		}
 	}
 
-	// 鐩爣鏂囦欢宸插瓨鍦?
+	// 目标文件已存在
 	if file.Exists(filePath) {
 		if strings.Contains(filePath, "models") {
 			return
@@ -98,7 +98,7 @@ func createFileFromStub(filePath, stubName string, model Model, variables ...any
 		console.Exit(filePath + " already exists!")
 	}
 
-	// 璇诲彇 stub 妯℃澘鏂囦欢
+	// 读取 stub 模板文件
 	modelData, err := stubsFS.ReadFile("stubs/" + stubName + ".stub")
 	if err != nil {
 		console.Exit(err.Error())
@@ -106,7 +106,7 @@ func createFileFromStub(filePath, stubName string, model Model, variables ...any
 
 	modelStub := string(modelData)
 
-	// 榛樿鏇挎崲鍙橀噺
+	// 默认替换变量
 	replaces["{{VariableName}}"] = model.VariableName
 	replaces["{{VariableNamePlural}}"] = model.VariableNamePlural
 	replaces["{{StructName}}"] = model.StructName

@@ -1,7 +1,9 @@
-.PHONY: lint check tag gittag
+.PHONY: lint check tag gittag sync-v2
 
 GO ?= go
+PYTHON ?= python
 LINT_TARGETS ?= ./...
+V2_VERSION ?=
 
 lint:
 	@echo "▶️  golangci-lint run"
@@ -11,6 +13,13 @@ lint:
 
 check:
 	govulncheck $(LINT_TARGETS)
+
+sync-v2:
+	@if [ -n "$(V2_VERSION)" ]; then \
+		$(PYTHON) tools/sync_v2.py --repo . --version $(V2_VERSION); \
+	else \
+		$(PYTHON) tools/sync_v2.py --repo .; \
+	fi
 
 tag:
 	@current=$$(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' version.go | head -n1 | tr -d 'v'); \

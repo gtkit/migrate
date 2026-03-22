@@ -6,7 +6,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// Commands 杩斿洖鎵€鏈夊彲鐢ㄧ殑 cobra 鍛戒护.
+// Commands 返回所有可用的 cobra 命令.
 func Commands() []*cobra.Command {
 	return []*cobra.Command{
 		make.CmdMake,

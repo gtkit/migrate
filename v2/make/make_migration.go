@@ -9,11 +9,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// projectName 鐢ㄤ簬浠ｇ爜鐢熸垚鐨勯」鐩悕绉?
-// 閫氳繃 SetProjectName 璁剧疆.
+// projectName 用于代码生成的项目名称.
+// 通过 SetProjectName 设置.
 var projectName = "project_name"
 
-// SetProjectName 璁剧疆椤圭洰鍚嶇О锛堢敱 migrate.Setup 璋冪敤锛?
+// SetProjectName 设置项目名称（由 migrate.Setup 调用）.
 func SetProjectName(name string) {
 	if name != "" {
 		projectName = name
@@ -81,11 +81,11 @@ func runMakeMigration(_ *cobra.Command, args []string) {
 		fmt.Printf(", Column: %s", columnName)
 	}
 
-	// 浣跨敤 UTC 鏃堕棿锛岄伩鍏嶆椂鍖虹‖缂栫爜
+	// 使用 UTC 时间，避免时区硬编码
 	timeStr := time.Now().UTC().Format("2006_01_02_150405")
 	model := makeModelFromString(projectName, action, tableName, columnName)
 
-	// create 鎿嶄綔鍚屾椂鐢熸垚 model 鏂囦欢
+	// create 操作同时生成 model 文件
 	if action == "create" {
 		createFileFromStub("internal/models/"+model.PackageName+".go", "model/model", model)
 	}

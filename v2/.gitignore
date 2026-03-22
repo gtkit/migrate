@@ -9,3 +9,4 @@
 *.bak
 __MACOSX/
 .DS_Store
+.cache/

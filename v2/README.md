@@ -1,28 +1,28 @@
 # migrate
 
-鍩轰簬 GORM + Cobra 鐨?Go 鏁版嵁搴撹縼绉诲伐鍏凤紝鏀寔 MySQL銆丳ostgreSQL銆丼QLite銆?
+基于 GORM + Cobra 的 Go 数据库迁移工具，支持 MySQL、PostgreSQL、SQLite。
 
-## 鐗规€?
+## 特性
 
-- 杩佺Щ鏂囦欢鎸夋椂闂存埑鎺掑簭锛屾敮鎸?up / down / reset / refresh / fresh
-- Advisory Lock 闃叉澶氬疄渚嬪苟鍙戣縼绉诲啿绐侊紙MySQL `GET_LOCK`銆丳ostgreSQL `pg_advisory_lock`锛?
-- `pending` 鍛戒护棰勮寰呮墽琛岃縼绉伙紙dry-run锛?
-- 缁撴瀯鍖栨棩蹇楁帴鍙ｏ紝鍙敞鍏?zap / zerolog / slog 绛?
-- Lock name 鍙厤缃紝鍚屼竴鏁版嵁搴撳椤圭洰鍏卞瓨涓嶅啿绐?
-- `make migration` 鑷姩鐢熸垚杩佺Щ鏂囦欢鍜?model 鑴氭墜鏋?
-- 鎵€鏈夋搷浣滆繑鍥?`error`锛屼笉鍦ㄥ簱鍐呰皟鐢?`os.Exit`
+- 迁移文件按时间戳排序，支持 up / down / reset / refresh / fresh
+- Advisory Lock 防止多实例并发迁移冲突（MySQL `GET_LOCK`、PostgreSQL `pg_advisory_lock`）
+- `pending` 命令预览待执行迁移（dry-run）
+- 结构化日志接口，可注入 zap / zerolog / slog 等
+- Lock name 可配置，同一数据库多项目共存不冲突
+- `make migration` 自动生成迁移文件和 model 脚手架
+- 所有操作返回 `error`，不在库内调用 `os.Exit`
 
-## 瀹夎
+## 安装
 
 ```bash
 go get github.com/gtkit/migrate/v2@latest
 ```
 
-## 蹇€熷紑濮?
+## 快速开始
 
-### 1. 鍒濆鍖?
+### 1. 初始化
 
-鍦ㄧ▼搴忓惎鍔ㄦ椂璋冪敤 `migrate.Setup`锛屼紶鍏?GORM 鏁版嵁搴撹繛鎺ュ拰閫夐」锛?
+在程序启动时调用 `migrate.Setup`，传入 GORM 数据库连接和选项：
 
 ```go
 package main
@@ -43,7 +43,7 @@ func main() {
         log.Fatal(err)
     }
 
-    // 鍒濆鍖栬縼绉诲伐鍏?
+    // 初始化迁移工具
     if err := migrate.Setup(db,
         migrate.WithProjectName("myproject"),
         migrate.WithMigrationDir("database/migrations"),
@@ -51,7 +51,7 @@ func main() {
         log.Fatal(err)
     }
 
-    // 娉ㄥ唽鍒?cobra
+    // 注册到 cobra
     rootCmd := &cobra.Command{Use: "myapp"}
     rootCmd.AddCommand(command.Commands()...)
 
@@ -61,38 +61,38 @@ func main() {
 }
 ```
 
-### 2. Setup 閫夐」涓€瑙?
+### 2. Setup 选项一览
 
 ```go
 migrate.Setup(db,
-    migrate.WithProjectName("myproject"),             // 椤圭洰鍚嶇О锛岀敤浜庝唬鐮佺敓鎴?
-    migrate.WithMigrationDir("database/migrations"),  // 杩佺Щ鏂囦欢鐩綍锛岄粯璁?database/migrations
-    migrate.WithTimeout(10 * time.Minute),            // 杩佺Щ瓒呮椂鏃堕棿锛岄粯璁?5 鍒嗛挓
-    migrate.WithLockName("myproject_migrate"),         // 杩佺Щ閿佸悕绉帮紝榛樿 migrate_lock
-    migrate.WithLogger(myLogger),                     // 鑷畾涔夋棩蹇楋紝榛樿 stdout
+    migrate.WithProjectName("myproject"),             // 项目名称，用于代码生成
+    migrate.WithMigrationDir("database/migrations"),  // 迁移文件目录，默认 database/migrations
+    migrate.WithTimeout(10 * time.Minute),            // 迁移超时时间，默认 5 分钟
+    migrate.WithLockName("myproject_migrate"),         // 迁移锁名称，默认 migrate_lock
+    migrate.WithLogger(myLogger),                     // 自定义日志，默认 stdout
 )
 ```
 
-### 3. 鍒涘缓杩佺Щ鏂囦欢
+### 3. 创建迁移文件
 
 ```bash
-# 鍒涘缓琛?
+# 创建表
 myapp make migration create_users_table
 
-# 淇敼琛?
+# 修改表
 myapp make migration update_users_table
 
-# 娣诲姞瀛楁鍒拌〃
+# 添加字段到表
 myapp make migration add_email_to_users_table
 
-# 鍒犻櫎瀛楁
+# 删除字段
 myapp make migration drop_column_avatar_from_users_table
 
-# 鍒犻櫎绱㈠紩
+# 删除索引
 myapp make migration drop_index_email_from_users_table
 ```
 
-鎵ц鍚庝細鍦?`database/migrations/` 涓嬬敓鎴愬舰濡?`2026_03_17_120000_create_users_table.go` 鐨勬枃浠讹細
+执行后会在 `database/migrations/` 下生成形如 `2026_03_17_120000_create_users_table.go` 的文件：
 
 ```go
 package migrations
@@ -117,34 +117,34 @@ func init() {
 }
 ```
 
-`create` 鎿嶄綔浼氬悓鏃跺湪 `internal/models/` 涓嬬敓鎴?model 鏂囦欢銆?
+`create` 操作会同时在 `internal/models/` 下生成 model 文件。
 
-### 4. 鎵ц杩佺Щ
+### 4. 执行迁移
 
 ```bash
-# 棰勮寰呮墽琛岀殑杩佺Щ锛坉ry-run锛屼笉瀹為檯鎵ц锛?
+# 预览待执行的迁移（dry-run，不实际执行）
 myapp migrate pending
 
-# 鎵ц鎵€鏈夋湭杩佺Щ鐨勬枃浠?
+# 执行所有未迁移的文件
 myapp migrate up
 
-# 鏌ョ湅鎵€鏈夎縼绉荤姸鎬?
+# 查看所有迁移状态
 myapp migrate status
 
-# 鍥炴粴鏈€鍚庝竴鎵硅縼绉?
+# 回滚最后一批迁移
 myapp migrate down
 
-# 鍥炴粴鎵€鏈夎縼绉?
+# 回滚所有迁移
 myapp migrate reset
 
-# 鍥炴粴鎵€鏈夊悗閲嶆柊鎵ц
+# 回滚所有后重新执行
 myapp migrate refresh
 
-# 鍒犻櫎鎵€鏈夎〃鍚庨噸鏂版墽琛岋紙鈿狅笍 鍗遍櫓锛屼細涓㈠け鏁版嵁锛?
+# 删除所有表后重新执行（⚠️ 危险，会丢失数据）
 myapp migrate fresh
 ```
 
-### 5. 鍛戒护杈撳嚭绀轰緥
+### 5. 命令输出示例
 
 ```bash
 $ myapp migrate pending
@@ -174,11 +174,11 @@ Migration Status:
   2026_03_18_090000_add_email_to_users_table         Pending
 ```
 
-## 鑷畾涔夋棩蹇?
+## 自定义日志
 
-榛樿鏃ュ織杈撳嚭鍒?stdout銆傜敓浜х幆澧冨缓璁敞鍏ョ粨鏋勫寲鏃ュ織瀹炵幇銆?
+默认日志输出到 stdout。生产环境建议注入结构化日志实现。
 
-### Logger 鎺ュ彛
+### Logger 接口
 
 ```go
 type Logger interface {
@@ -188,9 +188,9 @@ type Logger interface {
 }
 ```
 
-绛惧悕鍏煎 `zap.SugaredLogger`銆乣slog` 鐨?key-value 椋庢牸銆?
+签名兼容 `zap.SugaredLogger`、`slog` 的 key-value 风格。
 
-### 鎺ュ叆 zap
+### 接入 zap
 
 ```go
 type zapLogger struct {
@@ -201,12 +201,12 @@ func (l *zapLogger) Info(msg string, kv ...any)  { l.s.Infow(msg, kv...) }
 func (l *zapLogger) Warn(msg string, kv ...any)  { l.s.Warnw(msg, kv...) }
 func (l *zapLogger) Error(msg string, kv ...any) { l.s.Errorw(msg, kv...) }
 
-// 浣跨敤
+// 使用
 sugar := zap.NewProduction().Sugar()
 migrate.Setup(db, migrate.WithLogger(&zapLogger{s: sugar}))
 ```
 
-### 鎺ュ叆 zerolog
+### 接入 zerolog
 
 ```go
 type zerologLogger struct {
@@ -232,7 +232,7 @@ func kvToMap(kv []any) map[string]any {
 }
 ```
 
-### 鎺ュ叆 slog锛圙o 1.21+锛?
+### 接入 slog（Go 1.21+）
 
 ```go
 type slogLogger struct {
@@ -243,19 +243,19 @@ func (s *slogLogger) Info(msg string, kv ...any)  { s.l.Info(msg, kv...) }
 func (s *slogLogger) Warn(msg string, kv ...any)  { s.l.Warn(msg, kv...) }
 func (s *slogLogger) Error(msg string, kv ...any) { s.l.Error(msg, kv...) }
 
-// slog 鐨勭鍚嶅ぉ鐒跺尮閰嶏紝鐩存帴鍖呬竴灞傚嵆鍙?
+// slog 的签名天然匹配，直接包一层即可
 migrate.Setup(db, migrate.WithLogger(&slogLogger{l: slog.Default()}))
 ```
 
-### 闈欓粯鏃ュ織锛堟祴璇曞満鏅級
+### 静默日志（测试场景）
 
 ```go
 migrate.Setup(db, migrate.WithLogger(&migration.NopLogger{}))
 ```
 
-## 澶氶」鐩叡鐢ㄦ暟鎹簱
+## 多项目共用数据库
 
-褰撳涓湇鍔″叡浜悓涓€涓暟鎹簱鏃讹紝浣跨敤 `WithLockName` 閬垮厤杩佺Щ閿佸啿绐侊細
+当多个服务共享同一个数据库时，使用 `WithLockName` 避免迁移锁冲突：
 
 ```go
 // user-service
@@ -265,11 +265,11 @@ migrate.Setup(db, migrate.WithLockName("user_svc_migrate"))
 migrate.Setup(db, migrate.WithLockName("order_svc_migrate"))
 ```
 
-涓嶅悓鐨?lock name 浼氱敓鎴愪笉鍚岀殑 advisory lock key锛屽悇椤圭洰鐨勮縼绉讳簰涓嶉樆濉炪€?
+不同的 lock name 会生成不同的 advisory lock key，各项目的迁移互不阻塞。
 
-## 缂栫▼寮忚皟鐢?
+## 编程式调用
 
-闄や簡 CLI 鍛戒护锛屼篃鍙互鍦ㄤ唬鐮佷腑鐩存帴璋冪敤 Migrator锛?
+除了 CLI 命令，也可以在代码中直接调用 Migrator：
 
 ```go
 m := migration.NewMigrator("database/migrations", db,
@@ -279,47 +279,47 @@ m := migration.NewMigrator("database/migrations", db,
 
 ctx := context.Background()
 
-// 妫€鏌ュ緟鎵ц鐨勮縼绉?
+// 检查待执行的迁移
 pending, err := m.Pending(ctx)
 
-// 鎵ц杩佺Щ
+// 执行迁移
 err = m.Up(ctx)
 
-// 鍥炴粴鏈€鍚庝竴鎵?
+// 回滚最后一批
 err = m.Rollback(ctx)
 
-// 鍥炴粴鎸囧畾姝ユ暟
+// 回滚指定步数
 err = m.RollbackSteps(ctx, 3)
 
-// 鏌ョ湅鐘舵€?
+// 查看状态
 statuses, err := m.Status(ctx)
 ```
 
-## 椤圭洰缁撴瀯
+## 项目结构
 
 ```
 migrate/
-鈹溾攢鈹€ migrate.go              # 鍏ュ彛锛歋etup銆丆onfig銆丆obra 鍛戒护
-鈹溾攢鈹€ version.go
-鈹溾攢鈹€ command/
-鈹?  鈹斺攢鈹€ command.go          # 鑱氬悎鎵€鏈夊懡浠?
-鈹溾攢鈹€ console/
-鈹?  鈹斺攢鈹€ console.go          # 缁堢棰滆壊杈撳嚭
-鈹溾攢鈹€ file/
-鈹?  鈹斺攢鈹€ file.go             # 鏂囦欢鎿嶄綔宸ュ叿
-鈹溾攢鈹€ make/
-鈹?  鈹溾攢鈹€ make.go             # 浠ｇ爜鐢熸垚鏍稿績
-鈹?  鈹溾攢鈹€ make_cmd.go         # make cmd 鍛戒护
-鈹?  鈹溾攢鈹€ make_migration.go   # make migration 鍛戒护
-鈹?  鈹溾攢鈹€ make_model.go       # make model 鍛戒护
-鈹?  鈹斺攢鈹€ stubs/              # 浠ｇ爜妯℃澘
-鈹斺攢鈹€ migration/
-    鈹溾攢鈹€ migrator.go         # 杩佺Щ鎵ц鏍稿績
-    鈹溾攢鈹€ migration_file.go   # 杩佺Щ娉ㄥ唽琛?
-    鈹溾攢鈹€ model.go            # migrations 琛ㄦā鍨?
-    鈹溾攢鈹€ database.go         # 澶氭暟鎹簱鏀寔
-    鈹溾攢鈹€ lock.go             # 鍒嗗竷寮忚縼绉婚攣
-    鈹斺攢鈹€ logger.go           # 鏃ュ織鎺ュ彛
+├── migrate.go              # 入口：Setup、Config、Cobra 命令
+├── version.go
+├── command/
+│   └── command.go          # 聚合所有命令
+├── console/
+│   └── console.go          # 终端颜色输出
+├── file/
+│   └── file.go             # 文件操作工具
+├── make/
+│   ├── make.go             # 代码生成核心
+│   ├── make_cmd.go         # make cmd 命令
+│   ├── make_migration.go   # make migration 命令
+│   ├── make_model.go       # make model 命令
+│   └── stubs/              # 代码模板
+└── migration/
+    ├── migrator.go         # 迁移执行核心
+    ├── migration_file.go   # 迁移注册表
+    ├── model.go            # migrations 表模型
+    ├── database.go         # 多数据库支持
+    ├── lock.go             # 分布式迁移锁
+    └── logger.go           # 日志接口
 ```
 
 ## License

@@ -13,33 +13,33 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// Config 杩佺Щ閰嶇疆.
+// Config 迁移配置.
 type Config struct {
-	// ProjectName 椤圭洰鍚嶇О锛岀敤浜庝唬鐮佺敓鎴?
+	// ProjectName 项目名称，用于代码生成.
 	ProjectName string
 
-	// DB 鏁版嵁搴撹繛鎺?
+	// DB 数据库连接.
 	DB *gorm.DB
 
-	// MigrationDir 杩佺Щ鏂囦欢鐩綍锛堥粯璁?"database/migrations"锛?
+	// MigrationDir 迁移文件目录（默认 "database/migrations"）.
 	MigrationDir string
 
-	// Timeout 杩佺Щ鎿嶄綔瓒呮椂鏃堕棿锛堥粯璁?5 鍒嗛挓锛?
+	// Timeout 迁移操作超时时间（默认 5 分钟）.
 	Timeout time.Duration
 
-	// LockName 杩佺Щ閿佸悕绉帮紙榛樿 "migrate_lock"锛?
-	// 褰撳悓涓€鏁版嵁搴撹澶氫釜椤圭洰鍏辩敤鏃讹紝涓嶅悓椤圭洰搴斾娇鐢ㄤ笉鍚岀殑閿佸悕绉?
+	// LockName 迁移锁名称（默认 "migrate_lock"）.
+	// 当同一数据库被多个项目共用时，不同项目应使用不同的锁名称.
 	LockName string
 
-	// Logger 鑷畾涔夋棩蹇楀疄鐜?
-	// 浼犲叆 nil 鏃朵娇鐢ㄩ粯璁ょ殑 stdout 鏃ュ織.
+	// Logger 自定义日志实现.
+	// 传入 nil 时使用默认的 stdout 日志.
 	Logger migration.Logger
 }
 
-// Option 閰嶇疆閫夐」鍑芥暟.
+// Option 配置选项函数.
 type Option func(*Config)
 
-// WithProjectName 璁剧疆椤圭洰鍚嶇О.
+// WithProjectName 设置项目名称.
 func WithProjectName(name string) Option {
 	return func(c *Config) {
 		if name != "" {
@@ -48,7 +48,7 @@ func WithProjectName(name string) Option {
 	}
 }
 
-// WithMigrationDir 璁剧疆杩佺Щ鏂囦欢鐩綍.
+// WithMigrationDir 设置迁移文件目录.
 func WithMigrationDir(dir string) Option {
 	return func(c *Config) {
 		if dir != "" {
@@ -57,7 +57,7 @@ func WithMigrationDir(dir string) Option {
 	}
 }
 
-// WithTimeout 璁剧疆杩佺Щ鎿嶄綔瓒呮椂.
+// WithTimeout 设置迁移操作超时.
 func WithTimeout(d time.Duration) Option {
 	return func(c *Config) {
 		if d > 0 {
@@ -66,8 +66,8 @@ func WithTimeout(d time.Duration) Option {
 	}
 }
 
-// WithLockName 璁剧疆杩佺Щ閿佸悕绉?
-// 褰撳悓涓€鏁版嵁搴撹澶氫釜椤圭洰鍏辩敤鏃讹紝涓嶅悓椤圭洰搴斾娇鐢ㄤ笉鍚岀殑閿佸悕绉伴伩鍏嶄簰鐩搁樆濉?
+// WithLockName 设置迁移锁名称.
+// 当同一数据库被多个项目共用时，不同项目应使用不同的锁名称避免互相阻塞.
 func WithLockName(name string) Option {
 	return func(c *Config) {
 		if name != "" {
@@ -76,16 +76,16 @@ func WithLockName(name string) Option {
 	}
 }
 
-// WithLogger 璁剧疆缁撴瀯鍖栨棩蹇楀疄鐜?
-// 浼犲叆 nil 鏃朵娇鐢ㄩ粯璁ょ殑 stdout 鏃ュ織.
-// 鐢熶骇鐜鎺ㄨ崘娉ㄥ叆 zerolog/zap 绛夊疄鐜?
+// WithLogger 设置结构化日志实现.
+// 传入 nil 时使用默认的 stdout 日志.
+// 生产环境推荐注入 zerolog/zap 等实现.
 func WithLogger(l migration.Logger) Option {
 	return func(c *Config) {
 		c.Logger = l
 	}
 }
 
-// defaultConfig 杩斿洖榛樿閰嶇疆.
+// defaultConfig 返回默认配置.
 func defaultConfig() *Config {
 	return &Config{
 		ProjectName:  "project_name",
@@ -95,11 +95,11 @@ func defaultConfig() *Config {
 	}
 }
 
-// app 鍏ㄥ眬閰嶇疆瀹炰緥锛堢敱 Setup 鍒濆鍖栵級.
+// app 全局配置实例（由 Setup 初始化）.
 var app *Config
 
-// Setup 鍒濆鍖栬縼绉诲伐鍏?
-// 蹇呴』鍦ㄤ娇鐢ㄤ换浣曡縼绉诲懡浠や箣鍓嶈皟鐢?
+// Setup 初始化迁移工具.
+// 必须在使用任何迁移命令之前调用.
 func Setup(db *gorm.DB, opts ...Option) error {
 	if db == nil {
 		return fmt.Errorf("migrate: database connection is required")
@@ -114,13 +114,13 @@ func Setup(db *gorm.DB, opts ...Option) error {
 
 	app = cfg
 
-	// 鍚屾椤圭洰鍚嶇О鍒?make 鍖咃紙鐢ㄤ簬浠ｇ爜鐢熸垚锛?
+	// 同步项目名称到 make 包（用于代码生成）
 	make.SetProjectName(cfg.ProjectName)
 
 	return nil
 }
 
-// mustApp 鑾峰彇閰嶇疆锛屾湭鍒濆鍖栨椂 panic锛堜粎鍦?cobra.Command.Run 涓娇鐢級.
+// mustApp 获取配置，未初始化时 panic（仅在 cobra.Command.Run 中使用）.
 func mustApp() *Config {
 	if app == nil {
 		panic("migrate: Setup() must be called before using migration commands")
@@ -128,7 +128,7 @@ func mustApp() *Config {
 	return app
 }
 
-// newMigrator 鍒涘缓 Migrator 瀹炰緥.
+// newMigrator 创建 Migrator 实例.
 func newMigrator() *migration.Migrator {
 	cfg := mustApp()
 
@@ -143,7 +143,7 @@ func newMigrator() *migration.Migrator {
 	return migration.NewMigrator(cfg.MigrationDir, cfg.DB, opts...)
 }
 
-// newContext 鍒涘缓甯﹁秴鏃剁殑 context.
+// newContext 创建带超时的 context.
 func newContext() (context.Context, context.CancelFunc) {
 	cfg := mustApp()
 	return context.WithTimeout(context.Background(), cfg.Timeout)
@@ -151,7 +151,7 @@ func newContext() (context.Context, context.CancelFunc) {
 
 // --- Cobra Commands ---
 
-// CmdMigrate 杩佺Щ鏍瑰懡浠?
+// CmdMigrate 迁移根命令.
 var CmdMigrate = &cobra.Command{
 	Use:   "migrate",
 	Short: "Run database migration",
@@ -218,7 +218,7 @@ func runUp(cmd *cobra.Command, _ []string) error {
 
 	m := newMigrator()
 
-	// 鍏堟鏌ユ槸鍚﹂渶瑕佽縼绉?
+	// 先检查是否需要迁移
 	upToDate, err := m.IsUpToDate(ctx)
 	if err != nil {
 		return fmt.Errorf("check migration status: %w", err)
