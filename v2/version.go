@@ -1,3 +1,3 @@
 package migrate
 
-const Version = "v2.0.3"
+const Version = "v2.0.4"
