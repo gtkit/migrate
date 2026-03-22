@@ -1,0 +1,22 @@
+package migrations
+
+import (
+    "github.com/gtkit/logger"
+    "gorm.io/gorm"
+
+    "{{ProjectName}}/internal/models"
+
+    "github.com/gtkit/migrate/v2/migration"
+)
+
+func init() {
+    up := func(db *gorm.DB) error {
+        if err := db.Migrator().DropColumn(&models.{{StructName}}{}, "{{ColumnName}}"); err != nil {
+            logger.Errorf("failed to drop column {{ColumnName}} from {{StructName}}: %v", err)
+            return err
+        }
+        return nil
+    }
+
+    migration.Add("{{FileName}}", up, nil)
+}

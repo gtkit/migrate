@@ -1,0 +1,28 @@
+package cmd
+
+import (
+    "errors"
+    "github.com/gtkit/migrate/v2/console"
+
+    "github.com/spf13/cobra"
+)
+
+var Cmd{{StructName}} = &cobra.Command{
+    Use:   "{{PackageName}}",
+    Short: "HERE PUTS THE COMMAND DESCRIPTION",
+    Run:   run{{StructName}},
+    Args:  cobra.ExactArgs(1),
+}
+
+func run{{StructName}}(cmd *cobra.Command, args []string) {
+    console.Success("This is a success message")
+    console.Warning("This is a warning message")
+    console.Error("This is an error message")
+    console.Warning("Use English for better terminal compatibility")
+    console.Exit("exit will print a message and terminate the program")
+    console.ExitIf(errors.New("prints and exits when err != nil"))
+}
+
+func init() {
+	rootCmd.AddCommand(Cmd{{StructName}})
+}
