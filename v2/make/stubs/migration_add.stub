@@ -1,0 +1,27 @@
+package migrations
+
+import (
+	"{{ModelsImportPath}}"
+	"gorm.io/gorm"
+
+	"github.com/gtkit/migrate/v2/migration"
+)
+
+func init() {
+	up := func(db *gorm.DB) error {
+		// Adjust {{StructFieldName}} if the struct field name differs from the migration token.
+		if db.Migrator().HasColumn(&{{ModelPackageName}}.{{StructName}}{}, "{{StructFieldName}}") {
+			return nil
+		}
+		return db.Migrator().AddColumn(&{{ModelPackageName}}.{{StructName}}{}, "{{StructFieldName}}")
+	}
+
+	down := func(db *gorm.DB) error {
+		if !db.Migrator().HasColumn(&{{ModelPackageName}}.{{StructName}}{}, "{{ColumnName}}") {
+			return nil
+		}
+		return db.Migrator().DropColumn(&{{ModelPackageName}}.{{StructName}}{}, "{{ColumnName}}")
+	}
+
+	migration.Add("{{FileName}}", up, down)
+}

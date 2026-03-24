@@ -1,0 +1,94 @@
+package {{PackageName}}
+
+import (
+	"context"
+	"fmt"
+
+	"{{ModelsImportPath}}"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+var allowed{{StructName}}Fields = map[string]struct{}{
+	"id": {},
+}
+
+func (r *Repository) Get(ctx context.Context, id any) (*{{ModelPackageName}}.{{StructName}}, error) {
+	var entity {{ModelPackageName}}.{{StructName}}
+	if err := r.mdbCtx(ctx).Where("id = ?", id).First(&entity).Error; err != nil {
+		return nil, err
+	}
+	return &entity, nil
+}
+
+func (r *Repository) GetBy(ctx context.Context, field string, value any) (*{{ModelPackageName}}.{{StructName}}, error) {
+	if err := validate{{StructName}}Field(field); err != nil {
+		return nil, err
+	}
+
+	var entity {{ModelPackageName}}.{{StructName}}
+	if err := r.mdbCtx(ctx).Where(fmt.Sprintf("%s = ?", field), value).First(&entity).Error; err != nil {
+		return nil, err
+	}
+	return &entity, nil
+}
+
+func (r *Repository) All(ctx context.Context) ([]*{{ModelPackageName}}.{{StructName}}, error) {
+	var entities []*{{ModelPackageName}}.{{StructName}}
+	if err := r.mdbCtx(ctx).Find(&entities).Error; err != nil {
+		return nil, err
+	}
+	return entities, nil
+}
+
+func (r *Repository) Create(ctx context.Context, entity *{{ModelPackageName}}.{{StructName}}) error {
+	return r.mdbCtx(ctx).Create(entity).Error
+}
+
+func (r *Repository) Save(ctx context.Context, entity *{{ModelPackageName}}.{{StructName}}) error {
+	return r.mdbCtx(ctx).Save(entity).Error
+}
+
+func (r *Repository) Delete(ctx context.Context, id any) error {
+	result := r.mdbCtx(ctx).Where("id = ?", id).Delete(&{{ModelPackageName}}.{{StructName}}{})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+func (r *Repository) IsExist(ctx context.Context, field string, value any) (bool, error) {
+	if err := validate{{StructName}}Field(field); err != nil {
+		return false, err
+	}
+
+	var count int64
+	if err := r.mdbCtx(ctx).Model(&{{ModelPackageName}}.{{StructName}}{}).Where(fmt.Sprintf("%s = ?", field), value).Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func (r *Repository) CreateOrUpdate(ctx context.Context, entity *{{ModelPackageName}}.{{StructName}}, primaryKey string, updateColumns []string) error {
+	if primaryKey == "" {
+		return fmt.Errorf("primaryKey is required")
+	}
+	if len(updateColumns) == 0 {
+		return fmt.Errorf("updateColumns is required")
+	}
+
+	return r.mdbCtx(ctx).Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: primaryKey}},
+		DoUpdates: clause.AssignmentColumns(updateColumns),
+	}).Create(entity).Error
+}
+
+func validate{{StructName}}Field(field string) error {
+	if _, ok := allowed{{StructName}}Fields[field]; !ok {
+		return fmt.Errorf("field %q is not allowed", field)
+	}
+	return nil
+}

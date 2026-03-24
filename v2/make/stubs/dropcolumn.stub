@@ -1,22 +1,23 @@
 package migrations
 
 import (
-    "github.com/gtkit/logger"
-    "gorm.io/gorm"
+	"{{ModelsImportPath}}"
+	"gorm.io/gorm"
 
-    "{{ProjectName}}/internal/models"
-
-    "github.com/gtkit/migrate/v2/migration"
+	"github.com/gtkit/migrate/v2/migration"
 )
 
 func init() {
-    up := func(db *gorm.DB) error {
-        if err := db.Migrator().DropColumn(&models.{{StructName}}{}, "{{ColumnName}}"); err != nil {
-            logger.Errorf("failed to drop column {{ColumnName}} from {{StructName}}: %v", err)
-            return err
-        }
-        return nil
-    }
+	up := func(db *gorm.DB) error {
+		if !db.Migrator().HasColumn(&{{ModelPackageName}}.{{StructName}}{}, "{{ColumnName}}") {
+			return nil
+		}
+		return db.Migrator().DropColumn(&{{ModelPackageName}}.{{StructName}}{}, "{{ColumnName}}")
+	}
 
-    migration.Add("{{FileName}}", up, nil)
+	down := func(db *gorm.DB) error {
+		return migration.Irreversible("fill in the column recreation for {{FileName}} manually")
+	}
+
+	migration.Add("{{FileName}}", up, down)
 }

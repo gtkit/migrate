@@ -1,30 +1,44 @@
 package make
 
 import (
-	"fmt"
-	"os"
-
-	"github.com/gtkit/migrate/v2/console"
 	"github.com/spf13/cobra"
 )
 
 var CmdMakeModel = &cobra.Command{
 	Use:   "model",
 	Short: "Create model file, example: make model user",
-	Run:   runMakeModel,
+	RunE:  runMakeModel,
 	Args:  cobra.ExactArgs(1),
 }
 
-func runMakeModel(_ *cobra.Command, args []string) {
-	model := makeModelFromString(projectName, "", args[0], "")
+func runMakeModel(cmd *cobra.Command, args []string) error {
+	cfg := resolveConfig(cmd)
+	model := enrichModel(cfg, makeModelFromString(cfg.ProjectName, "", args[0], ""))
+	return generateModelScaffold(cfg, model)
+}
 
-	repositoryDir := fmt.Sprintf("internal/repository/%s/", model.PackageName)
-	if err := os.MkdirAll(repositoryDir, os.ModePerm); err != nil {
-		console.Error("Failed to create repository directory: " + err.Error())
-		return
+func generateModelScaffold(cfg Config, model Model) error {
+	if err := ensureModelSupportFiles(cfg, model); err != nil {
+		return err
 	}
+	if err := createFileFromStub(modelFilePath(cfg, model), "model/model", model, writeSkipIfExists); err != nil {
+		return err
+	}
+	if err := createFileFromStub(repositoryFilePath(cfg, model), "model/repository", model, writeFailIfExists); err != nil {
+		return err
+	}
+	if err := createFileFromStub(repositoryUtilFilePath(cfg, model), "model/repository_util", model, writeFailIfExists); err != nil {
+		return err
+	}
+	return nil
+}
 
-	createFileFromStub("internal/models/"+model.PackageName+".go", "model/model", model)
-	createFileFromStub(repositoryDir+model.PackageName+"_util.go", "model/model_util", model)
-	createFileFromStub(repositoryDir+model.PackageName+"_i.go", "model/i", model)
+func ensureModelSupportFiles(cfg Config, model Model) error {
+	if err := createFileFromStub(modelBaseFilePath(cfg), "model/base", model, writeSkipIfExists); err != nil {
+		return err
+	}
+	if err := createFileFromStub(modelDocFilePath(cfg), "model/doc", model, writeSkipIfExists); err != nil {
+		return err
+	}
+	return nil
 }

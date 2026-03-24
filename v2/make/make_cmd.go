@@ -10,17 +10,21 @@ import (
 var CmdMakeCMD = &cobra.Command{
 	Use:   "cmd",
 	Short: "Create a command, should be snake_case, example: make cmd backup_database",
-	Run:   runMakeCMD,
+	RunE:  runMakeCMD,
 	Args:  cobra.ExactArgs(1),
 }
 
-func runMakeCMD(_ *cobra.Command, args []string) {
-	model := makeModelFromString(projectName, "cmd", args[0], "")
+func runMakeCMD(cmd *cobra.Command, args []string) error {
+	cfg := resolveConfig(cmd)
+	model := enrichModel(cfg, makeModelFromString(cfg.ProjectName, "cmd", args[0], ""))
 	filePath := fmt.Sprintf("cmd/%s.go", model.PackageName)
 
-	createFileFromStub(filePath, "cmd", model)
+	if err := createFileFromStub(filePath, "cmd", model, writeFailIfExists); err != nil {
+		return err
+	}
 
 	console.Success("command name: " + model.PackageName)
 	console.Success("command variable name: cmd.Cmd" + model.StructName)
 	console.Warning("please edit main.go's app.Commands slice to register command")
+	return nil
 }

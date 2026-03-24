@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gtkit/migrate/v2/make"
@@ -24,6 +25,15 @@ type Config struct {
 	// MigrationDir 迁移文件目录（默认 "database/migrations"）.
 	MigrationDir string
 
+	// ModelDir model 文件目录（默认 "internal/models"）.
+	ModelDir string
+
+	// RepositoryDir repository 文件目录（默认 "internal/repository"）.
+	RepositoryDir string
+
+	// DDLDir DDL 文件输出目录（默认 "database/ddl"）.
+	DDLDir string
+
 	// Timeout 迁移操作超时时间（默认 5 分钟）.
 	Timeout time.Duration
 
@@ -34,6 +44,9 @@ type Config struct {
 	// Logger 自定义日志实现.
 	// 传入 nil 时使用默认的 stdout 日志.
 	Logger migration.Logger
+
+	// DDLModels 用于 make ddl 的模型注册表。
+	DDLModels []any
 }
 
 // Option 配置选项函数.
@@ -53,6 +66,33 @@ func WithMigrationDir(dir string) Option {
 	return func(c *Config) {
 		if dir != "" {
 			c.MigrationDir = filepath.Clean(dir)
+		}
+	}
+}
+
+// WithModelDir 设置 model 生成目录。
+func WithModelDir(dir string) Option {
+	return func(c *Config) {
+		if dir != "" {
+			c.ModelDir = filepath.Clean(dir)
+		}
+	}
+}
+
+// WithRepositoryDir 设置 repository 生成目录。
+func WithRepositoryDir(dir string) Option {
+	return func(c *Config) {
+		if dir != "" {
+			c.RepositoryDir = filepath.Clean(dir)
+		}
+	}
+}
+
+// WithDDLDir 设置 DDL 输出目录。
+func WithDDLDir(dir string) Option {
+	return func(c *Config) {
+		if dir != "" {
+			c.DDLDir = filepath.Clean(dir)
 		}
 	}
 }
@@ -85,13 +125,23 @@ func WithLogger(l migration.Logger) Option {
 	}
 }
 
+// WithDDLModels 注册可用于 make ddl 的 GORM 模型。
+func WithDDLModels(models ...any) Option {
+	return func(c *Config) {
+		c.DDLModels = append(c.DDLModels, models...)
+	}
+}
+
 // defaultConfig 返回默认配置.
 func defaultConfig() *Config {
 	return &Config{
-		ProjectName:  "project_name",
-		MigrationDir: "database/migrations",
-		Timeout:      5 * time.Minute,
-		LockName:     "migrate_lock",
+		ProjectName:   "project_name",
+		MigrationDir:  "database/migrations",
+		ModelDir:      "internal/models",
+		RepositoryDir: "internal/repository",
+		DDLDir:        "database/ddl",
+		Timeout:       5 * time.Minute,
+		LockName:      "migrate_lock",
 	}
 }
 
@@ -114,8 +164,15 @@ func Setup(db *gorm.DB, opts ...Option) error {
 
 	app = cfg
 
-	// 同步项目名称到 make 包（用于代码生成）
-	make.SetProjectName(cfg.ProjectName)
+	make.SetConfig(make.Config{
+		ProjectName:   cfg.ProjectName,
+		ModelDir:      cfg.ModelDir,
+		RepositoryDir: cfg.RepositoryDir,
+		MigrationDir:  cfg.MigrationDir,
+		DDLDir:        cfg.DDLDir,
+		DB:            cfg.DB,
+		DDLModels:     cfg.DDLModels,
+	})
 
 	return nil
 }
@@ -200,7 +257,16 @@ var CmdMigratePending = &cobra.Command{
 	RunE:  runPending,
 }
 
+var CmdMigrateLint = &cobra.Command{
+	Use:   "lint",
+	Short: "Lint migration files, registry, and applied records for drift and rollback risk",
+	RunE:  runLint,
+}
+
 func init() {
+	CmdMigrateLint.Flags().Bool("strict", false, "Fail on warnings as well as errors")
+	CmdMigrateLint.Flags().Bool("skip-db", false, "Skip database-applied migration drift checks")
+
 	CmdMigrate.AddCommand(
 		CmdMigrateUp,
 		CmdMigrateRollback,
@@ -209,6 +275,7 @@ func init() {
 		CmdMigrateFresh,
 		CmdMigrateStatus,
 		CmdMigratePending,
+		CmdMigrateLint,
 	)
 }
 
@@ -335,6 +402,48 @@ func runPending(cmd *cobra.Command, _ []string) error {
 		cmd.Printf("  %d. %s\n", i+1, name)
 	}
 	cmd.Println("\nRun 'migrate up' to execute these migrations.")
+
+	return nil
+}
+
+func runLint(cmd *cobra.Command, _ []string) error {
+	ctx, cancel := newContext()
+	defer cancel()
+
+	strict, err := cmd.Flags().GetBool("strict")
+	if err != nil {
+		return err
+	}
+	skipDB, err := cmd.Flags().GetBool("skip-db")
+	if err != nil {
+		return err
+	}
+
+	report, err := newMigrator().Lint(ctx, migration.LintOptions{
+		SkipDatabase: skipDB,
+	})
+	if err != nil {
+		return fmt.Errorf("migrate lint: %w", err)
+	}
+
+	if len(report.Issues) == 0 {
+		cmd.Println("Migration lint passed. No issues found.")
+		return nil
+	}
+
+	for _, issue := range report.Issues {
+		cmd.Printf("[%s] %s: %s\n",
+			strings.ToUpper(string(issue.Severity)),
+			issue.Name,
+			issue.Message,
+		)
+	}
+
+	cmd.Printf("\nSummary: %d error(s), %d warning(s)\n", report.ErrorCount(), report.WarningCount())
+
+	if report.HasErrors() || (strict && report.HasWarnings()) {
+		return fmt.Errorf("%w: %d error(s), %d warning(s)", migration.ErrLintFailed, report.ErrorCount(), report.WarningCount())
+	}
 
 	return nil
 }

@@ -1,18 +1,18 @@
 .PHONY: lint check tag gittag
 
-GO ?= go
 LINT_TARGETS ?= ./...
 
-lint:
-	@echo "▶️  golangci-lint run"
+lint: ## Lint Go code
+	@ echo "▶️ golangci-lint run"
 	golangci-lint run $(LINT_TARGETS)
 	gofumpt -l -w .
-	@echo "✅ golangci-lint run"
+	@ echo "✅ golangci-lint run"
 
-check:
-	govulncheck $(LINT_TARGETS)
+check: ## Check vulnerabilities
+	govulncheck ./...
+	gosec ./...
 
-tag:
+tag: ## Bump patch version and push tag
 	@current=$$(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' version.go | head -n1 | tr -d 'v'); \
 	if [ -z "$$current" ]; then echo "version not found in version.go"; exit 1; fi; \
 	maj=$$(echo $$current | cut -d. -f1); \
@@ -23,14 +23,14 @@ tag:
 	printf "Bump: v%s -> %s\n" "$$current" "$$new"; \
 	sed -E -i.bak 's/(const Version = ")([^"]+)(")/\1'"$$new"'\3/' version.go; \
 	git add version.go; \
-	git commit -m "chore(release): $$new"; \
+	git commit -m "chore(release): v2 $$new"; \
 	printf "Release: %s\n" "$$new"; \
 	git push gtkit HEAD; \
-	git tag -a "$$new" -m "release $$new"; \
-	printf "Tag: %s\n" "$$new"; \
-	git push gtkit "$$new"; \
+	git tag -a "v2/$${new}" -m "release v2/$$new"; \
+	printf "Tag: v2/%s\n" "$$new"; \
+	git push gtkit "v2/$${new}"; \
 	printf "Done\n"
 	rm -f version.go.bak
 
-gittag:
-	git tag --sort=-version:refname | head -1
+gittag: ## Show latest tag
+	git tag --sort=-version:refname | grep '^v2/' | head -1

@@ -1,0 +1,18 @@
+package {{ModelPackageName}}
+
+import (
+	"time"
+
+	"gorm.io/gorm"
+)
+
+type BaseID struct {
+	ID int64 `gorm:"column:id;primaryKey;autoIncrement;comment:主键编码" json:"id"`
+}
+
+// BaseTimeField 通用时间字段。
+type BaseTimeField struct {
+	CreatedAt time.Time      `gorm:"column:created_at;type:timestamp;index;comment:创建时间" json:"created_at,omitzero"`
+	UpdatedAt time.Time      `gorm:"column:updated_at;type:timestamp;index;comment:最后更新时间" json:"updated_at,omitzero"`
+	DeletedAt gorm.DeletedAt `gorm:"column:deleted_at;type:timestamp;index;comment:删除时间" json:"-"`
+}
