@@ -92,21 +92,32 @@ myapp make migration drop_column_avatar_from_users_table
 myapp make migration drop_index_email_from_users_table
 ```
 
-执行后会在 `database/migrations/` 下生成形如 `2026_03_17_120000_create_users_table.go` 的文件：
+执行后会在 `database/migrations/` 下生成形如 `2026_03_17_120000_create_users_table.go` 的文件。
+
+不同 action 使用不同的 migration 模板：
+
+| action | up 行为 | down 行为 |
+|--------|---------|-----------|
+| `create` | `CreateTable` | `DropTable` |
+| `update` | `AutoMigrate` | 标记为不可逆，需人工补全 |
+| `add` | `AddColumn`（带存在性检查） | `DropColumn`（带存在性检查） |
+| `drop` | `DropTable` / `DropColumn` / `DropIndex` | 对应的反向操作 |
+
+示例（`create`）：
 
 ```go
 package migrations
 
 import (
+    "myproject/internal/models"
     "gorm.io/gorm"
 
-    "myproject/internal/models"
     "github.com/gtkit/migrate/migration"
 )
 
 func init() {
     up := func(db *gorm.DB) error {
-        return db.AutoMigrate(&models.User{})
+        return db.Migrator().CreateTable(&models.User{})
     }
 
     down := func(db *gorm.DB) error {
@@ -117,7 +128,14 @@ func init() {
 }
 ```
 
-`create` 操作会同时在 `internal/models/` 下生成 model 文件。
+`create` 操作会同时生成以下文件：
+
+```text
+internal/models/model.go          # BaseID、BaseTimeField（仅首次生成）
+internal/models/user.go           # GORM model 骨架（含 ListPaging、CRUD 方法）
+internal/repository/user/user_i.go      # Repository 结构体 + New 构造函数
+internal/repository/user/user_util.go   # Get / GetBy / All / IsExist / Paginate
+```
 
 ### 4. 执行迁移
 

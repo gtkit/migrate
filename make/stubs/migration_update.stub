@@ -1,0 +1,20 @@
+package migrations
+
+import (
+	"{{ProjectName}}/internal/models"
+	"gorm.io/gorm"
+
+	"github.com/gtkit/migrate/migration"
+)
+
+func init() {
+	up := func(db *gorm.DB) error {
+		return db.AutoMigrate(&models.{{StructName}}{})
+	}
+
+	down := func(db *gorm.DB) error {
+		return migration.Irreversible("fill in the down migration for {{FileName}} manually")
+	}
+
+	migration.Add("{{FileName}}", up, down)
+}

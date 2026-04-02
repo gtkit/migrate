@@ -2,6 +2,7 @@ package make
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -55,7 +56,9 @@ func runMakeMigration(_ *cobra.Command, args []string) {
 
 	if action == "add" && strings.Contains(arg, "_to_") {
 		toIndex := strings.Index(arg, "_to_")
+		columnName = arg[index+1 : toIndex]
 		tableName = arg[toIndex+4 : lastIndex]
+		objectName = "column"
 	} else if action == "drop" && strings.Contains(arg, "_from_") {
 		toIndex := strings.Index(arg, "_from_")
 		tableName = arg[toIndex+6 : lastIndex]
@@ -85,22 +88,46 @@ func runMakeMigration(_ *cobra.Command, args []string) {
 	timeStr := time.Now().UTC().Format("2006_01_02_150405")
 	model := makeModelFromString(projectName, action, tableName, columnName)
 
-	// create 操作同时生成 model 文件
+	// create 操作同时生成 model 和 repository 文件
 	if action == "create" {
+		repositoryDir := fmt.Sprintf("internal/repository/%s/", model.PackageName)
+		if err := os.MkdirAll(repositoryDir, os.ModePerm); err != nil {
+			console.Error("Failed to create repository directory: " + err.Error())
+			return
+		}
+		createFileFromStub("internal/models/model.go", "model/base", model)
 		createFileFromStub("internal/models/"+model.PackageName+".go", "model/model", model)
+		createFileFromStub(repositoryDir+model.PackageName+"_i.go", "model/i", model)
+		createFileFromStub(repositoryDir+model.PackageName+"_util.go", "model/model_util", model)
 	}
 
 	fileName := timeStr + "_" + arg
 	filePath := fmt.Sprintf("database/migrations/%s.go", fileName)
 
-	switch objectName {
-	case "index":
-		createFileFromStub(filePath, "dropindex", model, map[string]string{"{{FileName}}": fileName})
-	case "column":
-		createFileFromStub(filePath, "dropcolumn", model, map[string]string{"{{FileName}}": fileName})
-	default:
-		createFileFromStub(filePath, "migration", model, map[string]string{"{{FileName}}": fileName})
-	}
+	stubName := migrationStubName(action, objectName)
+	createFileFromStub(filePath, stubName, model, map[string]string{"{{FileName}}": fileName})
 
 	console.Success("Migration file created. After modifying it, use `migrate up` to run.")
+}
+
+func migrationStubName(action, objectName string) string {
+	switch action {
+	case "create":
+		return "migration_create"
+	case "add":
+		return "migration_add"
+	case "update":
+		return "migration_update"
+	case "drop":
+		switch objectName {
+		case "index":
+			return "dropindex"
+		case "column":
+			return "dropcolumn"
+		default:
+			return "migration_drop"
+		}
+	default:
+		return "migration_update"
+	}
 }

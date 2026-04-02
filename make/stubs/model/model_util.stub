@@ -1,87 +1,53 @@
 package {{PackageName}}
 
 import (
-    "context"
-    "fmt"
+	"context"
+	"fmt"
 
-    "{{ProjectName}}/internal/models"
+	"{{ProjectName}}/internal/models"
 	"{{ProjectName}}/internal/pkg/paginator"
 )
 
-func (r *reposit) Get(ctx context.Context, idstr string, fields ...string) ({{VariableName}} *models.{{StructName}}, err error) {
-    q := r.mdbCtx(ctx)
-    if len(fields) > 0 {
-        q = q.Select(fields)
-    }
-    if err := q.Where("id", idstr).First(&{{VariableName}}).Error; err != nil {
-        return nil, err
-    }
-    return
+func (r *Repository) Get(ctx context.Context, idstr string) ({{VariableName}} models.{{StructName}}) {
+	r.mdbCtx(ctx).Where("id", idstr).First(&{{VariableName}})
+	return
 }
 
-func (r *reposit) GetBy(ctx context.Context, field, value string) ({{VariableName}} *models.{{StructName}}, err error) {
-    allowedFields := map[string]bool{
-            "id":    true,
-            // ... 其他允许的字段
-        }
-
-    if !allowedFields[field] {
-        // 处理非法字段名
-        return
-    }
-
-    if err := r.mdbCtx(ctx).Where(fmt.Sprintf("%s = ?", field), value).First(&{{VariableName}}).Error; err != nil {
-        return nil, err
-    }
-    return
+func (r *Repository) GetBy(ctx context.Context, field, value string) ({{VariableName}} models.{{StructName}}) {
+	r.mdbCtx(ctx).Where(fmt.Sprintf("%s = ?", field), value).First(&{{VariableName}})
+	return
 }
 
-func (r *reposit) All(ctx context.Context, fields ...string) ([]*models.{{StructName}}, error) {
-    var {{VariableNamePlural}} []*models.{{StructName}}
+func (r *Repository) All(ctx context.Context) ({{VariableNamePlural}} []models.{{StructName}}) {
+	r.mdbCtx(ctx).Find(&{{VariableNamePlural}})
+	return
+}
 
-	q := r.mdbCtx(ctx)
-	if len(fields) > 0 {
-		q = q.Select(fields)
+func (r *Repository) IsExist(ctx context.Context, field, value string) bool {
+	var count int64
+	r.mdbCtx(ctx).Model(models.{{StructName}}{}).Where(fmt.Sprintf("%s = ?", field), value).Count(&count)
+	return count > 0
+}
+
+func (r *Repository) Paginate(ctx context.Context, baseURL string, pagination paginator.Pagination, args ...paginator.Option) (*models.{{StructName}}ListPaging, error) {
+	var (
+		{{VariableNamePlural}} []*models.{{StructName}}
+		paging               paginator.Paging
+		err                  error
+	)
+
+	db := r.mdbCtx(ctx).Model(models.{{StructName}}{})
+	paging, err = paginator.Paginate(db, &{{VariableNamePlural}}, baseURL, paginator.Pagination{
+		Page:     pagination.Page,
+		PageSize: pagination.PageSize,
+		Order:    "desc",
+	}, args...)
+	if err != nil {
+		return nil, fmt.Errorf("paginate {{VariableNamePlural}}: %w", err)
 	}
 
-    if err := q.Find(&{{VariableNamePlural}}).Error; err != nil {
-        return nil, err
-    }
-    return {{VariableNamePlural}}, nil
-}
-
-func (r *reposit) IsExist(ctx context.Context, field, value string) bool {
-    var count int64
-
-    allowedFields := map[string]bool{
-                "id":    true,
-                // ... 其他允许的字段
-            }
-
-    if !allowedFields[field] {
-        // 处理非法字段名
-        return false
-    }
-
-    r.mdbCtx(ctx).Model(models.{{StructName}}{}).Where(fmt.Sprintf("%s = ?", field), value).Count(&count)
-    return count > 0
-}
-
-func (r *reposit) Paginate(ctx context.Context, baseURL string, pagination paginator.Pagination, args ...any) (*models.{{StructName}}ListPaging, error) {
-    var (
-    		{{VariableNamePlural}} []*models.{{StructName}}
-    		paging  paginator.Paging
-    	)
-
-    db := r.mdbCtx(ctx).Model(models.{{StructName}}{})
-    paging = paginator.Paginate(db, &{{VariableNamePlural}}, baseURL, paginator.Pagination{
-    		Page:     pagination.Page,
-    		PageSize: pagination.PageSize,
-    		Order:    "desc",
-    	}, args)
-
-    return &models.{{StructName}}ListPaging{
-    		List:   {{VariableNamePlural}},
-    		Paging: paging,
-    	}, nil
+	return &models.{{StructName}}ListPaging{
+		List:   {{VariableNamePlural}},
+		Paging: paging,
+	}, nil
 }

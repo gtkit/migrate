@@ -1,0 +1,23 @@
+package migrations
+
+import (
+	"{{ProjectName}}/internal/models"
+	"gorm.io/gorm"
+
+	"github.com/gtkit/migrate/migration"
+)
+
+func init() {
+	up := func(db *gorm.DB) error {
+		if !db.Migrator().HasTable(&models.{{StructName}}{}) {
+			return nil
+		}
+		return db.Migrator().DropTable(&models.{{StructName}}{})
+	}
+
+	down := func(db *gorm.DB) error {
+		return db.Migrator().CreateTable(&models.{{StructName}}{})
+	}
+
+	migration.Add("{{FileName}}", up, down)
+}

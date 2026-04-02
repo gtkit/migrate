@@ -155,11 +155,11 @@ func repositoryDirPath(cfg Config, model Model) string {
 }
 
 func repositoryFilePath(cfg Config, model Model) string {
-	return filepath.Join(repositoryDirPath(cfg, model), "repository.go")
+	return filepath.Join(repositoryDirPath(cfg, model), model.PackageName+"_i.go")
 }
 
 func repositoryUtilFilePath(cfg Config, model Model) string {
-	return filepath.Join(repositoryDirPath(cfg, model), "repository_util.go")
+	return filepath.Join(repositoryDirPath(cfg, model), model.PackageName+"_util.go")
 }
 
 func migrationDocFilePath(cfg Config) string {

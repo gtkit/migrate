@@ -1,4 +1,15 @@
+// Package {{PackageName}} 模型
 package {{ModelPackageName}}
+
+import (
+	"strconv"
+
+	"{{ProjectName}}/internal/pkg/paginator"
+
+	"github.com/gtkit/json"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
 
 type {{StructName}} struct {
 	BaseID
@@ -9,6 +20,58 @@ type {{StructName}} struct {
 }
 
 // TableName 指定表名。
-func ({{StructName}}) TableName() string {
+func ({{VariableName}} *{{StructName}}) TableName() string {
 	return "{{TableName}}"
 }
+
+type {{StructName}}ListPaging struct {
+	List   []*{{StructName}}    `json:"list"`
+	Paging paginator.Paging `json:"paging"`
+}
+
+func ({{VariableName}} *{{StructName}}) Create(db *gorm.DB) error {
+	return db.Create(&{{VariableName}}).Error
+}
+
+func ({{VariableName}} *{{StructName}}) Save(db *gorm.DB) error {
+	result := db.Save(&{{VariableName}})
+	return result.Error
+}
+
+func ({{VariableName}} *{{StructName}}) Delete(db *gorm.DB) (rowsAffected int64) {
+	result := db.Delete(&{{VariableName}})
+	return result.RowsAffected
+}
+
+// GetStringID 获取 ID 的字符串格式.
+func ({{VariableName}} *{{StructName}}) GetStringID() string {
+	return strconv.Itoa(int({{VariableName}}.ID))
+}
+
+// CreateOrUpdate 创建或更新.
+func ({{VariableName}} *{{StructName}}) CreateOrUpdate(db *gorm.DB, primarykey string, updatekey []string) error {
+	return db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: primarykey}},
+		DoUpdates: clause.AssignmentColumns(updatekey),
+	}).Create(&{{VariableName}}).Error
+}
+
+// MarshalBinary 序列化到JSON.
+func ({{VariableName}} *{{StructName}}) MarshalBinary() ([]byte, error) {
+	return json.Marshal({{VariableName}})
+}
+
+// UnmarshalBinary 反序列化.
+func ({{VariableName}} *{{StructName}}) UnmarshalBinary(data []byte) error {
+	return json.Unmarshal(data, {{VariableName}})
+}
+
+// func ({{VariableName}} *{{StructName}}) BeforeSave(tx *gorm.DB) (err error) {}
+// func ({{VariableName}} *{{StructName}}) BeforeCreate(tx *gorm.DB) (err error) {}
+// func ({{VariableName}} *{{StructName}}) AfterCreate(tx *gorm.DB) (err error) {}
+// func ({{VariableName}} *{{StructName}}) BeforeUpdate(tx *gorm.DB) (err error) {}
+// func ({{VariableName}} *{{StructName}}) AfterUpdate(tx *gorm.DB) (err error) {}
+// func ({{VariableName}} *{{StructName}}) AfterSave(tx *gorm.DB) (err error) {}
+// func ({{VariableName}} *{{StructName}}) BeforeDelete(tx *gorm.DB) (err error) {}
+// func ({{VariableName}} *{{StructName}}) AfterDelete(tx *gorm.DB) (err error) {}
+// func ({{VariableName}} *{{StructName}}) AfterFind(tx *gorm.DB) (err error) {}

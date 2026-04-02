@@ -1,22 +1,22 @@
-//Package {{PackageName}} 模型
+// Package {{PackageName}} 模型
 package models
 
 import (
-    "strconv"
+	"strconv"
 
-    "github.com/gtkit/json"
-    "gorm.io/gorm"
-    "gorm.io/gorm/clause"
-    "{{ProjectName}}/internal/pkg/paginator"
+	"{{ProjectName}}/internal/pkg/paginator"
+
+	"github.com/gtkit/json"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type {{StructName}} struct {
-    BaseID
+	BaseID
 
-    // Put fields in here
-    // FIXME()
+	// TODO: define business fields.
 
-   BaseTimeField
+	BaseTimeField
 }
 
 // TableName 指定表名。
@@ -30,23 +30,22 @@ type {{StructName}}ListPaging struct {
 }
 
 func ({{VariableName}} *{{StructName}}) Create(db *gorm.DB) error {
-    return db.Create(&{{VariableName}}).Error
+	return db.Create(&{{VariableName}}).Error
 }
 
 func ({{VariableName}} *{{StructName}}) Save(db *gorm.DB) error {
-    result := db.Save(&{{VariableName}})
-    return result.Error
+	result := db.Save(&{{VariableName}})
+	return result.Error
 }
 
 func ({{VariableName}} *{{StructName}}) Delete(db *gorm.DB) (rowsAffected int64) {
-    result := db.Delete(&{{VariableName}})
-    return result.RowsAffected
+	result := db.Delete(&{{VariableName}})
+	return result.RowsAffected
 }
-
 
 // GetStringID 获取 ID 的字符串格式.
 func ({{VariableName}} *{{StructName}}) GetStringID() string {
-    return strconv.Itoa(int({{VariableName}}.ID))
+	return strconv.Itoa(int({{VariableName}}.ID))
 }
 
 // CreateOrUpdate 创建或更新.

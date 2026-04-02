@@ -24,6 +24,9 @@ func runMakeModel(_ *cobra.Command, args []string) {
 		return
 	}
 
+	// 确保 base model 文件存在（BaseID、BaseTimeField）
+	createFileFromStub("internal/models/model.go", "model/base", model)
+
 	createFileFromStub("internal/models/"+model.PackageName+".go", "model/model", model)
 	createFileFromStub(repositoryDir+model.PackageName+"_util.go", "model/model_util", model)
 	createFileFromStub(repositoryDir+model.PackageName+"_i.go", "model/i", model)

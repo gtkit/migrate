@@ -172,18 +172,20 @@ myapp make model user
 默认会生成：
 
 ```text
-internal/models/model.go
-internal/models/doc.go
-internal/models/user.go
-internal/repository/user/repository.go
-internal/repository/user/repository_util.go
+internal/models/model.go                        # BaseID、BaseTimeField（仅首次生成）
+internal/models/doc.go                          # 包注释（仅首次生成）
+internal/models/user.go                         # GORM model 骨架
+internal/repository/user/user_i.go              # Repository 结构体 + New 构造函数
+internal/repository/user/user_util.go           # Get / GetBy / All / IsExist / Paginate
 ```
 
 其中：
 
 - `model.go` / `doc.go` 只会在不存在时补齐，不会反复覆盖
-- `user.go` 是 GORM model 基础骨架
-- `repository.go` / `repository_util.go` 是最小可用的 GORM repository 模板
+- `user.go` 是 GORM model 骨架，包含 `ListPaging` 分页结构体、`Create` / `Save` / `Delete` / `CreateOrUpdate` / `MarshalBinary` / `UnmarshalBinary` 等常用方法
+- `user_i.go` 定义 `Repository` 结构体、`New(db *gorm.DB)` 构造函数、`mdbCtx` context 注入
+- `user_util.go` 包含 `Get` / `GetBy` / `All` / `IsExist` / `Paginate` 基础 CRUD 方法
+- 时间字段默认使用 `datetime` 类型（而非 `timestamp`），兼容阿里云 RDS 严格模式
 
 如果你已经有自定义 model/repository 实现，建议只在新实体创建初期使用此命令，之后按项目规范手工演化。
 
@@ -216,21 +218,32 @@ myapp make migration drop_index_email_from_users_table
 | `drop_column_<column>_from_<table>_table` | `drop_column_email_from_users_table` | 生成删列 migration，`down` 默认标记为人工补全 |
 | `drop_index_<name>_from_<table>_table` | `drop_index_email_from_users_table` | 生成删索引 migration，`down` 默认标记为人工补全 |
 
-执行后会在 `database/migrations/` 下生成形如 `2026_03_17_120000_create_users_table.go` 的文件：
+执行后会在 `database/migrations/` 下生成形如 `2026_03_17_120000_create_users_table.go` 的文件。
+
+不同 action 使用不同的 migration 模板：
+
+| action | up 行为 | down 行为 |
+|--------|---------|-----------|
+| `create` | `CreateTable` | `DropTable` |
+| `update` | `AutoMigrate` | 标记为不可逆，需人工补全 |
+| `add` | `AddColumn`（带存在性检查） | `DropColumn`（带存在性检查） |
+| `drop` | `DropTable` / `DropColumn` / `DropIndex` | 对应的反向操作 |
+
+示例（`create`）：
 
 ```go
 package migrations
 
 import (
+    "myproject/internal/models"
     "gorm.io/gorm"
 
-    "myproject/internal/models"
     "github.com/gtkit/migrate/v2/migration"
 )
 
 func init() {
     up := func(db *gorm.DB) error {
-        return db.AutoMigrate(&models.User{})
+        return db.Migrator().CreateTable(&models.User{})
     }
 
     down := func(db *gorm.DB) error {
@@ -241,7 +254,7 @@ func init() {
 }
 ```
 
-`create` 操作会同时在 `internal/models/` 和 `internal/repository/<model>/` 下生成默认代码；如果 `internal/models/model.go`、`internal/models/doc.go`、`database/migrations/doc.go` 不存在，也会自动补齐。
+`create` 操作会同时在 `internal/models/` 和 `internal/repository/<model>/` 下生成默认代码（model 骨架 + repository CRUD）；如果 `internal/models/model.go`、`internal/models/doc.go`、`database/migrations/doc.go` 不存在，也会自动补齐。
 
 注意：
 

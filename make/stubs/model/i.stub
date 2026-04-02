@@ -1,58 +1,22 @@
-//Package {{PackageName}} 模型
+// Package {{PackageName}} 模型
 package {{PackageName}}
 
 import (
-    "context"
+	"context"
 
-	"github.com/redis/go-redis/v9"
-
-	"{{ProjectName}}/internal/dao"
-	"{{ProjectName}}/internal/models"
-	"{{ProjectName}}/internal/pkg/paginator"
+	"gorm.io/gorm"
 )
 
-func _() {
-	var _ Repositer = (*reposit)(nil)
+type Repository struct {
+	db *gorm.DB
 }
 
-type Repositer interface {
-	i()
-	Get(ctx context.Context, idstr string, fields ...string) ({{VariableName}} *models.{{StructName}}, err error)
-	GetBy(ctx context.Context, field, value string) ({{VariableName}} *models.{{StructName}}, err error)
-	All(ctx context.Context, fields ...string) ([]*models.{{StructName}}, error)
-	IsExist(ctx context.Context, field, value string) bool
-	Paginate(ctx context.Context, baseURL string, pagination paginator.Pagination, args ...any) (*models.{{StructName}}ListPaging, error)
-}
-type reposit struct {
-	dao dao.Dao
-}
-
-func New(dao dao.Dao) Repositer {
-	return &reposit{
-		dao: dao,
+func New(db *gorm.DB) *Repository {
+	return &Repository{
+		db: db,
 	}
 }
 
-func (r *reposit) i() {}
-
-func (r *reposit) mdb() dao.MyDB {
-	return r.dao.Mdb()
-}
-
-func (r *reposit) mdbCtx(ctx context.Context) dao.MyDB {
-	return r.mdb().WithContext(ctx)
-}
-
-func (r *reposit) rdb(rdb ...int) dao.RDB {
-	if len(rdb) == 0 {
-		return r.dao.Rdb(0)
-	}
-	return r.dao.Rdb(rdb[0])
-}
-
-func (r *reposit) rdbClient(rdb ...int) *redis.Client {
-	if len(rdb) == 0 {
-		return r.dao.Rdb(0).Client()
-	}
-	return r.dao.Rdb(rdb[0]).Client()
+func (r *Repository) mdbCtx(ctx context.Context) *gorm.DB {
+	return r.db.WithContext(ctx)
 }
