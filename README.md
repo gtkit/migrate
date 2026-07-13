@@ -85,6 +85,9 @@ myapp make migration update_users_table
 # 添加字段到表
 myapp make migration add_email_to_users_table
 
+# 添加字段并指定位置（MySQL AFTER）——生成 raw SQL 模板，列类型需手工补全
+myapp make migration add_email_to_users_table --after phone
+
 # 删除字段
 myapp make migration drop_column_avatar_from_users_table
 
@@ -162,7 +165,54 @@ myapp migrate refresh
 myapp migrate fresh
 ```
 
-### 5. 命令输出示例
+### 5. Makefile 集成
+
+推荐在项目中创建 `migrate.mk`，通过 `include migrate.mk` 引入到主 `Makefile`，统一使用 `make` 命令操作：
+
+```makefile
+# Makefile
+include migrate.mk
+```
+
+`migrate.mk` 示例：
+
+```makefile
+MIGRATE_ENV = $(if $(ENV),$(ENV),dev)
+
+migrate:                ## 执行迁移
+	go run . migrate up -c $(MIGRATE_ENV)
+
+migrate-down:           ## 回滚最后一批
+	go run . migrate down -c $(MIGRATE_ENV)
+
+migrate-status:         ## 查看迁移状态
+	go run . migrate status -c $(MIGRATE_ENV)
+
+migrate-pending:        ## 预览待执行迁移（dry-run）
+	go run . migrate pending -c $(MIGRATE_ENV)
+
+migration:              ## 生成 migration 文件: make migration create_users_table
+	go run . make migration $(filter-out $@,$(MAKECMDGOALS)) -c dev
+
+model:                  ## 生成 model + repository: make model user
+	go run . make model $(filter-out $@,$(MAKECMDGOALS)) -c dev
+
+%:
+	@:
+```
+
+常用命令速查：
+
+| Makefile 命令 | 作用 |
+|---------------|------|
+| `make migrate` | 执行所有未运行的迁移 |
+| `make migrate-down` | 回滚最后一批迁移 |
+| `make migrate-status` | 查看迁移状态 |
+| `make migrate-pending` | 预览待执行迁移 |
+| `make model user` | 生成 model + repository |
+| `make migration create_users_table` | 生成 migration 文件 |
+
+### 6. 命令输出示例
 
 ```bash
 $ myapp migrate pending

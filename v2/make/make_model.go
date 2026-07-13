@@ -24,10 +24,10 @@ func generateModelScaffold(cfg Config, model Model) error {
 	if err := createFileFromStub(modelFilePath(cfg, model), "model/model", model, writeSkipIfExists); err != nil {
 		return err
 	}
-	if err := createFileFromStub(repositoryFilePath(cfg, model), "model/repository", model, writeFailIfExists); err != nil {
+	if err := createFileFromStub(repositoryFilePath(cfg, model), "model/repository", model, writeSkipIfExists); err != nil {
 		return err
 	}
-	if err := createFileFromStub(repositoryUtilFilePath(cfg, model), "model/repository_util", model, writeFailIfExists); err != nil {
+	if err := createFileFromStub(repositoryUtilFilePath(cfg, model), "model/repository_util", model, writeSkipIfExists); err != nil {
 		return err
 	}
 	return nil

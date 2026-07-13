@@ -92,7 +92,7 @@ func createFileFromStub(filePath, stubName string, model Model, variables ...any
 
 	// 目标文件已存在
 	if file.Exists(filePath) {
-		if strings.Contains(filePath, "models") {
+		if strings.Contains(filePath, "models") || strings.Contains(filePath, "repository") {
 			return
 		}
 		console.Exit(filePath + " already exists!")

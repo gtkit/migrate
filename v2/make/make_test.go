@@ -120,6 +120,58 @@ func TestMakeMigrationDropColumnMarksIrreversibleDown(t *testing.T) {
 	}
 }
 
+func TestMakeMigrationAddWithAfterGeneratesRawSQL(t *testing.T) {
+	resetMakeTestState(t)
+	tmpDir := t.TempDir()
+	chdirForTest(t, tmpDir)
+
+	SetConfig(Config{ProjectName: "example.com/testapp"})
+
+	executeMakeCommand(t, "migration", "--after", "pay_channel", "add_pay_mch_id_to_orders_table")
+
+	migrations, err := filepath.Glob(filepath.Join(tmpDir, "database/migrations/*_add_pay_mch_id_to_orders_table.go"))
+	if err != nil {
+		t.Fatalf("glob migration file: %v", err)
+	}
+	if len(migrations) != 1 {
+		t.Fatalf("expected exactly one generated migration, got %d", len(migrations))
+	}
+	assertGoFileParses(t, migrations[0])
+
+	content := readFile(t, migrations[0])
+	if !strings.Contains(content, "ALTER TABLE `orders` ADD COLUMN `pay_mch_id`") {
+		t.Fatalf("expected raw SQL ADD COLUMN, got:\n%s", content)
+	}
+	if !strings.Contains(content, "AFTER `pay_channel`") {
+		t.Fatalf("expected AFTER clause, got:\n%s", content)
+	}
+	if strings.Contains(content, "AddColumn(") {
+		t.Fatalf("raw SQL stub should not use Migrator().AddColumn, got:\n%s", content)
+	}
+}
+
+func TestMakeMigrationAddWithoutAfterUsesMigratorStub(t *testing.T) {
+	resetMakeTestState(t)
+	tmpDir := t.TempDir()
+	chdirForTest(t, tmpDir)
+
+	SetConfig(Config{ProjectName: "example.com/testapp"})
+
+	executeMakeCommand(t, "migration", "add_email_to_users_table")
+
+	migrations, err := filepath.Glob(filepath.Join(tmpDir, "database/migrations/*_add_email_to_users_table.go"))
+	if err != nil {
+		t.Fatalf("glob migration file: %v", err)
+	}
+	if len(migrations) != 1 {
+		t.Fatalf("expected exactly one generated migration, got %d", len(migrations))
+	}
+	content := readFile(t, migrations[0])
+	if !strings.Contains(content, "AddColumn(") {
+		t.Fatalf("default add (no --after) should use Migrator().AddColumn, got:\n%s", content)
+	}
+}
+
 func TestMakeDDLGeneratesSQLFile(t *testing.T) {
 	resetMakeTestState(t)
 	tmpDir := t.TempDir()

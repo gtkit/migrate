@@ -6,6 +6,7 @@ import (
 
 	"{{ProjectName}}/internal/models"
 	"{{ProjectName}}/internal/pkg/paginator"
+	"gorm.io/gorm/clause"
 )
 
 func (r *Repository) Get(ctx context.Context, idstr string) ({{VariableName}} models.{{StructName}}) {
@@ -50,4 +51,12 @@ func (r *Repository) Paginate(ctx context.Context, baseURL string, pagination pa
 		List:   {{VariableNamePlural}},
 		Paging: paging,
 	}, nil
+}
+
+// CreateOrUpdate 创建或更新.
+func (r *Repository) CreateOrUpdate(ctx context.Context, entity *models.{{StructName}}, primaryKey string, updateColumns []string) error {
+	return r.mdbCtx(ctx).Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: primaryKey}},
+		DoUpdates: clause.AssignmentColumns(updateColumns),
+	}).Create(entity).Error
 }

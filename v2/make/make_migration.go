@@ -16,6 +16,12 @@ var CmdMakeMigration = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 }
 
+func init() {
+	// --after 仅对 add 操作生效：指定后改用 raw SQL stub，并把新列放在该列之后
+	// （MySQL AFTER 语义；GORM Migrator().AddColumn 无法指定列顺序）。
+	CmdMakeMigration.Flags().String("after", "", "For `add_*` migrations: place the new column AFTER this column (generates a raw SQL ALTER stub)")
+}
+
 func runMakeMigration(cmd *cobra.Command, args []string) error {
 	cfg := resolveConfig(cmd)
 	action, objectName, tableName, columnName, err := parseMigrationName(args[0])
@@ -39,8 +45,14 @@ func runMakeMigration(cmd *cobra.Command, args []string) error {
 	fileName := timeStr + "_" + args[0]
 	filePath := migrationFilePath(cfg, fileName)
 
+	extra := map[string]string{"{{FileName}}": fileName}
 	stubName := migrationStubName(action, objectName)
-	if err := createFileFromStub(filePath, stubName, model, writeFailIfExists, map[string]string{"{{FileName}}": fileName}); err != nil {
+	// add 操作指定了 --after 时改用 raw SQL stub，以支持 MySQL 的 AFTER 列定位。
+	if after, _ := cmd.Flags().GetString("after"); action == "add" && after != "" {
+		stubName = "migration_add_raw"
+		extra["{{AfterColumnName}}"] = after
+	}
+	if err := createFileFromStub(filePath, stubName, model, writeFailIfExists, extra); err != nil {
 		return err
 	}
 

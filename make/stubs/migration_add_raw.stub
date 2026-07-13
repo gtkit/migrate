@@ -1,0 +1,30 @@
+package migrations
+
+import (
+	"gorm.io/gorm"
+
+	"github.com/gtkit/migrate/migration"
+)
+
+func init() {
+	up := func(db *gorm.DB) error {
+		// 幂等：列已存在则跳过，重复执行无副作用。
+		if db.Migrator().HasColumn("{{TableName}}", "{{ColumnName}}") {
+			return nil
+		}
+		// TODO: 补全列定义（类型/约束/注释），例如：
+		//   VARCHAR(64) NOT NULL DEFAULT '' COMMENT '说明'
+		return db.Exec(
+			"ALTER TABLE `{{TableName}}` ADD COLUMN `{{ColumnName}}` /* TODO: 列定义 */ AFTER `{{AfterColumnName}}`",
+		).Error
+	}
+
+	down := func(db *gorm.DB) error {
+		if !db.Migrator().HasColumn("{{TableName}}", "{{ColumnName}}") {
+			return nil
+		}
+		return db.Exec("ALTER TABLE `{{TableName}}` DROP COLUMN `{{ColumnName}}`").Error
+	}
+
+	migration.Add("{{FileName}}", up, down)
+}

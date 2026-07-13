@@ -201,6 +201,9 @@ myapp make migration update_users_table
 # 添加字段到表
 myapp make migration add_email_to_users_table
 
+# 添加字段并指定位置（MySQL AFTER）——生成 raw SQL 模板，列类型需手工补全
+myapp make migration add_email_to_users_table --after phone
+
 # 删除字段
 myapp make migration drop_column_avatar_from_users_table
 
@@ -214,9 +217,12 @@ myapp make migration drop_index_email_from_users_table
 |------|------|----------|
 | `create_<table>_table` | `create_users_table` | 生成建表 migration，并自动生成 model/repository |
 | `update_<table>_table` | `update_users_table` | 生成 `AutoMigrate` 模板，`down` 默认标记为不可逆 |
-| `add_<column>_to_<table>_table` | `add_email_to_users_table` | 生成加列 migration |
+| `add_<column>_to_<table>_table` | `add_email_to_users_table` | 生成加列 migration（默认用 `Migrator().AddColumn`，列追加到表末尾） |
+| `add_<column>_to_<table>_table --after <col>` | `add_email_to_users_table --after phone` | 生成 **raw SQL** 加列 migration，新列置于 `<col>` 之后（MySQL `AFTER`）；列类型/约束/注释以 `TODO` 占位待手工补全 |
 | `drop_column_<column>_from_<table>_table` | `drop_column_email_from_users_table` | 生成删列 migration，`down` 默认标记为人工补全 |
 | `drop_index_<name>_from_<table>_table` | `drop_index_email_from_users_table` | 生成删索引 migration，`down` 默认标记为人工补全 |
+
+> `--after` 仅对 `add_*` 模式生效。原因：GORM `Migrator().AddColumn` 无法指定列顺序，因此指定位置时改走 `db.Exec` 的 raw `ALTER TABLE ... ADD COLUMN ... AFTER ...`。注意列的物理顺序在 MySQL 中仅影响展示，不影响功能。
 
 执行后会在 `database/migrations/` 下生成形如 `2026_03_17_120000_create_users_table.go` 的文件。
 
@@ -433,9 +439,85 @@ myapp make ddl diff --all
 - 你改了 model
 - 忘了同步更新 DDL 文件
 - CI 用 `make ddl diff --all` 直接拦住
-### 6. 推荐工作流
+### 6. Makefile 集成
 
-#### 6.1 新增一张表
+推荐在项目中创建 `migrate.mk`，通过 `include migrate.mk` 引入到主 `Makefile`，统一使用 `make` 命令操作：
+
+```makefile
+# Makefile
+include migrate.mk
+```
+
+`migrate.mk` 示例：
+
+```makefile
+MIGRATE_ENV = $(if $(ENV),$(ENV),dev)
+
+# ─── migrate 命令 ───────────────────────────────────────
+
+migrate:                ## 执行迁移
+	go run . migrate up -c $(MIGRATE_ENV)
+
+migrate-down:           ## 回滚最后一批
+	go run . migrate down -c $(MIGRATE_ENV)
+
+migrate-status:         ## 查看迁移状态
+	go run . migrate status -c $(MIGRATE_ENV)
+
+migrate-reset:          ## 回滚所有迁移
+	go run . migrate reset -c $(MIGRATE_ENV)
+
+migrate-refresh:        ## 回滚后重放所有迁移
+	go run . migrate refresh -c $(MIGRATE_ENV)
+
+migrate-fresh:          ## 删表后重放（⚠️ 危险）
+	go run . migrate fresh -c $(MIGRATE_ENV)
+
+migrate-pending:        ## 预览待执行迁移（dry-run）
+	go run . migrate pending -c $(MIGRATE_ENV)
+
+migrate-lint:           ## 检查迁移漂移和回滚风险
+	go run . migrate lint -c $(MIGRATE_ENV)
+
+migrate-lint-strict:    ## 严格模式（warning 也视为失败）
+	go run . migrate lint --strict -c $(MIGRATE_ENV)
+
+# ─── make 命令（代码生成） ──────────────────────────────
+
+migration:              ## 生成 migration 文件: make migration create_users_table
+	go run . make migration $(filter-out $@,$(MAKECMDGOALS)) -c dev
+
+model:                  ## 生成 model + repository: make model user
+	go run . make model $(filter-out $@,$(MAKECMDGOALS)) -c dev
+
+ddl:                    ## 生成建表 DDL: make ddl user / make ddl --all
+	go run . make ddl $(filter-out $@,$(MAKECMDGOALS)) -c dev
+
+ddl-diff:               ## 对比 DDL 漂移: make ddl-diff user / make ddl-diff --all
+	go run . make ddl diff $(filter-out $@,$(MAKECMDGOALS)) -c dev
+
+%:
+	@:
+```
+
+常用命令速查：
+
+| Makefile 命令 | 等价于 | 作用 |
+|---------------|--------|------|
+| `make migrate` | `migrate up` | 执行所有未运行的迁移 |
+| `make migrate-down` | `migrate down` | 回滚最后一批迁移 |
+| `make migrate-status` | `migrate status` | 查看迁移状态 |
+| `make migrate-pending` | `migrate pending` | 预览待执行迁移 |
+| `make migrate-lint` | `migrate lint` | 检查漂移和回滚风险 |
+| `make migrate-lint-strict` | `migrate lint --strict` | 严格模式，CI 推荐 |
+| `make model user` | `make model user` | 生成 model + repository |
+| `make migration create_users_table` | `make migration ...` | 生成 migration 文件 |
+| `make ddl user` | `make ddl user` | 生成建表 DDL SQL |
+| `make ddl-diff --all` | `make ddl diff --all` | 对比 schema 漂移 |
+
+### 7. 推荐工作流
+
+#### 7.1 新增一张表
 
 ```bash
 myapp make migration create_users_table
@@ -444,7 +526,7 @@ myapp migrate lint
 myapp migrate up
 ```
 
-#### 6.2 修改现有表结构
+#### 7.2 修改现有表结构
 
 ```bash
 myapp make migration add_email_to_users_table
@@ -453,7 +535,7 @@ myapp make ddl diff users
 myapp migrate lint --strict
 ```
 
-#### 6.3 CI 建议
+#### 7.3 CI 建议
 
 最常见的 CI 检查顺序：
 
@@ -470,7 +552,7 @@ myapp make ddl diff --all
 go test -tags=integration ./migration -run 'TestMigrator(MySQL|Postgres)Integration'
 ```
 
-### 7. 命令输出示例
+### 8. 命令输出示例
 
 ```bash
 $ myapp migrate pending
