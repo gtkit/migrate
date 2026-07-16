@@ -5,7 +5,8 @@
 ## 特性
 
 - 迁移文件按时间戳排序，支持 up / down / reset / refresh / fresh
-- Advisory Lock 防止多实例并发迁移冲突（MySQL `GET_LOCK`、PostgreSQL `pg_advisory_lock`）
+- 每个迁移的执行逻辑与迁移记录写入在同一事务中提交：PostgreSQL / SQLite 支持事务型 DDL，失败自动整体回滚，不留"已执行但无记录"的中间状态（MySQL 的 DDL 会隐式提交、无法回滚，属其固有限制）
+- Advisory Lock 防止多实例并发迁移冲突（MySQL `GET_LOCK`、PostgreSQL `pg_advisory_lock`），获取锁超时可配置，超时返回错误而非无限阻塞
 - `pending` 命令预览待执行迁移（dry-run）
 - 结构化日志接口，可注入 zap / zerolog / slog 等
 - Lock name 可配置，同一数据库多项目共存不冲突
@@ -69,6 +70,7 @@ migrate.Setup(db,
     migrate.WithMigrationDir("database/migrations"),  // 迁移文件目录，默认 database/migrations
     migrate.WithTimeout(10 * time.Minute),            // 迁移超时时间，默认 5 分钟
     migrate.WithLockName("myproject_migrate"),         // 迁移锁名称，默认 migrate_lock
+    migrate.WithLockTimeout(30 * time.Second),        // 获取迁移锁的最长等待时间，默认 10 秒
     migrate.WithLogger(myLogger),                     // 自定义日志，默认 stdout
 )
 ```
@@ -134,10 +136,10 @@ func init() {
 `create` 操作会同时生成以下文件：
 
 ```text
-internal/models/model.go          # BaseID、BaseTimeField（仅首次生成）
-internal/models/user.go           # GORM model 骨架（含 ListPaging、CRUD 方法）
-internal/repository/user/user_i.go      # Repository 结构体 + New 构造函数
-internal/repository/user/user_util.go   # Get / GetBy / All / IsExist / Paginate
+internal/models/model.go                    # BaseID、BaseTimeField（仅首次生成）
+internal/models/user.go                     # GORM model 骨架（含 ListPaging、CRUD 方法）
+internal/repository/user/repository.go      # Repository 结构体 + New(db) 构造函数
+internal/repository/user/repository_util.go # Get / GetBy / All / IsExist / Paginate
 ```
 
 ### 4. 执行迁移

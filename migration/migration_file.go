@@ -1,7 +1,6 @@
 package migration
 
 import (
-	"fmt"
 	"sync"
 
 	"gorm.io/gorm"
@@ -86,13 +85,4 @@ func (r *Registry) Len() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.files)
-}
-
-// getMigrationFile 从默认注册表获取迁移文件（内部使用）.
-func getMigrationFile(name string) (MigrationFile, error) {
-	mf, ok := defaultRegistry.Get(name)
-	if !ok {
-		return MigrationFile{}, fmt.Errorf("migration file %q not found in registry", name)
-	}
-	return mf, nil
 }

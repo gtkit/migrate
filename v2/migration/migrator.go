@@ -7,18 +7,21 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gorm.io/gorm"
 )
 
 // Migrator 数据迁移操作核心.
 type Migrator struct {
-	Folder   string
-	DB       *gorm.DB
-	dbType   DBType
-	lock     migrationLock
-	registry *Registry
-	logger   Logger
+	Folder      string
+	DB          *gorm.DB
+	dbType      DBType
+	lock        migrationLock
+	lockName    string
+	lockTimeout time.Duration
+	registry    *Registry
+	logger      Logger
 }
 
 // MigratorOption 配置 Migrator 的选项函数.
@@ -38,7 +41,18 @@ func WithLogger(l Logger) MigratorOption {
 func WithLockName(name string) MigratorOption {
 	return func(m *Migrator) {
 		if name != "" {
-			m.lock = newLock(m.DB, m.dbType, name)
+			m.lockName = name
+		}
+	}
+}
+
+// WithLockTimeout 设置获取迁移锁的最长等待时间.
+// MySQL 通过 GET_LOCK 的超时参数实现；PostgreSQL 通过 statement_timeout 实现.
+// 超时后返回错误而非无限阻塞，避免某个实例的长迁移导致其他实例永久挂起.
+func WithLockTimeout(d time.Duration) MigratorOption {
+	return func(m *Migrator) {
+		if d > 0 {
+			m.lockTimeout = d
 		}
 	}
 }
@@ -59,17 +73,21 @@ const defaultLockName = "migrate_lock"
 func NewMigrator(folder string, db *gorm.DB, opts ...MigratorOption) *Migrator {
 	dbType := DetectDBType(db)
 	m := &Migrator{
-		Folder:   folder,
-		DB:       db,
-		dbType:   dbType,
-		lock:     newLock(db, dbType, defaultLockName),
-		registry: defaultRegistry,
-		logger:   &defaultLogger{},
+		Folder:      folder,
+		DB:          db,
+		dbType:      dbType,
+		lockName:    defaultLockName,
+		lockTimeout: defaultLockTimeout,
+		registry:    defaultRegistry,
+		logger:      &defaultLogger{},
 	}
 
 	for _, opt := range opts {
 		opt(m)
 	}
+
+	// 所有选项应用完成后再构建锁，避免 WithLockName 与 WithLockTimeout 的顺序依赖.
+	m.lock = newLock(db, dbType, m.lockName, m.lockTimeout)
 
 	return m
 }
@@ -406,35 +424,32 @@ func (m *Migrator) upWithoutLock(ctx context.Context) error {
 }
 
 // runUpMigration 执行单个迁移.
+// 迁移逻辑与迁移记录写入在同一事务中提交：对支持事务型 DDL 的数据库
+// （PostgreSQL、SQLite）能保证原子性，中途失败整体回滚，不会留下
+// "已执行但无记录" 的中间状态；MySQL 的 DDL 会隐式提交、无法回滚，
+// 此为 MySQL 固有限制，此时事务仅保护记录写入.
 func (m *Migrator) runUpMigration(ctx context.Context, mfile MigrationFile, batch int) (retErr error) {
 	if mfile.Up == nil {
 		// 没有 Up 函数，只记录
 		return m.recordMigration(ctx, mfile.FileName, batch)
 	}
 
-	// 捕获迁移函数中的 panic，转化为 error
+	// 捕获迁移函数中的 panic，转化为 error（gorm.Transaction 遇 panic 会先回滚再向上抛出）
 	defer func() {
 		if r := recover(); r != nil {
 			retErr = fmt.Errorf("migration %s panicked: %v", mfile.FileName, r)
 		}
 	}()
 
-	// 执行迁移 Up 函数
-	if err := mfile.Up(m.DB.WithContext(ctx)); err != nil {
-		return fmt.Errorf("execute up: %w", err)
-	}
-
-	// 记录迁移
-	if err := m.recordMigration(ctx, mfile.FileName, batch); err != nil {
-		// Up 已执行但记录写入失败 — 这是最危险的情况
-		// 返回明确的错误信息，让运维人员手动处理
-		return fmt.Errorf(
-			"CRITICAL: migration %s executed successfully but failed to record: %w (manual intervention required)",
-			mfile.FileName, err,
-		)
-	}
-
-	return nil
+	return m.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := mfile.Up(tx); err != nil {
+			return fmt.Errorf("execute up: %w", err)
+		}
+		if err := tx.Create(&Migration{Migration: mfile.FileName, Batch: batch}).Error; err != nil {
+			return fmt.Errorf("record migration %s: %w", mfile.FileName, err)
+		}
+		return nil
+	})
 }
 
 // recordMigration 写入迁移记录.
@@ -452,29 +467,16 @@ func (m *Migrator) rollbackMigrations(ctx context.Context, migrations []Migratio
 	}
 
 	for _, record := range migrations {
-		mfile, err := getMigrationFile(record.Migration)
-		if err != nil {
-			return fmt.Errorf("rollback %s: %w", record.Migration, err)
+		mfile, ok := m.registry.Get(record.Migration)
+		if !ok {
+			return fmt.Errorf("rollback %s: migration file %q not found in registry", record.Migration, record.Migration)
 		}
 
 		m.logger.Info("rolling back", "file", record.Migration, "batch", record.Batch)
 
-		// 执行 Down（带 panic 保护）
-		if mfile.Down != nil {
-			if err := m.safeExecDown(ctx, mfile); err != nil {
-				m.logger.Error("rollback failed", "file", record.Migration, "error", err)
-				return fmt.Errorf("execute down for %s: %w", record.Migration, err)
-			}
-		}
-
-		// 删除迁移记录
-		if err := m.DB.WithContext(ctx).Delete(&record).Error; err != nil {
-			m.logger.Error("CRITICAL: rollback record deletion failed",
-				"file", record.Migration, "error", err)
-			return fmt.Errorf(
-				"CRITICAL: rollback %s executed but failed to delete record: %w (manual intervention required)",
-				record.Migration, err,
-			)
+		if err := m.runDownMigration(ctx, mfile, record); err != nil {
+			m.logger.Error("rollback failed", "file", record.Migration, "error", err)
+			return err
 		}
 
 		m.logger.Info("rolled back", "file", record.Migration)
@@ -483,15 +485,26 @@ func (m *Migrator) rollbackMigrations(ctx context.Context, migrations []Migratio
 	return nil
 }
 
-// safeExecDown 安全执行 Down 函数，捕获 panic.
-func (m *Migrator) safeExecDown(ctx context.Context, mfile MigrationFile) (retErr error) {
+// runDownMigration 在同一事务中执行 Down 逻辑并删除迁移记录，带 panic 保护.
+// 与 runUpMigration 相同：PostgreSQL、SQLite 可保证原子回滚；MySQL 的 DDL 无法回滚.
+func (m *Migrator) runDownMigration(ctx context.Context, mfile MigrationFile, record Migration) (retErr error) {
 	defer func() {
 		if r := recover(); r != nil {
 			retErr = fmt.Errorf("migration %s down panicked: %v", mfile.FileName, r)
 		}
 	}()
 
-	return mfile.Down(m.DB.WithContext(ctx))
+	return m.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if mfile.Down != nil {
+			if err := mfile.Down(tx); err != nil {
+				return fmt.Errorf("execute down for %s: %w", record.Migration, err)
+			}
+		}
+		if err := tx.Delete(&record).Error; err != nil {
+			return fmt.Errorf("delete migration record %s: %w", record.Migration, err)
+		}
+		return nil
+	})
 }
 
 // getBatch 获取下一个批次号.

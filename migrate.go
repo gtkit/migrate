@@ -31,6 +31,10 @@ type Config struct {
 	// 当同一数据库被多个项目共用时，不同项目应使用不同的锁名称.
 	LockName string
 
+	// LockTimeout 获取迁移锁的最长等待时间（默认 10 秒）.
+	// 超时后返回错误而非无限阻塞.
+	LockTimeout time.Duration
+
 	// Logger 自定义日志实现.
 	// 传入 nil 时使用默认的 stdout 日志.
 	Logger migration.Logger
@@ -76,6 +80,16 @@ func WithLockName(name string) Option {
 	}
 }
 
+// WithLockTimeout 设置获取迁移锁的最长等待时间.
+// 超时后返回错误而非无限阻塞，避免某个实例的长迁移导致其他实例永久挂起.
+func WithLockTimeout(d time.Duration) Option {
+	return func(c *Config) {
+		if d > 0 {
+			c.LockTimeout = d
+		}
+	}
+}
+
 // WithLogger 设置结构化日志实现.
 // 传入 nil 时使用默认的 stdout 日志.
 // 生产环境推荐注入 zerolog/zap 等实现.
@@ -92,6 +106,7 @@ func defaultConfig() *Config {
 		MigrationDir: "database/migrations",
 		Timeout:      5 * time.Minute,
 		LockName:     "migrate_lock",
+		LockTimeout:  10 * time.Second,
 	}
 }
 
@@ -135,6 +150,9 @@ func newMigrator() *migration.Migrator {
 	var opts []migration.MigratorOption
 	if cfg.LockName != "" {
 		opts = append(opts, migration.WithLockName(cfg.LockName))
+	}
+	if cfg.LockTimeout > 0 {
+		opts = append(opts, migration.WithLockTimeout(cfg.LockTimeout))
 	}
 	if cfg.Logger != nil {
 		opts = append(opts, migration.WithLogger(cfg.Logger))

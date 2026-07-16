@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -256,15 +255,4 @@ func compactStrings(values []string) []string {
 		result = append(result, value)
 	}
 	return result
-}
-
-func modelTypeName(value any) string {
-	if value == nil {
-		return ""
-	}
-	typ := reflect.TypeOf(value)
-	for typ.Kind() == reflect.Pointer {
-		typ = typ.Elem()
-	}
-	return typ.Name()
 }
