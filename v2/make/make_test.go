@@ -90,8 +90,15 @@ func TestMakeMigrationSupportsCustomDirectories(t *testing.T) {
 	}
 
 	migrationContent := readFile(t, migrations[0])
-	if !strings.Contains(migrationContent, `"example.com/customapp/internal/entities"`) {
-		t.Fatalf("migration should import custom models path, got:\n%s", migrationContent)
+	// create 迁移使用自包含的结构快照，不得引用业务 model 的 import 路径（避免 schema 随 model 演进漂移）。
+	if strings.Contains(migrationContent, "example.com/customapp/internal/entities") {
+		t.Fatalf("create migration must NOT import business model path, got:\n%s", migrationContent)
+	}
+	if !strings.Contains(migrationContent, `return "users"`) {
+		t.Fatalf("create migration should lock table name via TableName, got:\n%s", migrationContent)
+	}
+	if !strings.Contains(migrationContent, "CreateTable(") {
+		t.Fatalf("create migration should call CreateTable on the snapshot struct, got:\n%s", migrationContent)
 	}
 }
 

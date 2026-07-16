@@ -281,19 +281,37 @@ var CmdMigrateLint = &cobra.Command{
 	RunE:  runLint,
 }
 
+var CmdMigrateDownTo = &cobra.Command{
+	Use:   "down-to <version>",
+	Short: "Roll back all migrations newer than <version> (exclusive)",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runDownTo,
+}
+
+var CmdMigrateMarkApplied = &cobra.Command{
+	Use:   "mark-applied",
+	Short: "Mark pending migrations as applied WITHOUT running them (baseline an existing database)",
+	RunE:  runMarkApplied,
+}
+
 func init() {
 	CmdMigrateLint.Flags().Bool("strict", false, "Fail on warnings as well as errors")
 	CmdMigrateLint.Flags().Bool("skip-db", false, "Skip database-applied migration drift checks")
 
+	CmdMigrateMarkApplied.Flags().String("to", "", "Only mark pending migrations up to and including this version")
+	CmdMigrateMarkApplied.Flags().Bool("force", false, "Required: confirm marking versions as applied without running them")
+
 	CmdMigrate.AddCommand(
 		CmdMigrateUp,
 		CmdMigrateRollback,
+		CmdMigrateDownTo,
 		CmdMigrateReset,
 		CmdMigrateRefresh,
 		CmdMigrateFresh,
 		CmdMigrateStatus,
 		CmdMigratePending,
 		CmdMigrateLint,
+		CmdMigrateMarkApplied,
 	)
 }
 
@@ -463,5 +481,61 @@ func runLint(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("%w: %d error(s), %d warning(s)", migration.ErrLintFailed, report.ErrorCount(), report.WarningCount())
 	}
 
+	return nil
+}
+
+func runDownTo(cmd *cobra.Command, args []string) error {
+	target := strings.TrimSpace(args[0])
+	if target == "" {
+		return fmt.Errorf("down-to requires a target migration version")
+	}
+
+	ctx, cancel := newContext()
+	defer cancel()
+
+	cmd.Printf("Rolling back migrations newer than %s...\n", target)
+	if err := newMigrator().RollbackTo(ctx, target); err != nil {
+		return fmt.Errorf("migrate down-to: %w", err)
+	}
+
+	cmd.Println("Rollback completed.")
+	return nil
+}
+
+func runMarkApplied(cmd *cobra.Command, _ []string) error {
+	force, err := cmd.Flags().GetBool("force")
+	if err != nil {
+		return err
+	}
+	if !force {
+		return fmt.Errorf(
+			"mark-applied records versions as applied WITHOUT running their SQL and can hide schema drift; re-run with --force to confirm",
+		)
+	}
+
+	to, err := cmd.Flags().GetString("to")
+	if err != nil {
+		return err
+	}
+	to = strings.TrimSpace(to)
+
+	ctx, cancel := newContext()
+	defer cancel()
+
+	marked, err := newMigrator().MarkApplied(ctx, to)
+	if err != nil {
+		return fmt.Errorf("migrate mark-applied: %w", err)
+	}
+
+	if len(marked) == 0 {
+		cmd.Println("No pending migrations to mark as applied.")
+		return nil
+	}
+
+	cmd.Println("Marked the following migration(s) as applied WITHOUT running them:")
+	for _, name := range marked {
+		cmd.Printf("  %s\n", name)
+	}
+	cmd.Printf("Marked %d migration(s) as applied.\n", len(marked))
 	return nil
 }

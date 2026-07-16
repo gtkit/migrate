@@ -143,3 +143,128 @@ func TestMigratorUpRollsBackOnPanic(t *testing.T) {
 		t.Fatalf("expected table creation to be rolled back on panic")
 	}
 }
+
+// TestMigratorMarkApplied 验证 mark-applied 只写入迁移记录、不执行 Up.
+func TestMigratorMarkApplied(t *testing.T) {
+	db := openExecTestDB(t, "migrator_mark_applied")
+	dir := t.TempDir()
+
+	f1 := "2026_03_24_120000_create_a_table"
+	f2 := "2026_03_24_120001_create_b_table"
+	writeMigrationFile(t, dir, f1, "package migrations\n")
+	writeMigrationFile(t, dir, f2, "package migrations\n")
+
+	registry := NewRegistry()
+	// Up 若被执行会建表；mark-applied 不应执行它们.
+	registry.Add(f1, func(tx *gorm.DB) error { return tx.Migrator().CreateTable(&execTestUser{}) }, nil)
+	registry.Add(f2, func(tx *gorm.DB) error { return tx.Migrator().CreateTable(&execTestUser{}) }, nil)
+
+	m := NewMigrator(dir, db, WithRegistry(registry))
+
+	marked, err := m.MarkApplied(t.Context(), "")
+	if err != nil {
+		t.Fatalf("mark applied: %v", err)
+	}
+	if len(marked) != 2 {
+		t.Fatalf("expected 2 marked, got %d: %v", len(marked), marked)
+	}
+	if db.Migrator().HasTable(&execTestUser{}) {
+		t.Fatalf("mark-applied must not run Up (table should not exist)")
+	}
+
+	upToDate, err := m.IsUpToDate(t.Context())
+	if err != nil {
+		t.Fatalf("is up to date: %v", err)
+	}
+	if !upToDate {
+		t.Fatalf("expected up-to-date after mark-applied")
+	}
+
+	again, err := m.MarkApplied(t.Context(), "")
+	if err != nil {
+		t.Fatalf("mark applied again: %v", err)
+	}
+	if len(again) != 0 {
+		t.Fatalf("expected nothing to mark on second run, got %v", again)
+	}
+}
+
+// TestMigratorMarkAppliedTo 验证 --to 只标记不超过指定版本的 pending 迁移.
+func TestMigratorMarkAppliedTo(t *testing.T) {
+	db := openExecTestDB(t, "migrator_mark_applied_to")
+	dir := t.TempDir()
+
+	f1 := "2026_03_24_120000_create_a_table"
+	f2 := "2026_03_24_120001_create_b_table"
+	f3 := "2026_03_24_120002_create_c_table"
+	noop := func(*gorm.DB) error { return nil }
+	registry := NewRegistry()
+	for _, f := range []string{f1, f2, f3} {
+		writeMigrationFile(t, dir, f, "package migrations\n")
+		registry.Add(f, noop, noop)
+	}
+
+	m := NewMigrator(dir, db, WithRegistry(registry))
+
+	marked, err := m.MarkApplied(t.Context(), f2)
+	if err != nil {
+		t.Fatalf("mark applied to: %v", err)
+	}
+	if len(marked) != 2 || marked[0] != f1 || marked[1] != f2 {
+		t.Fatalf("expected [%s %s], got %v", f1, f2, marked)
+	}
+
+	pending, err := m.Pending(t.Context())
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	if len(pending) != 1 || pending[0] != f3 {
+		t.Fatalf("expected [%s] pending, got %v", f3, pending)
+	}
+}
+
+// TestMigratorRollbackTo 验证 down-to 只回滚版本高于目标（不含目标）的迁移.
+func TestMigratorRollbackTo(t *testing.T) {
+	db := openExecTestDB(t, "migrator_rollback_to")
+	dir := t.TempDir()
+
+	f1 := "2026_03_24_120000_create_a_table"
+	f2 := "2026_03_24_120001_create_b_table"
+	f3 := "2026_03_24_120002_create_c_table"
+	tables := map[string]string{f1: "rt_a", f2: "rt_b", f3: "rt_c"}
+
+	registry := NewRegistry()
+	for _, f := range []string{f1, f2, f3} {
+		tbl := tables[f]
+		writeMigrationFile(t, dir, f, "package migrations\n")
+		registry.Add(f,
+			func(tx *gorm.DB) error { return tx.Exec("CREATE TABLE " + tbl + " (id integer primary key)").Error },
+			func(tx *gorm.DB) error { return tx.Exec("DROP TABLE " + tbl).Error },
+		)
+	}
+
+	m := NewMigrator(dir, db, WithRegistry(registry))
+	if err := m.Up(t.Context()); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+
+	// 回滚到 f1（不含）：应回滚 f2、f3.
+	if err := m.RollbackTo(t.Context(), f1); err != nil {
+		t.Fatalf("rollback-to: %v", err)
+	}
+
+	if !db.Migrator().HasTable("rt_a") {
+		t.Fatalf("rt_a should remain (f1 not rolled back)")
+	}
+	if db.Migrator().HasTable("rt_b") || db.Migrator().HasTable("rt_c") {
+		t.Fatalf("rt_b/rt_c should be dropped after rollback-to f1")
+	}
+
+	pending, err := m.Pending(t.Context())
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("expected 2 pending after rollback-to, got %d: %v", len(pending), pending)
+	}
+}

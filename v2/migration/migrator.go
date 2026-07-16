@@ -276,6 +276,10 @@ func (m *Migrator) Refresh(ctx context.Context) error {
 		return err
 	}
 
+	if err := m.ensureConcurrentConns(); err != nil {
+		return err
+	}
+
 	release, err := m.lock.Acquire(ctx)
 	if err != nil {
 		return fmt.Errorf("acquire migration lock: %w", err)
@@ -301,6 +305,10 @@ func (m *Migrator) Refresh(ctx context.Context) error {
 // Fresh 删除所有表并重新执行所有迁移.
 // ⚠️ 危险操作：会丢失所有数据.
 func (m *Migrator) Fresh(ctx context.Context) error {
+	if err := m.ensureConcurrentConns(); err != nil {
+		return err
+	}
+
 	release, err := m.lock.Acquire(ctx)
 	if err != nil {
 		return fmt.Errorf("acquire migration lock: %w", err)
@@ -389,7 +397,116 @@ func (m *Migrator) Pending(ctx context.Context) ([]string, error) {
 	return pending, nil
 }
 
+// MarkApplied 把 pending 迁移写入迁移记录而不执行其 Up，用于把「已存在等价 schema」
+// 的存量库纳入迁移管理（baseline）.
+// toFile 为空时标记所有 pending；否则只标记文件名 <= toFile 的 pending 迁移.
+// ⚠️ 它不校验数据库真实结构是否与这些迁移等价——标错会让后续 up 跳过真实建表、造成漂移.
+// 返回实际被标记的迁移文件名（升序）.
+func (m *Migrator) MarkApplied(ctx context.Context, toFile string) ([]string, error) {
+	if err := m.Setup(ctx); err != nil {
+		return nil, err
+	}
+
+	release, err := m.lock.Acquire(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("acquire migration lock: %w", err)
+	}
+	defer release()
+
+	migrateFiles, err := m.readAllMigrationFiles()
+	if err != nil {
+		return nil, fmt.Errorf("read migration files: %w", err)
+	}
+
+	migrated, err := m.getMigratedSet(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get migrated records: %w", err)
+	}
+
+	batch, err := m.getBatch(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get batch: %w", err)
+	}
+
+	// readAllMigrationFiles 按文件名（时间戳）升序返回，toMark 天然有序.
+	var toMark []string
+	for _, mfile := range migrateFiles {
+		if _, ok := migrated[mfile.FileName]; ok {
+			continue
+		}
+		if toFile != "" && mfile.FileName > toFile {
+			continue
+		}
+		toMark = append(toMark, mfile.FileName)
+	}
+
+	if len(toMark) == 0 {
+		return nil, nil
+	}
+
+	// 同一事务写入所有 baseline 记录，全成或全败，不留部分标记.
+	if err := m.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for _, name := range toMark {
+			if err := tx.Create(&Migration{Migration: name, Batch: batch}).Error; err != nil {
+				return fmt.Errorf("mark %s applied: %w", name, err)
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	return toMark, nil
+}
+
+// RollbackTo 回滚所有版本高于 targetFile 的已应用迁移（不含 targetFile 本身）.
+// targetFile 为空时等价于 Reset（回滚全部）.
+func (m *Migrator) RollbackTo(ctx context.Context, targetFile string) error {
+	if err := m.Setup(ctx); err != nil {
+		return err
+	}
+
+	release, err := m.lock.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire migration lock: %w", err)
+	}
+	defer release()
+
+	// 按迁移文件名（版本）倒序回滚，保证后应用的先回滚.
+	query := m.DB.WithContext(ctx).Order("migration DESC")
+	if targetFile != "" {
+		query = query.Where("migration > ?", targetFile)
+	}
+
+	var migrations []Migration
+	if err := query.Find(&migrations).Error; err != nil {
+		return fmt.Errorf("get migrations to rollback: %w", err)
+	}
+
+	return m.rollbackMigrations(ctx, migrations)
+}
+
 // --- 内部方法 ---
+
+// ensureConcurrentConns 确保连接池允许并发连接.
+// fresh/refresh 需要一条连接持有迁移锁、另一条执行删表/回滚/重建；
+// MySQL、PostgreSQL 的锁绑定在专属连接上，连接池上限为 1 时会一直死等到超时，此处提前快速拒绝.
+// SQLite 使用 noopLock（不占用连接），无此约束.
+func (m *Migrator) ensureConcurrentConns() error {
+	if m.dbType == DBTypeSQLite {
+		return nil
+	}
+	sqlDB, err := m.DB.DB()
+	if err != nil {
+		return fmt.Errorf("get sql.DB: %w", err)
+	}
+	if sqlDB.Stats().MaxOpenConnections == 1 {
+		return fmt.Errorf(
+			"this command needs at least 2 connections (one holds the migration lock while the other drops/rebuilds); increase SetMaxOpenConns",
+		)
+	}
+	return nil
+}
 
 // upWithoutLock 执行迁移（不获取锁，供 Fresh 内部使用）.
 func (m *Migrator) upWithoutLock(ctx context.Context) error {

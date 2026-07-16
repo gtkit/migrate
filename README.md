@@ -108,30 +108,44 @@ myapp make migration drop_index_email_from_users_table
 | `add` | `AddColumn`（带存在性检查） | `DropColumn`（带存在性检查） |
 | `drop` | `DropTable` / `DropColumn` / `DropIndex` | 对应的反向操作 |
 
-示例（`create`）：
+示例（`create`）——迁移文件**自包含表结构快照，有意不引用业务 model**：业务 model 会随需求演进，而迁移必须锁定「创建当时」的结构，才能保证任何环境、任何时间执行都得到一致的表：
 
 ```go
 package migrations
 
 import (
-    "myproject/internal/models"
+    "time"
+
     "gorm.io/gorm"
 
     "github.com/gtkit/migrate/migration"
 )
 
+// userV20260317120000 是本迁移建表时的结构快照，锁定创建当时的表结构。
+type userV20260317120000 struct {
+    ID        int64          `gorm:"column:id;primaryKey;autoIncrement"`
+    CreatedAt time.Time      `gorm:"column:created_at;type:datetime;index"`
+    UpdatedAt time.Time      `gorm:"column:updated_at;type:datetime;index"`
+    DeletedAt gorm.DeletedAt `gorm:"column:deleted_at;type:datetime;index"`
+    // 在此补全建表字段（不要 import 业务 model）。
+}
+
+func (userV20260317120000) TableName() string { return "users" }
+
 func init() {
     up := func(db *gorm.DB) error {
-        return db.Migrator().CreateTable(&models.User{})
+        return db.Migrator().CreateTable(&userV20260317120000{})
     }
 
     down := func(db *gorm.DB) error {
-        return db.Migrator().DropTable(&models.User{})
+        return db.Migrator().DropTable("users")
     }
 
     migration.Add("2026_03_17_120000_create_users_table", up, down)
 }
 ```
+
+> 生成的业务 model 脚手架（`internal/models/user.go`）与本快照初始一致，但二者之后各自演进：model 随业务变化，迁移文件一旦执行不再修改，字段变更请新建 `add_`/`update_` 迁移。
 
 `create` 操作会同时生成以下文件：
 
@@ -157,15 +171,27 @@ myapp migrate status
 # 回滚最后一批迁移
 myapp migrate down
 
+# 回滚到指定版本（回滚所有比该版本新的迁移，不含该版本本身）
+myapp migrate down-to 2026_03_17_120000_create_users_table
+
 # 回滚所有迁移
 myapp migrate reset
 
-# 回滚所有后重新执行
+# 回滚所有后重新执行（需连接池 MaxOpenConns ≥ 2）
 myapp migrate refresh
 
-# 删除所有表后重新执行（⚠️ 危险，会丢失数据）
+# 删除所有表后重新执行（⚠️ 危险，会丢失数据；需连接池 MaxOpenConns ≥ 2）
 myapp migrate fresh
+
+# 把 pending 迁移标记为已应用而不执行其 SQL（用于接入已有等价结构的存量库，需 --force）
+myapp migrate mark-applied --force
+# 只标记到指定版本为止
+myapp migrate mark-applied --to 2026_03_17_120000_create_users_table --force
 ```
+
+> `mark-applied` 只写迁移记录、不执行建表/改表，且**不校验数据库真实结构是否与这些迁移等价**——仅用于数据库结构已等价于这些迁移净效果的存量库（如从其他工具迁移过来）。标错会让后续 `up` 跳过真实建表、造成 schema 漂移，故强制 `--force`。
+>
+> `fresh` / `refresh` 需要连接池至少 2 条连接（一条持迁移锁、另一条删表/回滚重建）；`SetMaxOpenConns(1)` 时会提前报错而非死等超时。
 
 ### 5. Makefile 集成
 

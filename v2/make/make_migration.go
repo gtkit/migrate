@@ -47,6 +47,11 @@ func runMakeMigration(cmd *cobra.Command, args []string) error {
 
 	extra := map[string]string{"{{FileName}}": fileName}
 	stubName := migrationStubName(action, objectName)
+	// create 迁移使用自包含的表结构快照（不引用业务 model），需要一个唯一的快照 struct 名。
+	if action == "create" {
+		compact := strings.ReplaceAll(timeStr, "_", "")
+		extra["{{SnapshotStruct}}"] = model.StructName + "V" + compact
+	}
 	// add 操作指定了 --after 时改用 raw SQL stub，以支持 MySQL 的 AFTER 列定位。
 	if after, _ := cmd.Flags().GetString("after"); action == "add" && after != "" {
 		stubName = "migration_add_raw"
