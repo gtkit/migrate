@@ -1,7 +1,6 @@
 package migrations
 
 import (
-	"{{ModelsImportPath}}"
 	"gorm.io/gorm"
 
 	"github.com/gtkit/migrate/v2/migration"
@@ -9,14 +8,16 @@ import (
 
 func init() {
 	up := func(db *gorm.DB) error {
-		if !db.Migrator().HasTable(&{{ModelPackageName}}.{{StructName}}{}) {
+		// 幂等：表不存在则跳过。
+		if !db.Migrator().HasTable("{{TableName}}") {
 			return nil
 		}
-		return db.Migrator().DropTable(&{{ModelPackageName}}.{{StructName}}{})
+		return db.Migrator().DropTable("{{TableName}}")
 	}
 
 	down := func(db *gorm.DB) error {
-		return db.Migrator().CreateTable(&{{ModelPackageName}}.{{StructName}}{})
+		// 删表无法自动回滚：如需回滚，请对照删除当时的表结构补全建表逻辑。
+		return migration.Irreversible("fill in the table recreation for {{FileName}} manually")
 	}
 
 	migration.Add("{{FileName}}", up, down)

@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -121,6 +124,7 @@ func (m *Migrator) Lint(ctx context.Context, opts LintOptions) (LintReport, erro
 				Message:  "migration declares manual down logic is required",
 			})
 		}
+		report.Issues = append(report.Issues, lintFileContent(file)...)
 	}
 
 	for _, file := range registryFiles {
@@ -247,6 +251,88 @@ func (m *Migrator) readDiskMigrationFiles() ([]diskMigrationFile, error) {
 		return strings.Compare(a.Name, b.Name)
 	})
 	return result, nil
+}
+
+// lintFileContent 对单个迁移文件做内容级检查：结构性问题报 error，风险性问题报 warning.
+func lintFileContent(file diskMigrationFile) []LintIssue {
+	var issues []LintIssue
+
+	if strings.Contains(file.Content, "TODO") {
+		issues = append(issues, LintIssue{
+			Severity: LintSeverityError,
+			Code:     "unfilled_placeholder",
+			Name:     file.Name,
+			Message:  "migration still contains a TODO placeholder; complete it before running",
+		})
+	}
+
+	if strings.Contains(file.Content, "AutoMigrate(") {
+		issues = append(issues, LintIssue{
+			Severity: LintSeverityError,
+			Code:     "automigrate_used",
+			Name:     file.Name,
+			Message:  "migration uses AutoMigrate; use explicit, self-contained SQL instead",
+		})
+	}
+
+	for _, imp := range migrationImports(file.Content) {
+		if !isSelfContainedImport(imp) {
+			issues = append(issues, LintIssue{
+				Severity: LintSeverityError,
+				Code:     "non_self_contained",
+				Name:     file.Name,
+				Message:  fmt.Sprintf("migration imports %q; migrations must be self-contained (only stdlib, gorm, and the migrate package)", imp),
+			})
+		}
+	}
+
+	lc := strings.ToLower(file.Content)
+	if strings.Contains(lc, "alter table") && !strings.Contains(lc, "algorithm") {
+		issues = append(issues, LintIssue{
+			Severity: LintSeverityWarning,
+			Code:     "missing_online_ddl",
+			Name:     file.Name,
+			Message:  "raw ALTER TABLE without an online-DDL strategy (ALGORITHM/LOCK); large tables may block",
+		})
+	}
+	if strings.Contains(lc, "drop table") || strings.Contains(lc, "drop database") || strings.Contains(lc, "truncate") {
+		issues = append(issues, LintIssue{
+			Severity: LintSeverityWarning,
+			Code:     "destructive_migration",
+			Name:     file.Name,
+			Message:  "migration contains destructive raw DDL (DROP TABLE/DROP DATABASE/TRUNCATE)",
+		})
+	}
+
+	return issues
+}
+
+// migrationImports 解析迁移文件的 import 路径；解析失败返回空（其余文本检查照常进行）.
+func migrationImports(content string) []string {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", content, parser.ImportsOnly)
+	if err != nil {
+		return nil
+	}
+	paths := make([]string, 0, len(f.Imports))
+	for _, imp := range f.Imports {
+		p, err := strconv.Unquote(imp.Path.Value)
+		if err != nil {
+			continue
+		}
+		paths = append(paths, p)
+	}
+	return paths
+}
+
+// isSelfContainedImport 判定 import 是否属于迁移允许的自包含范围：
+// 标准库（首段不含域名点）、gorm.io/*、github.com/gtkit/migrate/*.
+func isSelfContainedImport(path string) bool {
+	first, _, _ := strings.Cut(path, "/")
+	if !strings.Contains(first, ".") {
+		return true // 标准库
+	}
+	return strings.HasPrefix(path, "gorm.io/") || strings.HasPrefix(path, "github.com/gtkit/migrate/")
 }
 
 func sortLintIssues(issues []LintIssue) {

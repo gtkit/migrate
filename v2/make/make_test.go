@@ -157,7 +157,7 @@ func TestMakeMigrationAddWithAfterGeneratesRawSQL(t *testing.T) {
 	}
 }
 
-func TestMakeMigrationAddWithoutAfterUsesMigratorStub(t *testing.T) {
+func TestMakeMigrationAddWithoutAfterGeneratesRawSQL(t *testing.T) {
 	resetMakeTestState(t)
 	tmpDir := t.TempDir()
 	chdirForTest(t, tmpDir)
@@ -173,9 +173,17 @@ func TestMakeMigrationAddWithoutAfterUsesMigratorStub(t *testing.T) {
 	if len(migrations) != 1 {
 		t.Fatalf("expected exactly one generated migration, got %d", len(migrations))
 	}
+	assertGoFileParses(t, migrations[0])
+
 	content := readFile(t, migrations[0])
-	if !strings.Contains(content, "AddColumn(") {
-		t.Fatalf("default add (no --after) should use Migrator().AddColumn, got:\n%s", content)
+	if !strings.Contains(content, "ALTER TABLE `users` ADD COLUMN `email`") {
+		t.Fatalf("default add (no --after) should generate raw SQL ADD COLUMN, got:\n%s", content)
+	}
+	if strings.Contains(content, "AddColumn(") {
+		t.Fatalf("raw SQL stub should not use Migrator().AddColumn, got:\n%s", content)
+	}
+	if strings.Contains(content, "AFTER `") {
+		t.Fatalf("add without --after should not contain an AFTER clause, got:\n%s", content)
 	}
 }
 
@@ -210,6 +218,50 @@ func TestMakeDDLGeneratesSQLFile(t *testing.T) {
 	}
 	if !strings.Contains(upper, "CREATE UNIQUE INDEX") && !strings.Contains(upper, "UNIQUE") {
 		t.Fatalf("DDL should include unique constraint or index for email, got:\n%s", content)
+	}
+}
+
+// TestMakeMigrationTemplatesAreSelfContained 验证 add/update/drop/dropcolumn/dropindex
+// 生成的迁移不 import 业务 model、update 不用 AutoMigrate，且可被 go/parser 解析。
+func TestMakeMigrationTemplatesAreSelfContained(t *testing.T) {
+	cases := []struct {
+		arg  string
+		glob string
+	}{
+		{"add_email_to_users_table", "*_add_email_to_users_table.go"},
+		{"update_users_table", "*_update_users_table.go"},
+		{"drop_users_table", "*_drop_users_table.go"},
+		{"drop_column_email_from_users_table", "*_drop_column_email_from_users_table.go"},
+		{"drop_index_email_from_users_table", "*_drop_index_email_from_users_table.go"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.arg, func(t *testing.T) {
+			resetMakeTestState(t)
+			tmpDir := t.TempDir()
+			chdirForTest(t, tmpDir)
+
+			SetConfig(Config{ProjectName: "example.com/testapp"})
+
+			executeMakeCommand(t, "migration", tc.arg)
+
+			migrations, err := filepath.Glob(filepath.Join(tmpDir, "database/migrations", tc.glob))
+			if err != nil {
+				t.Fatalf("glob migration file: %v", err)
+			}
+			if len(migrations) != 1 {
+				t.Fatalf("expected exactly one generated migration, got %d", len(migrations))
+			}
+			assertGoFileParses(t, migrations[0])
+
+			content := readFile(t, migrations[0])
+			if strings.Contains(content, "example.com/testapp") {
+				t.Fatalf("%s migration must not import a project package, got:\n%s", tc.arg, content)
+			}
+			if strings.Contains(content, "AutoMigrate(") {
+				t.Fatalf("%s migration must not use AutoMigrate, got:\n%s", tc.arg, content)
+			}
+		})
 	}
 }
 

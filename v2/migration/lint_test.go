@@ -76,6 +76,76 @@ func TestMigratorLintDetectsDuplicateTimestamps(t *testing.T) {
 	assertLintHasIssue(t, report.Issues, "duplicate_timestamp", "2026_03_24_120000_create_orders_table, 2026_03_24_120000_create_users_table")
 }
 
+func TestMigratorLintDetectsContentIssues(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+
+	dir := t.TempDir()
+	todoFile := "2026_03_24_120000_add_email_to_users_table"
+	autoFile := "2026_03_24_120001_update_users_table"
+	importFile := "2026_03_24_120002_create_orders_table"
+
+	writeMigrationFile(t, dir, todoFile,
+		"package migrations\n\nfunc up() { _ = \"ALTER TABLE `users` ADD COLUMN `email` /* TODO: 列定义 */\" }\n")
+	writeMigrationFile(t, dir, autoFile,
+		"package migrations\n\nfunc up() { db.AutoMigrate(&X{}) }\n")
+	writeMigrationFile(t, dir, importFile,
+		"package migrations\n\nimport \"example.com/app/internal/models\"\n")
+
+	registry := NewRegistry()
+	noop := func(*gorm.DB) error { return nil }
+	registry.Add(todoFile, noop, noop)
+	registry.Add(autoFile, noop, noop)
+	registry.Add(importFile, noop, noop)
+
+	report, err := NewMigrator(dir, db, WithRegistry(registry)).Lint(t.Context(), LintOptions{SkipDatabase: true})
+	if err != nil {
+		t.Fatalf("lint: %v", err)
+	}
+
+	assertLintHasIssue(t, report.Issues, "unfilled_placeholder", todoFile)
+	assertLintHasIssue(t, report.Issues, "missing_online_ddl", todoFile)
+	assertLintHasIssue(t, report.Issues, "automigrate_used", autoFile)
+	assertLintHasIssue(t, report.Issues, "non_self_contained", importFile)
+}
+
+func TestMigratorLintDestructiveAndCleanMigration(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+
+	dir := t.TempDir()
+	dropFile := "2026_03_24_120000_drop_users_table"
+	cleanFile := "2026_03_24_120001_add_phone_to_users_table"
+
+	writeMigrationFile(t, dir, dropFile,
+		"package migrations\n\nfunc up() { _ = \"DROP TABLE `users`\" }\n")
+	// 完整、自包含、带在线 DDL 策略、无 TODO 的迁移不应产生任何归属它的问题。
+	writeMigrationFile(t, dir, cleanFile,
+		"package migrations\n\nimport (\n\t\"gorm.io/gorm\"\n\n\t\"github.com/gtkit/migrate/v2/migration\"\n)\n\nfunc up(db *gorm.DB) error {\n\treturn db.Exec(\"ALTER TABLE `users` ADD COLUMN `phone` VARCHAR(32) NOT NULL DEFAULT '', ALGORITHM=INPLACE, LOCK=NONE\").Error\n}\n\nvar _ = migration.Add\n")
+
+	registry := NewRegistry()
+	noop := func(*gorm.DB) error { return nil }
+	registry.Add(dropFile, noop, noop)
+	registry.Add(cleanFile, noop, noop)
+
+	report, err := NewMigrator(dir, db, WithRegistry(registry)).Lint(t.Context(), LintOptions{SkipDatabase: true})
+	if err != nil {
+		t.Fatalf("lint: %v", err)
+	}
+
+	assertLintHasIssue(t, report.Issues, "destructive_migration", dropFile)
+
+	for _, issue := range report.Issues {
+		if issue.Name == cleanFile {
+			t.Fatalf("complete self-contained migration should have no issues, got %s/%s: %s", issue.Code, issue.Name, issue.Message)
+		}
+	}
+}
+
 func writeMigrationFile(t *testing.T, dir, name, content string) {
 	t.Helper()
 	path := filepath.Join(dir, name+".go")

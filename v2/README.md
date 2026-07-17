@@ -42,9 +42,9 @@ go get github.com/gtkit/migrate/v2@latest
 | `migrate pending` | 查看待执行 migration | 上线前确认 |
 | `migrate up` | 执行未运行 migration | 发布时执行 |
 | `migrate down` | 回滚最后一批 migration | 紧急回滚 |
-| `migrate reset` | 回滚全部 migration | 测试环境重置 |
-| `migrate refresh` | 回滚全部再重放 | 测试环境验证 |
-| `migrate fresh` | 删库内所有表再重放 migration | 仅测试环境 |
+| `migrate reset --force` | 回滚全部 migration（需 `--force`） | 测试环境重置 |
+| `migrate refresh --force` | 回滚全部再重放（需 `--force`） | 测试环境验证 |
+| `migrate fresh --force` | 删库内所有表再重放 migration（需 `--force`） | 仅测试环境 |
 | `migrate status` | 查看运行状态 | 运维排查 |
 | `migrate lint` | 检查文件、registry、数据库记录漂移 | CI / 发布前检查 |
 
@@ -215,14 +215,16 @@ myapp make migration drop_index_email_from_users_table
 
 | 模式 | 示例 | 生成行为 |
 |------|------|----------|
-| `create_<table>_table` | `create_users_table` | 生成建表 migration，并自动生成 model/repository |
-| `update_<table>_table` | `update_users_table` | 生成 `AutoMigrate` 模板，`down` 默认标记为不可逆 |
-| `add_<column>_to_<table>_table` | `add_email_to_users_table` | 生成加列 migration（默认用 `Migrator().AddColumn`，列追加到表末尾） |
-| `add_<column>_to_<table>_table --after <col>` | `add_email_to_users_table --after phone` | 生成 **raw SQL** 加列 migration，新列置于 `<col>` 之后（MySQL `AFTER`）；列类型/约束/注释以 `TODO` 占位待手工补全 |
-| `drop_column_<column>_from_<table>_table` | `drop_column_email_from_users_table` | 生成删列 migration，`down` 默认标记为人工补全 |
-| `drop_index_<name>_from_<table>_table` | `drop_index_email_from_users_table` | 生成删索引 migration，`down` 默认标记为人工补全 |
+| `create_<table>_table` | `create_users_table` | 生成建表 migration（自包含快照 struct），并自动生成 model/repository |
+| `update_<table>_table` | `update_users_table` | 生成 up/down 各一段 raw `ALTER TABLE` 骨架，`TODO` 待补全 |
+| `add_<column>_to_<table>_table` | `add_email_to_users_table` | 生成 **raw SQL** 加列 migration，列类型/约束以 `TODO` 占位待补全 |
+| `add_<column>_to_<table>_table --after <col>` | `add_email_to_users_table --after phone` | 同上，并在 `ADD COLUMN` 后追加 `AFTER <col>` 子句（MySQL 列定位） |
+| `drop_column_<column>_from_<table>_table` | `drop_column_email_from_users_table` | 生成 raw `DROP COLUMN` migration，`down` 标记为人工补全 |
+| `drop_index_<name>_from_<table>_table` | `drop_index_email_from_users_table` | 生成 raw `DROP INDEX` migration（索引名以 `TODO` 待确认），`down` 标记为人工补全 |
 
-> `--after` 仅对 `add_*` 模式生效。原因：GORM `Migrator().AddColumn` 无法指定列顺序，因此指定位置时改走 `db.Exec` 的 raw `ALTER TABLE ... ADD COLUMN ... AFTER ...`。注意列的物理顺序在 MySQL 中仅影响展示，不影响功能。
+> **迁移模板均自包含、显式、可审查**：都不 import 业务 model、不使用 `AutoMigrate`（避免随 model 演进漂移）。带 `TODO` 占位的模板需补全（大表建议标注 `ALGORITHM`/`LOCK` 在线 DDL 策略）后才能通过 `migrate lint`。
+>
+> `--after` 仅对 `add_*` 模式生效，通过在 raw `ALTER TABLE ... ADD COLUMN` 后追加 `AFTER <col>` 实现。注意列的物理顺序在 MySQL 中仅影响展示，不影响功能。
 
 执行后会在 `database/migrations/` 下生成形如 `2026_03_17_120000_create_users_table.go` 的文件。
 
@@ -230,10 +232,11 @@ myapp make migration drop_index_email_from_users_table
 
 | action | up 行为 | down 行为 |
 |--------|---------|-----------|
-| `create` | `CreateTable` | `DropTable` |
-| `update` | `AutoMigrate` | 标记为不可逆，需人工补全 |
-| `add` | `AddColumn`（带存在性检查） | `DropColumn`（带存在性检查） |
-| `drop` | `DropTable` / `DropColumn` / `DropIndex` | 对应的反向操作 |
+| `create` | 快照 struct `CreateTable` | `DropTable` |
+| `update` | raw `ALTER TABLE`（TODO 待补全） | raw 反向 `ALTER`（TODO 待补全） |
+| `add` | raw `ALTER TABLE ADD COLUMN`（TODO 列定义，带存在性检查） | raw `DROP COLUMN`（带存在性检查） |
+| `drop`（表） | `DropTable`（带存在性检查） | 标记为不可逆，需人工补全 |
+| `drop_column` / `drop_index` | raw `DROP COLUMN` / `DROP INDEX`（带存在性检查） | 标记为不可逆，需人工补全 |
 
 示例（`create`）：
 
@@ -312,15 +315,17 @@ myapp migrate lint --strict
 # 回滚最后一批迁移
 myapp migrate down
 
-# 回滚所有迁移
-myapp migrate reset
+# 回滚所有迁移（破坏性，需 --force）
+myapp migrate reset --force
 
-# 回滚所有后重新执行
-myapp migrate refresh
+# 回滚所有后重新执行（破坏性，需 --force）
+myapp migrate refresh --force
 
-# 删除所有表后重新执行（⚠️ 危险，会丢失数据）
-myapp migrate fresh
+# 删除所有表后重新执行（⚠️ 危险，会丢失数据；需 --force）
+myapp migrate fresh --force
 ```
+
+> `reset` / `refresh` / `fresh` 会回滚或删除数据，必须显式加 `--force` 才执行，缺失时直接报错拒绝，避免误触丢数据。
 
 各命令语义：
 
@@ -366,6 +371,11 @@ lint 当前会检查：
 - migration 明确标记为 `Irreversible(...)`
 - 多个 migration 共享相同时间戳前缀
 - 数据库里已执行 migration，但源码/磁盘已经找不到
+- 迁移残留未补全的 `TODO` 占位（error）
+- 迁移使用 `AutoMigrate`（error）
+- 迁移非自包含：import 了标准库、gorm、migrate 包以外的第三方/业务包（如业务 model）（error）
+- raw `ALTER TABLE` 缺 `ALGORITHM`/`LOCK` 在线 DDL 策略（warning）
+- raw 危险 DDL：`DROP TABLE` / `DROP DATABASE` / `TRUNCATE`（warning）
 
 返回规则：
 
@@ -464,14 +474,14 @@ migrate-down:           ## 回滚最后一批
 migrate-status:         ## 查看迁移状态
 	go run . migrate status -c $(MIGRATE_ENV)
 
-migrate-reset:          ## 回滚所有迁移
-	go run . migrate reset -c $(MIGRATE_ENV)
+migrate-reset:          ## 回滚所有迁移（破坏性，需 --force）
+	go run . migrate reset --force -c $(MIGRATE_ENV)
 
-migrate-refresh:        ## 回滚后重放所有迁移
-	go run . migrate refresh -c $(MIGRATE_ENV)
+migrate-refresh:        ## 回滚后重放所有迁移（破坏性，需 --force）
+	go run . migrate refresh --force -c $(MIGRATE_ENV)
 
-migrate-fresh:          ## 删表后重放（⚠️ 危险）
-	go run . migrate fresh -c $(MIGRATE_ENV)
+migrate-fresh:          ## 删表后重放（⚠️ 危险，需 --force）
+	go run . migrate fresh --force -c $(MIGRATE_ENV)
 
 migrate-pending:        ## 预览待执行迁移（dry-run）
 	go run . migrate pending -c $(MIGRATE_ENV)

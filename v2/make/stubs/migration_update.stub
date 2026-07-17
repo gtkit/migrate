@@ -1,7 +1,6 @@
 package migrations
 
 import (
-	"{{ModelsImportPath}}"
 	"gorm.io/gorm"
 
 	"github.com/gtkit/migrate/v2/migration"
@@ -9,11 +8,14 @@ import (
 
 func init() {
 	up := func(db *gorm.DB) error {
-		return db.AutoMigrate(&{{ModelPackageName}}.{{StructName}}{})
+		// TODO: 补全对 `{{TableName}}` 的显式结构变更（勿用自动迁移）。大表建议标注在线 DDL 策略，例如：
+		//   ALTER TABLE `{{TableName}}` MODIFY COLUMN `xxx` VARCHAR(128) NOT NULL, ALGORITHM=INPLACE, LOCK=NONE
+		return db.Exec("ALTER TABLE `{{TableName}}` /* TODO: 变更定义 */").Error
 	}
 
 	down := func(db *gorm.DB) error {
-		return migration.Irreversible("fill in the down migration for {{FileName}} manually")
+		// TODO: 补全与 up 对应的反向变更；无法回滚时改用 migration.Irreversible(...)。
+		return db.Exec("ALTER TABLE `{{TableName}}` /* TODO: 反向变更定义 */").Error
 	}
 
 	migration.Add("{{FileName}}", up, down)

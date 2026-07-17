@@ -87,7 +87,7 @@ myapp make migration update_users_table
 # 添加字段到表
 myapp make migration add_email_to_users_table
 
-# 添加字段并指定位置（MySQL AFTER）——生成 raw SQL 模板，列类型需手工补全
+# 添加字段并指定位置（MySQL AFTER）——生成 raw SQL，在 ADD COLUMN 后追加 AFTER 子句
 myapp make migration add_email_to_users_table --after phone
 
 # 删除字段
@@ -99,14 +99,15 @@ myapp make migration drop_index_email_from_users_table
 
 执行后会在 `database/migrations/` 下生成形如 `2026_03_17_120000_create_users_table.go` 的文件。
 
-不同 action 使用不同的 migration 模板：
+**迁移模板均自包含、显式、可审查**：`create` 生成结构快照 struct，`add`/`update`/`drop`/`drop_column`/`drop_index` 生成**显式 raw SQL**，都不 import 业务 model、不使用 `AutoMigrate`（避免随 model 演进漂移）。`add`/`update` 及删索引模板留有 `TODO` 占位，需补全列/变更定义（大表建议标注 `ALGORITHM`/`LOCK` 在线 DDL 策略）后才能通过 `migrate lint`。
 
 | action | up 行为 | down 行为 |
 |--------|---------|-----------|
-| `create` | `CreateTable` | `DropTable` |
-| `update` | `AutoMigrate` | 标记为不可逆，需人工补全 |
-| `add` | `AddColumn`（带存在性检查） | `DropColumn`（带存在性检查） |
-| `drop` | `DropTable` / `DropColumn` / `DropIndex` | 对应的反向操作 |
+| `create` | 快照 struct `CreateTable` | `DropTable` |
+| `update` | raw `ALTER TABLE`（TODO 待补全） | raw 反向 `ALTER`（TODO 待补全） |
+| `add` | raw `ALTER TABLE ADD COLUMN`（TODO 列定义，带存在性检查） | raw `DROP COLUMN`（带存在性检查） |
+| `drop` (表) | `DropTable`（带存在性检查） | 标记为不可逆，需人工补全 |
+| `drop_column` / `drop_index` | raw `DROP COLUMN` / `DROP INDEX`（带存在性检查） | 标记为不可逆，需人工补全 |
 
 示例（`create`）——迁移文件**自包含表结构快照，有意不引用业务 model**：业务 model 会随需求演进，而迁移必须锁定「创建当时」的结构，才能保证任何环境、任何时间执行都得到一致的表：
 

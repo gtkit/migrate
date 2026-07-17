@@ -1,7 +1,6 @@
 package migrations
 
 import (
-	"{{ModelsImportPath}}"
 	"gorm.io/gorm"
 
 	"github.com/gtkit/migrate/v2/migration"
@@ -9,10 +8,11 @@ import (
 
 func init() {
 	up := func(db *gorm.DB) error {
-		if !db.Migrator().HasColumn(&{{ModelPackageName}}.{{StructName}}{}, "{{ColumnName}}") {
+		// 幂等：列不存在则跳过。
+		if !db.Migrator().HasColumn("{{TableName}}", "{{ColumnName}}") {
 			return nil
 		}
-		return db.Migrator().DropColumn(&{{ModelPackageName}}.{{StructName}}{}, "{{ColumnName}}")
+		return db.Exec("ALTER TABLE `{{TableName}}` DROP COLUMN `{{ColumnName}}`").Error
 	}
 
 	down := func(db *gorm.DB) error {
