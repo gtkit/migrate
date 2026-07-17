@@ -4,8 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -122,22 +121,24 @@ func (m *Migrator) Up(ctx context.Context) error {
 	}
 	defer release()
 
-	// 读取所有已注册的迁移文件（按文件系统排序）
-	migrateFiles, err := m.readAllMigrationFiles()
+	// registry 为迁移集合的唯一真实来源，按文件名升序执行
+	migrateFiles := m.registeredFiles()
+
+	// 获取所有已执行的迁移记录
+	migrated, err := m.getMigratedSet(ctx)
 	if err != nil {
-		return fmt.Errorf("read migration files: %w", err)
+		return fmt.Errorf("get migrated records: %w", err)
+	}
+
+	// fail-closed：空 registry 或已应用迁移在当前 binary 缺失时报错
+	if err := m.checkRegistryConsistency(migrated); err != nil {
+		return err
 	}
 
 	// 获取当前批次
 	batch, err := m.getBatch(ctx)
 	if err != nil {
 		return fmt.Errorf("get batch: %w", err)
-	}
-
-	// 获取所有已执行的迁移记录
-	migrated, err := m.getMigratedSet(ctx)
-	if err != nil {
-		return fmt.Errorf("get migrated records: %w", err)
 	}
 
 	// 执行未迁移的文件
@@ -170,17 +171,17 @@ func (m *Migrator) IsUpToDate(ctx context.Context) (bool, error) {
 		return false, err
 	}
 
-	migrateFiles, err := m.readAllMigrationFiles()
-	if err != nil {
-		return false, err
-	}
-
 	migrated, err := m.getMigratedSet(ctx)
 	if err != nil {
 		return false, err
 	}
 
-	for _, mfile := range migrateFiles {
+	// fail-closed：与 Up 一致，避免 runUp 用 IsUpToDate 短路时掩盖空 registry
+	if err := m.checkRegistryConsistency(migrated); err != nil {
+		return false, err
+	}
+
+	for _, mfile := range m.registeredFiles() {
 		if _, ok := migrated[mfile.FileName]; !ok {
 			return false, nil
 		}
@@ -337,10 +338,7 @@ func (m *Migrator) Status(ctx context.Context) ([]MigrationStatus, error) {
 		return nil, err
 	}
 
-	migrateFiles, err := m.readAllMigrationFiles()
-	if err != nil {
-		return nil, err
-	}
+	migrateFiles := m.registeredFiles()
 
 	migrated, err := m.getMigratedMap(ctx)
 	if err != nil {
@@ -377,10 +375,7 @@ func (m *Migrator) Pending(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 
-	migrateFiles, err := m.readAllMigrationFiles()
-	if err != nil {
-		return nil, err
-	}
+	migrateFiles := m.registeredFiles()
 
 	migrated, err := m.getMigratedSet(ctx)
 	if err != nil {
@@ -413,10 +408,7 @@ func (m *Migrator) MarkApplied(ctx context.Context, toFile string) ([]string, er
 	}
 	defer release()
 
-	migrateFiles, err := m.readAllMigrationFiles()
-	if err != nil {
-		return nil, fmt.Errorf("read migration files: %w", err)
-	}
+	migrateFiles := m.registeredFiles()
 
 	migrated, err := m.getMigratedSet(ctx)
 	if err != nil {
@@ -428,7 +420,7 @@ func (m *Migrator) MarkApplied(ctx context.Context, toFile string) ([]string, er
 		return nil, fmt.Errorf("get batch: %w", err)
 	}
 
-	// readAllMigrationFiles 按文件名（时间戳）升序返回，toMark 天然有序.
+	// registeredFiles 按文件名（时间戳）升序返回，toMark 天然有序.
 	var toMark []string
 	for _, mfile := range migrateFiles {
 		if _, ok := migrated[mfile.FileName]; ok {
@@ -510,10 +502,7 @@ func (m *Migrator) ensureConcurrentConns() error {
 
 // upWithoutLock 执行迁移（不获取锁，供 Fresh 内部使用）.
 func (m *Migrator) upWithoutLock(ctx context.Context) error {
-	migrateFiles, err := m.readAllMigrationFiles()
-	if err != nil {
-		return fmt.Errorf("read migration files: %w", err)
-	}
+	migrateFiles := m.registeredFiles()
 
 	batch, err := m.getBatch(ctx)
 	if err != nil {
@@ -665,35 +654,28 @@ func (m *Migrator) getMigratedMap(ctx context.Context) (map[string]Migration, er
 	return result, nil
 }
 
-// readAllMigrationFiles 从文件目录读取文件，并与注册表匹配.
-// 按文件名排序（文件名以时间戳开头，确保顺序正确）.
-func (m *Migrator) readAllMigrationFiles() ([]MigrationFile, error) {
-	files, err := os.ReadDir(m.Folder)
-	if err != nil {
-		return nil, fmt.Errorf("read migration dir %s: %w", m.Folder, err)
+// registeredFiles 返回编译期 registry 中的全部迁移，按文件名（时间戳前缀）升序.
+// 迁移执行以 registry 为唯一真实来源，不依赖运行时的 .go 源目录，
+// 避免部署环境缺少源目录时静默漏执行.
+func (m *Migrator) registeredFiles() []MigrationFile {
+	files := m.registry.All()
+	slices.SortFunc(files, func(a, b MigrationFile) int {
+		return strings.Compare(a.FileName, b.FileName)
+	})
+	return files
+}
+
+// checkRegistryConsistency 在执行前校验 registry 与已应用记录的一致性，fail-closed.
+// registry 为空（通常是漏 import 迁移包），或存在"已应用但当前 binary 未注册"的
+// 迁移（结构可能已漂移）时返回错误，禁止在这两种状态下继续执行.
+func (m *Migrator) checkRegistryConsistency(migrated map[string]struct{}) error {
+	if m.registry.Len() == 0 {
+		return errors.New("no migrations registered; did you forget to import the migrations package?")
 	}
-
-	var result []MigrationFile
-	for _, f := range files {
-		if f.IsDir() {
-			continue
+	for name := range migrated {
+		if _, ok := m.registry.Get(name); !ok {
+			return fmt.Errorf("applied migration %q is not registered in the current binary; schema may have drifted", name)
 		}
-
-		// 去除文件后缀 .go
-		ext := filepath.Ext(f.Name())
-		if ext != ".go" {
-			continue
-		}
-		fileName := strings.TrimSuffix(f.Name(), ext)
-
-		mfile, ok := m.registry.Get(fileName)
-		if !ok {
-			// 文件存在但未注册（可能是新创建尚未编译的迁移文件），跳过
-			continue
-		}
-
-		result = append(result, mfile)
 	}
-
-	return result, nil
+	return nil
 }

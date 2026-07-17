@@ -66,24 +66,27 @@ func deleteMySQLTables(db *gorm.DB) error {
 		return nil
 	}
 
-	// 关闭外键检测
-	if err := db.Exec("SET foreign_key_checks = 0").Error; err != nil {
-		return fmt.Errorf("disable foreign key checks: %w", err)
-	}
-
-	for _, table := range tables {
-		if err := db.Migrator().DropTable(table); err != nil {
-			// 恢复外键检测后再返回错误
-			_ = db.Exec("SET foreign_key_checks = 1").Error
-			return fmt.Errorf("drop table %s: %w", table, err)
+	// 关闭外键检查、删表、恢复必须在同一连接上完成：foreign_key_checks 是会话级变量，
+	// 若经连接池分发，关闭态可能落不到删表连接，或残留污染被业务复用的池内连接.
+	return db.Connection(func(conn *gorm.DB) (err error) {
+		if err = conn.Exec("SET foreign_key_checks = 0").Error; err != nil {
+			return fmt.Errorf("disable foreign key checks: %w", err)
 		}
-	}
+		// 无论删表成功与否，都在该连接归还连接池前恢复外键检查；
+		// 仅在没有更早错误时才上报恢复失败，避免掩盖删表错误.
+		defer func() {
+			if restoreErr := conn.Exec("SET foreign_key_checks = 1").Error; restoreErr != nil && err == nil {
+				err = fmt.Errorf("enable foreign key checks: %w", restoreErr)
+			}
+		}()
 
-	if err := db.Exec("SET foreign_key_checks = 1").Error; err != nil {
-		return fmt.Errorf("enable foreign key checks: %w", err)
-	}
-
-	return nil
+		for _, table := range tables {
+			if err = conn.Migrator().DropTable(table); err != nil {
+				return fmt.Errorf("drop table %s: %w", table, err)
+			}
+		}
+		return nil
+	})
 }
 
 func deletePostgresTables(db *gorm.DB) error {

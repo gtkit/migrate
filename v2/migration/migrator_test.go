@@ -268,3 +268,77 @@ func TestMigratorRollbackTo(t *testing.T) {
 		t.Fatalf("expected 2 pending after rollback-to, got %d: %v", len(pending), pending)
 	}
 }
+
+// TestMigratorUpUsesRegistryWithoutDiskFiles 验证 Up 以 registry 为执行源：
+// 迁移目录为空（模拟部署后不带 .go 源目录）时仍执行 registry 中的迁移，
+// 而非旧行为「空目录 → database is up to date」的静默漏执行.
+func TestMigratorUpUsesRegistryWithoutDiskFiles(t *testing.T) {
+	db := openExecTestDB(t, "migrator_up_no_disk")
+	emptyDir := t.TempDir() // 有意不写任何迁移文件
+
+	file := "2026_03_24_120000_create_exec_test_users_table"
+	registry := NewRegistry()
+	registry.Add(file, func(tx *gorm.DB) error {
+		return tx.Migrator().CreateTable(&execTestUser{})
+	}, func(tx *gorm.DB) error {
+		return tx.Migrator().DropTable(&execTestUser{})
+	})
+
+	m := NewMigrator(emptyDir, db, WithRegistry(registry))
+
+	if err := m.Up(t.Context()); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+	if !db.Migrator().HasTable(&execTestUser{}) {
+		t.Fatalf("expected table to exist: Up must run registry migrations even with an empty dir")
+	}
+
+	var count int64
+	if err := db.Model(&Migration{}).Where("migration = ?", file).Count(&count).Error; err != nil {
+		t.Fatalf("count records: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 migration record, got %d", count)
+	}
+}
+
+// TestMigratorFailsClosedOnEmptyRegistry 验证空 registry 时 Up 与 IsUpToDate
+// fail-closed 报错，而非静默报「已最新」.
+func TestMigratorFailsClosedOnEmptyRegistry(t *testing.T) {
+	db := openExecTestDB(t, "migrator_empty_registry")
+	m := NewMigrator(t.TempDir(), db, WithRegistry(NewRegistry()))
+
+	if err := m.Up(t.Context()); err == nil {
+		t.Fatalf("expected Up to fail on empty registry")
+	}
+
+	upToDate, err := m.IsUpToDate(t.Context())
+	if err == nil {
+		t.Fatalf("expected IsUpToDate to fail on empty registry")
+	}
+	if upToDate {
+		t.Fatalf("IsUpToDate must not report up-to-date on empty registry")
+	}
+}
+
+// TestMigratorFailsClosedOnDrift 验证存在「已应用但当前 binary 未注册」的迁移时
+// Up fail-closed，避免在结构漂移状态下继续执行.
+func TestMigratorFailsClosedOnDrift(t *testing.T) {
+	db := openExecTestDB(t, "migrator_drift")
+
+	registry := NewRegistry()
+	registry.Add("2026_03_24_120000_create_a", func(tx *gorm.DB) error { return nil }, nil)
+	m := NewMigrator(t.TempDir(), db, WithRegistry(registry))
+
+	if err := m.Setup(t.Context()); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	// 注入一条当前 registry 未注册的已应用记录.
+	if err := db.Create(&Migration{Migration: "2026_03_24_119999_ghost", Batch: 1}).Error; err != nil {
+		t.Fatalf("seed record: %v", err)
+	}
+
+	if err := m.Up(t.Context()); err == nil {
+		t.Fatalf("expected Up to fail on applied-but-unregistered migration")
+	}
+}

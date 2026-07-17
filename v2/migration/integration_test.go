@@ -17,6 +17,9 @@ import (
 	gormlogger "gorm.io/gorm/logger"
 )
 
+// 注意：fresh 的 foreign_key_checks 关闭→删表→恢复固定在同一连接执行（database.go
+// 的 deleteMySQLTables，fix C）是 MySQL 专属路径，SQLite 无法覆盖。对该路径「同一连接、
+// 返回前必复位」的断言归入后续新增 MySQL 集成测试的 change，此处暂随现有集成用例覆盖删表流程。
 func TestMigratorMySQLIntegration(t *testing.T) {
 	runMigratorIntegrationTest(t, "mysql", os.Getenv("MIGRATE_TEST_MYSQL_DSN"), func(dsn string) (db *gorm.DB, closeFn func(), err error) {
 		db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{})

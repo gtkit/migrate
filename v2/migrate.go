@@ -298,6 +298,10 @@ func init() {
 	CmdMigrateLint.Flags().Bool("strict", false, "Fail on warnings as well as errors")
 	CmdMigrateLint.Flags().Bool("skip-db", false, "Skip database-applied migration drift checks")
 
+	CmdMigrateReset.Flags().Bool("force", false, "Required: confirm rolling back all migrations")
+	CmdMigrateRefresh.Flags().Bool("force", false, "Required: confirm rolling back and re-running all migrations")
+	CmdMigrateFresh.Flags().Bool("force", false, "Required: confirm dropping all tables and destroying all data")
+
 	CmdMigrateMarkApplied.Flags().String("to", "", "Only mark pending migrations up to and including this version")
 	CmdMigrateMarkApplied.Flags().Bool("force", false, "Required: confirm marking versions as applied without running them")
 
@@ -353,7 +357,23 @@ func runDown(cmd *cobra.Command, _ []string) error {
 	return nil
 }
 
+// requireForce 校验破坏性命令是否显式传入 --force，缺失时拒绝执行.
+func requireForce(cmd *cobra.Command, warning string) error {
+	force, err := cmd.Flags().GetBool("force")
+	if err != nil {
+		return err
+	}
+	if !force {
+		return fmt.Errorf("%s; re-run with --force to confirm", warning)
+	}
+	return nil
+}
+
 func runReset(cmd *cobra.Command, _ []string) error {
+	if err := requireForce(cmd, "reset rolls back ALL migrations and can drop application data"); err != nil {
+		return err
+	}
+
 	ctx, cancel := newContext()
 	defer cancel()
 
@@ -367,6 +387,10 @@ func runReset(cmd *cobra.Command, _ []string) error {
 }
 
 func runRefresh(cmd *cobra.Command, _ []string) error {
+	if err := requireForce(cmd, "refresh rolls back ALL migrations then re-runs them and can drop application data"); err != nil {
+		return err
+	}
+
 	ctx, cancel := newContext()
 	defer cancel()
 
@@ -380,6 +404,10 @@ func runRefresh(cmd *cobra.Command, _ []string) error {
 }
 
 func runFresh(cmd *cobra.Command, _ []string) error {
+	if err := requireForce(cmd, "fresh DROPS ALL TABLES in the database and destroys all data"); err != nil {
+		return err
+	}
+
 	ctx, cancel := newContext()
 	defer cancel()
 

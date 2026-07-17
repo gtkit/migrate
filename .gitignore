@@ -10,3 +10,7 @@
 __MACOSX/
 .DS_Store
 .cache/
+
+.vscode/
+.Ds_Store
+*.log

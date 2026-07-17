@@ -174,14 +174,14 @@ myapp migrate down
 # 回滚到指定版本（回滚所有比该版本新的迁移，不含该版本本身）
 myapp migrate down-to 2026_03_17_120000_create_users_table
 
-# 回滚所有迁移
-myapp migrate reset
+# 回滚所有迁移（破坏性，需 --force）
+myapp migrate reset --force
 
-# 回滚所有后重新执行（需连接池 MaxOpenConns ≥ 2）
-myapp migrate refresh
+# 回滚所有后重新执行（破坏性，需 --force；需连接池 MaxOpenConns ≥ 2）
+myapp migrate refresh --force
 
-# 删除所有表后重新执行（⚠️ 危险，会丢失数据；需连接池 MaxOpenConns ≥ 2）
-myapp migrate fresh
+# 删除所有表后重新执行（⚠️ 危险，会丢失数据；需 --force；需连接池 MaxOpenConns ≥ 2）
+myapp migrate fresh --force
 
 # 把 pending 迁移标记为已应用而不执行其 SQL（用于接入已有等价结构的存量库，需 --force）
 myapp migrate mark-applied --force
@@ -190,6 +190,8 @@ myapp migrate mark-applied --to 2026_03_17_120000_create_users_table --force
 ```
 
 > `mark-applied` 只写迁移记录、不执行建表/改表，且**不校验数据库真实结构是否与这些迁移等价**——仅用于数据库结构已等价于这些迁移净效果的存量库（如从其他工具迁移过来）。标错会让后续 `up` 跳过真实建表、造成 schema 漂移，故强制 `--force`。
+>
+> `reset` / `refresh` / `fresh` 会回滚或删除数据，必须显式加 `--force` 才执行，缺失时直接报错拒绝，避免误触丢数据。
 >
 > `fresh` / `refresh` 需要连接池至少 2 条连接（一条持迁移锁、另一条删表/回滚重建）；`SetMaxOpenConns(1)` 时会提前报错而非死等超时。
 
