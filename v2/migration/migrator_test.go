@@ -269,6 +269,52 @@ func TestMigratorRollbackTo(t *testing.T) {
 	}
 }
 
+// TestMigrationLoggerAndHelpers 覆盖默认日志、NopLogger、Irreversible 与 hashLockName.
+func TestMigrationLoggerAndHelpers(t *testing.T) {
+	dl := &defaultLogger{}
+	dl.Info("info")
+	dl.Info("info", "k", "v")
+	dl.Warn("warn")
+	dl.Warn("warn", "k", "v")
+	dl.Error("err")
+	dl.Error("err", "k", "v", "odd")
+
+	nop := &NopLogger{}
+	nop.Info("i", "k", "v")
+	nop.Warn("w")
+	nop.Error("e")
+
+	if Irreversible("manual down required") == nil {
+		t.Fatalf("Irreversible should return a non-nil error")
+	}
+	hx := hashLockName("x")
+	if hx != hashLockName("x") {
+		t.Fatalf("hashLockName should be deterministic")
+	}
+	if hx == hashLockName("y") {
+		t.Fatalf("hashLockName should differ for different names")
+	}
+}
+
+// TestMigratorRecordsMigrationWithoutUp 覆盖 Up==nil 时只写记录的 recordMigration 路径.
+func TestMigratorRecordsMigrationWithoutUp(t *testing.T) {
+	db := openExecTestDB(t, "record_no_up")
+	registry := NewRegistry()
+	registry.Add("2026_03_24_120000_noop_table", nil, nil)
+	m := NewMigrator(t.TempDir(), db, WithRegistry(registry))
+
+	if err := m.Up(t.Context()); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+	var n int64
+	if err := db.Model(&Migration{}).Where("migration = ?", "2026_03_24_120000_noop_table").Count(&n).Error; err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected the no-op migration to be recorded, got %d", n)
+	}
+}
+
 // setupThreeApplied 建三条已应用迁移（各建一张表），返回 Migrator 与版本名.
 func setupThreeApplied(t *testing.T, db *gorm.DB) (*Migrator, [3]string) {
 	t.Helper()

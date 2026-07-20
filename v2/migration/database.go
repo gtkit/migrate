@@ -2,6 +2,7 @@ package migration
 
 import (
 	"fmt"
+	"strings"
 
 	"gorm.io/gorm"
 )
@@ -81,7 +82,10 @@ func deleteMySQLTables(db *gorm.DB) error {
 		}()
 
 		for _, table := range tables {
-			if err = conn.Migrator().DropTable(table); err != nil {
+			// 用 conn 原生 Exec 删表：db.Connection 提供的是 *sql.Conn，
+			// conn.Migrator() 内部需要 *sql.DB 会返回 "invalid db"，故直接执行 raw DROP.
+			quoted := "`" + strings.ReplaceAll(table, "`", "``") + "`"
+			if err = conn.Exec("DROP TABLE IF EXISTS " + quoted).Error; err != nil {
 				return fmt.Errorf("drop table %s: %w", table, err)
 			}
 		}

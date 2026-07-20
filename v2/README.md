@@ -609,6 +609,21 @@ $ myapp migrate lint
 Summary: 0 error(s), 1 warning(s)
 ```
 
+## 生产注意事项：MySQL 迁移的原子性与故障恢复
+
+MySQL 的 `CREATE TABLE`/`ALTER TABLE` 等 DDL 会**隐式提交、无法回滚**（PostgreSQL、SQLite 支持事务型 DDL，本工具会把 DDL 与迁移记录放同一事务、失败整体回滚；MySQL 属其固有限制）。这带来两点必须知晓的行为，本工具**不会也无法**替 MySQL 消除：
+
+- **迁移不是原子的**：一个迁移里若有多条 DDL，执行到中途失败时，前面的 DDL 已经提交、留下「半张表」；DDL 提交后、写迁移记录前若进程崩溃或超时，也会出现「结构已变更但记录未写」。
+- **故障需人工恢复**：出现上述情况时，请**先人工核对真实表结构**，再决定：把该迁移手工补完（并用 `mark-applied` 将其记入），或把已生效的 DDL 手工回退后重跑。工具不会自动修复半成品。
+
+降低风险的实践：
+
+- **一个迁移只做一件事**，MySQL 迁移尽量写成**单条、幂等**的 DDL（生成模板已带 `HasColumn`/`HasTable` 存在性检查）。
+- 大表结构变更走 gh-ost / pt-online-schema-change，或在 raw SQL 里标注 `ALGORITHM`/`LOCK`（`migrate lint` 会对缺失项告警）。
+- 发布前先 `migrate lint` + `migrate pending` 人工确认；破坏性命令（`down`/`down-to`/`reset`/`refresh`/`fresh`）已强制 `--force`，核心生产建议在组装 CLI 时干脆不注册它们。
+
+> 说明：本工具的迁移记录表沿用业界主流的极简结构（`id/migration/batch/created_at`，与 Laravel/Rails 一致），**未引入 dirty/checksum 状态**——这是有意的取舍，代价是 MySQL 半失败的恢复靠人工，如上所述。
+
 ## 集成测试
 
 MySQL/Postgres 集成测试默认不参与普通 `go test`，需要显式指定 `integration` build tag 和数据库 DSN：
@@ -617,15 +632,17 @@ MySQL/Postgres 集成测试默认不参与普通 `go test`，需要显式指定 
 export MIGRATE_TEST_MYSQL_DSN='user:pass@tcp(127.0.0.1:3306)/migrate_test?parseTime=true'
 export MIGRATE_TEST_POSTGRES_DSN='host=127.0.0.1 user=postgres password=postgres dbname=migrate_test sslmode=disable'
 
-go test -tags=integration ./migration -run 'TestMigrator(MySQL|Postgres)Integration'
+go test -tags=integration ./migration -run 'TestMigratorMySQL|TestMigratorPostgres'
 ```
+
+MySQL 侧覆盖：端到端迁移/回滚、`GET_LOCK` 竞争与超时（`TestMigratorMySQLLockContention`）、`fresh` 删表的外键检查同连接处理（`TestMigratorMySQLForeignKeyChecksRestored`）。
 
 为了降低误操作风险，测试默认要求数据库名包含 `test`；如果你确实要对其他库运行，请显式设置 `MIGRATE_TEST_ALLOW_ANY_DB=1`。
 
 如果你只想跑单个数据库：
 
 ```bash
-go test -tags=integration ./migration -run TestMigratorMySQLIntegration
+go test -tags=integration ./migration -run 'TestMigratorMySQL'
 go test -tags=integration ./migration -run TestMigratorPostgresIntegration
 ```
 

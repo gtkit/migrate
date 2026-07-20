@@ -187,6 +187,38 @@ func TestMakeMigrationAddWithoutAfterGeneratesRawSQL(t *testing.T) {
 	}
 }
 
+func TestSetProjectNameOverridesConfig(t *testing.T) {
+	resetMakeTestState(t)
+	SetConfig(Config{ProjectName: "example.com/old"})
+	SetProjectName("example.com/new")
+	if got := CurrentConfig().ProjectName; got != "example.com/new" {
+		t.Fatalf("SetProjectName should override project name, got %q", got)
+	}
+	SetProjectName("") // 空值忽略
+	if got := CurrentConfig().ProjectName; got != "example.com/new" {
+		t.Fatalf("empty SetProjectName should be ignored, got %q", got)
+	}
+}
+
+func TestMakeCmdGeneratesCommandFile(t *testing.T) {
+	resetMakeTestState(t)
+	tmpDir := t.TempDir()
+	chdirForTest(t, tmpDir)
+
+	SetConfig(Config{ProjectName: "example.com/testapp"})
+
+	executeMakeCommand(t, "cmd", "backup_database")
+
+	files, err := filepath.Glob(filepath.Join(tmpDir, "cmd", "*.go"))
+	if err != nil {
+		t.Fatalf("glob command file: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("expected exactly one generated command file, got %d", len(files))
+	}
+	assertGoFileParses(t, files[0])
+}
+
 func TestMakeDDLGeneratesSQLFile(t *testing.T) {
 	resetMakeTestState(t)
 	tmpDir := t.TempDir()

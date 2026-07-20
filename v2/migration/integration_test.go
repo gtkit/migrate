@@ -17,9 +17,9 @@ import (
 	gormlogger "gorm.io/gorm/logger"
 )
 
-// 注意：fresh 的 foreign_key_checks 关闭→删表→恢复固定在同一连接执行（database.go
-// 的 deleteMySQLTables，fix C）是 MySQL 专属路径，SQLite 无法覆盖。对该路径「同一连接、
-// 返回前必复位」的断言归入后续新增 MySQL 集成测试的 change，此处暂随现有集成用例覆盖删表流程。
+// MySQL 专属路径（fresh 的 foreign_key_checks 同连接关闭/删表/复位、GET_LOCK 竞争与超时）
+// SQLite 无法覆盖，由本文件的 TestMigratorMySQLForeignKeyChecksRestored 与
+// TestMigratorMySQLLockContention 在真实 MySQL 上验证（需设置 MIGRATE_TEST_MYSQL_DSN）。
 func TestMigratorMySQLIntegration(t *testing.T) {
 	runMigratorIntegrationTest(t, "mysql", os.Getenv("MIGRATE_TEST_MYSQL_DSN"), func(dsn string) (db *gorm.DB, closeFn func(), err error) {
 		db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{})
@@ -138,6 +138,95 @@ func runMigratorIntegrationTest(t *testing.T, name, dsn string, open func(string
 	if db.Migrator().HasTable(&integrationUser{}) {
 		t.Fatalf("expected integration_users table to be dropped after rollback")
 	}
+}
+
+// openMySQLTestDB 打开真实 MySQL 测试库；未设置 DSN 或不是 test 库则跳过.
+func openMySQLTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	dsn := strings.TrimSpace(os.Getenv("MIGRATE_TEST_MYSQL_DSN"))
+	if dsn == "" {
+		t.Skip("mysql integration test skipped: MIGRATE_TEST_MYSQL_DSN is not set")
+	}
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open mysql: %v", err)
+	}
+	if name := strings.ToLower(CurrentDatabase(db)); !strings.Contains(name, "test") && os.Getenv("MIGRATE_TEST_ALLOW_ANY_DB") != "1" {
+		t.Skipf("mysql integration test skipped: database %q does not look like a test database", name)
+	}
+	t.Cleanup(func() {
+		if sqlDB, err := db.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	return db
+}
+
+// TestMigratorMySQLForeignKeyChecksRestored 在真实 MySQL 上验证 fix C：
+// deleteMySQLTables 关闭外键检查、删表、恢复固定在同一连接完成.
+// 用带外键约束的父子表验证删除成功——外键未在删表连接上关闭时，删被引用的
+// parent 会因约束失败；删成功即证明外键检查确实在同一连接被关闭.
+func TestMigratorMySQLForeignKeyChecksRestored(t *testing.T) {
+	db := openMySQLTestDB(t)
+
+	if err := DeleteAllTables(db); err != nil {
+		t.Fatalf("initial cleanup: %v", err)
+	}
+
+	if err := db.Exec("CREATE TABLE fk_parent (id INT PRIMARY KEY)").Error; err != nil {
+		t.Fatalf("create parent: %v", err)
+	}
+	if err := db.Exec("CREATE TABLE fk_child (id INT PRIMARY KEY, pid INT, CONSTRAINT fk_c FOREIGN KEY (pid) REFERENCES fk_parent(id))").Error; err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+
+	if err := DeleteAllTables(db); err != nil {
+		t.Fatalf("delete all tables with FK constraint: %v", err)
+	}
+
+	var remaining int64
+	if err := db.Raw("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ?", CurrentDatabase(db)).
+		Scan(&remaining).Error; err != nil {
+		t.Fatalf("count tables: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("expected all tables dropped, got %d remaining", remaining)
+	}
+}
+
+// TestMigratorMySQLLockContention 在真实 MySQL 上验证 GET_LOCK 竞争与超时：
+// 一个实例持锁时，另一个实例在 WithLockTimeout 内拿不到锁应返回错误而非无限阻塞；
+// 释放后可正常获取.
+func TestMigratorMySQLLockContention(t *testing.T) {
+	dbA := openMySQLTestDB(t)
+	dbB := openMySQLTestDB(t)
+
+	lockName := fmt.Sprintf("migrate_contention_%d", time.Now().UnixNano())
+	mA := NewMigrator(t.TempDir(), dbA, WithRegistry(NewRegistry()), WithLockName(lockName))
+	mB := NewMigrator(t.TempDir(), dbB, WithRegistry(NewRegistry()),
+		WithLockName(lockName), WithLockTimeout(2*time.Second))
+
+	release, err := mA.lock.Acquire(t.Context())
+	if err != nil {
+		t.Fatalf("A acquire lock: %v", err)
+	}
+
+	// B 在 A 持锁期间获取同名锁：应在超时后失败.
+	start := time.Now()
+	if _, err := mB.lock.Acquire(t.Context()); err == nil {
+		t.Fatalf("B should fail to acquire a lock held by A")
+	}
+	if waited := time.Since(start); waited < time.Second {
+		t.Fatalf("B should have waited for the lock timeout, returned after %s", waited)
+	}
+
+	// A 释放后 B 应能获取.
+	release()
+	relB, err := mB.lock.Acquire(t.Context())
+	if err != nil {
+		t.Fatalf("B acquire after release: %v", err)
+	}
+	relB()
 }
 
 func writeIntegrationMigrationFile(t *testing.T, dir, fileName string) {
