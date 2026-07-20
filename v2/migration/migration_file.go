@@ -1,6 +1,7 @@
 package migration
 
 import (
+	"slices"
 	"sync"
 
 	"gorm.io/gorm"
@@ -21,6 +22,7 @@ type Registry struct {
 	mu    sync.RWMutex
 	files map[string]MigrationFile
 	order []string // 保持注册顺序
+	dupes []string // 被忽略的重复注册名（供 lint 发现"两个包注册同名"）
 }
 
 // defaultRegistry 默认的全局注册表.
@@ -45,7 +47,9 @@ func (r *Registry) Add(name string, up, down MigrateFunc) {
 	defer r.mu.Unlock()
 
 	if _, exists := r.files[name]; exists {
-		// 重复注册直接忽略（程序重启时 init 会再次调用）
+		// 运行时保持"先注册者赢"，但记录下来供 lint 报告——
+		// 否则两个包注册同名不同内容的迁移会被静默吞掉、无法发现.
+		r.dupes = append(r.dupes, name)
 		return
 	}
 
@@ -55,6 +59,27 @@ func (r *Registry) Add(name string, up, down MigrateFunc) {
 		Down:     down,
 	}
 	r.order = append(r.order, name)
+}
+
+// Duplicates 返回被忽略的重复注册名（去重、升序）.
+func (r *Registry) Duplicates() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if len(r.dupes) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(r.dupes))
+	result := make([]string, 0, len(r.dupes))
+	for _, name := range r.dupes {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		result = append(result, name)
+	}
+	slices.Sort(result)
+	return result
 }
 
 // Get 通过名称获取迁移文件.

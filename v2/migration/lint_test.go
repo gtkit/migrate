@@ -181,6 +181,62 @@ func TestMigratorLintOnlineDDLIgnoresComments(t *testing.T) {
 	}
 }
 
+func TestMigratorLintOnlineDDLIgnoresSQLComments(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+
+	dir := t.TempDir()
+	// 在线 DDL 策略写在 SQL 块注释里 → 应仍报 missing_online_ddl.
+	commented := "2026_03_24_120000_add_a_to_users_table"
+	writeMigrationFile(t, dir, commented,
+		"package migrations\n\nfunc up() { _ = \"ALTER TABLE users ADD COLUMN x INT /* ALGORITHM=INPLACE, LOCK=NONE */\" }\n")
+	// 真实子句（非注释）→ 不应报.
+	real := "2026_03_24_120001_add_b_to_users_table"
+	writeMigrationFile(t, dir, real,
+		"package migrations\n\nfunc up() { _ = \"ALTER TABLE users ADD COLUMN y INT, ALGORITHM=INPLACE, LOCK=NONE\" }\n")
+
+	registry := NewRegistry()
+	noop := func(*gorm.DB) error { return nil }
+	registry.Add(commented, noop, noop)
+	registry.Add(real, noop, noop)
+
+	report, err := NewMigrator(dir, db, WithRegistry(registry)).Lint(t.Context(), LintOptions{SkipDatabase: true})
+	if err != nil {
+		t.Fatalf("lint: %v", err)
+	}
+
+	assertLintHasIssue(t, report.Issues, "missing_online_ddl", commented)
+	for _, issue := range report.Issues {
+		if issue.Name == real && issue.Code == "missing_online_ddl" {
+			t.Fatalf("real ALGORITHM+LOCK clause must not be flagged, got: %s", issue.Message)
+		}
+	}
+}
+
+func TestMigratorLintDetectsDuplicateRegistration(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+
+	dir := t.TempDir()
+	name := "2026_03_24_120000_create_users_table"
+	writeMigrationFile(t, dir, name, "package migrations\n")
+
+	registry := NewRegistry()
+	noop := func(*gorm.DB) error { return nil }
+	registry.Add(name, noop, noop)
+	registry.Add(name, noop, noop) // 重复注册
+
+	report, err := NewMigrator(dir, db, WithRegistry(registry)).Lint(t.Context(), LintOptions{SkipDatabase: true})
+	if err != nil {
+		t.Fatalf("lint: %v", err)
+	}
+	assertLintHasIssue(t, report.Issues, "duplicate_registration", name)
+}
+
 func writeMigrationFile(t *testing.T, dir, name, content string) {
 	t.Helper()
 	path := filepath.Join(dir, name+".go")

@@ -296,22 +296,104 @@ func TestMigrationLoggerAndHelpers(t *testing.T) {
 	}
 }
 
-// TestMigratorRecordsMigrationWithoutUp 覆盖 Up==nil 时只写记录的 recordMigration 路径.
-func TestMigratorRecordsMigrationWithoutUp(t *testing.T) {
-	db := openExecTestDB(t, "record_no_up")
+// TestMigratorUpFailsClosedOnNilUp 验证 Up==nil 时 fail-closed：报错且不写记录.
+func TestMigratorUpFailsClosedOnNilUp(t *testing.T) {
+	db := openExecTestDB(t, "nil_up")
 	registry := NewRegistry()
 	registry.Add("2026_03_24_120000_noop_table", nil, nil)
 	m := NewMigrator(t.TempDir(), db, WithRegistry(registry))
 
-	if err := m.Up(t.Context()); err != nil {
-		t.Fatalf("up: %v", err)
+	if err := m.Up(t.Context()); err == nil {
+		t.Fatalf("Up should fail-closed on a nil Up function")
 	}
 	var n int64
 	if err := db.Model(&Migration{}).Where("migration = ?", "2026_03_24_120000_noop_table").Count(&n).Error; err != nil {
 		t.Fatalf("count: %v", err)
 	}
+	if n != 0 {
+		t.Fatalf("nil-Up migration must not be recorded, got %d", n)
+	}
+}
+
+// TestMigratorFreshRefreshFailClosedOnEmptyRegistry 验证空 registry 下 Fresh/Refresh
+// 报错且不删/不回滚任何数据.
+func TestMigratorFreshRefreshFailClosedOnEmptyRegistry(t *testing.T) {
+	db := openExecTestDB(t, "fresh_empty_registry")
+	if err := db.Exec("CREATE TABLE sentinel (id integer primary key)").Error; err != nil {
+		t.Fatalf("create sentinel: %v", err)
+	}
+	m := NewMigrator(t.TempDir(), db, WithRegistry(NewRegistry()))
+
+	if err := m.Fresh(t.Context()); err == nil {
+		t.Fatalf("Fresh should fail-closed on empty registry")
+	}
+	if err := m.Refresh(t.Context()); err == nil {
+		t.Fatalf("Refresh should fail-closed on empty registry")
+	}
+	if !db.Migrator().HasTable("sentinel") {
+		t.Fatalf("Fresh/Refresh must not touch data on empty registry")
+	}
+}
+
+// TestMigratorDiagnosticsFailClosedOnEmptyRegistry 验证空 registry 下 Pending/Status/MarkApplied 报错.
+func TestMigratorDiagnosticsFailClosedOnEmptyRegistry(t *testing.T) {
+	db := openExecTestDB(t, "diag_empty_registry")
+	m := NewMigrator(t.TempDir(), db, WithRegistry(NewRegistry()))
+
+	if _, err := m.Pending(t.Context()); err == nil {
+		t.Fatalf("Pending should fail-closed on empty registry")
+	}
+	if _, err := m.Status(t.Context()); err == nil {
+		t.Fatalf("Status should fail-closed on empty registry")
+	}
+	if _, err := m.MarkApplied(t.Context(), ""); err == nil {
+		t.Fatalf("MarkApplied should fail-closed on empty registry")
+	}
+}
+
+// TestMigratorRollbackFailsClosedOnNilDown 验证 Down==nil 时回滚报错、记录保留、结构不变.
+func TestMigratorRollbackFailsClosedOnNilDown(t *testing.T) {
+	db := openExecTestDB(t, "nil_down")
+	registry := NewRegistry()
+	registry.Add("2026_03_24_120000_create_x_table",
+		func(tx *gorm.DB) error { return tx.Exec("CREATE TABLE x (id integer primary key)").Error },
+		nil)
+	m := NewMigrator(t.TempDir(), db, WithRegistry(registry))
+	if err := m.Up(t.Context()); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+
+	if err := m.Rollback(t.Context()); err == nil {
+		t.Fatalf("Rollback should fail-closed on a nil Down function")
+	}
+	if !db.Migrator().HasTable("x") {
+		t.Fatalf("table must not be dropped when Down is nil")
+	}
+	var n int64
+	db.Model(&Migration{}).Count(&n)
 	if n != 1 {
-		t.Fatalf("expected the no-op migration to be recorded, got %d", n)
+		t.Fatalf("migration record must be kept when Down is nil, got %d", n)
+	}
+}
+
+// TestMigratorRollbackAbortsOnUnregisteredRecord 验证回滚批中含未注册记录时整体拒绝、无一回滚.
+func TestMigratorRollbackAbortsOnUnregisteredRecord(t *testing.T) {
+	db := openExecTestDB(t, "rollback_unregistered")
+	m, _ := setupThreeApplied(t, db)
+	if err := db.Create(&Migration{Migration: "2026_03_24_119999_ghost", Batch: 1}).Error; err != nil {
+		t.Fatalf("seed ghost record: %v", err)
+	}
+
+	if err := m.Reset(t.Context()); err == nil {
+		t.Fatalf("Reset should abort when a record is not in registry")
+	}
+	var n int64
+	db.Model(&Migration{}).Count(&n)
+	if n != 4 {
+		t.Fatalf("no migration should be rolled back on abort, got %d records", n)
+	}
+	if !db.Migrator().HasTable("rb_a") {
+		t.Fatalf("tables must remain when rollback aborts upfront")
 	}
 }
 

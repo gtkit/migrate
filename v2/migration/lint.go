@@ -155,6 +155,15 @@ func (m *Migrator) Lint(ctx context.Context, opts LintOptions) (LintReport, erro
 		}
 	}
 
+	for _, name := range m.registry.Duplicates() {
+		report.Issues = append(report.Issues, LintIssue{
+			Severity: LintSeverityError,
+			Code:     "duplicate_registration",
+			Name:     name,
+			Message:  "migration name registered more than once; two packages may register the same name (first registration wins at runtime)",
+		})
+	}
+
 	for timestamp, names := range timestampMap {
 		if len(names) < 2 {
 			continue
@@ -336,10 +345,19 @@ func lintMigrationSQL(content string) (missingOnlineDDL, destructive bool) {
 	return missingOnlineDDL, destructive
 }
 
+// sqlCommentPattern 匹配 SQL 块注释 /* ... */ 与行注释 -- ... 到行尾.
+var sqlCommentPattern = regexp.MustCompile(`(?s)/\*.*?\*/|--[^\n]*`)
+
+// stripSQLComments 去除 SQL 注释，避免注释里的 ALGORITHM/LOCK 等关键词误导判定.
+func stripSQLComments(sql string) string {
+	return sqlCommentPattern.ReplaceAllString(sql, " ")
+}
+
 // sqlDDLChecks 对单段 SQL 文本判定在线 DDL 策略缺失与危险 DDL.
 // 缺在线 DDL 策略：含 ALTER TABLE 但未同时标注 ALGORITHM 与 LOCK.
+// 判定前先剥离 SQL 注释——注释中的关键词不算作已标注策略.
 func sqlDDLChecks(sql string) (missingOnlineDDL, destructive bool) {
-	lc := strings.ToLower(sql)
+	lc := strings.ToLower(stripSQLComments(sql))
 	if strings.Contains(lc, "alter table") && (!strings.Contains(lc, "algorithm") || !strings.Contains(lc, "lock")) {
 		missingOnlineDDL = true
 	}

@@ -277,6 +277,10 @@ func (m *Migrator) Reset(ctx context.Context) error {
 
 // Refresh 回滚所有迁移，然后重新执行.
 func (m *Migrator) Refresh(ctx context.Context) error {
+	// 回滚前先校验 registry 非空：空则不回滚，避免回滚后无迁移可重建.
+	if err := m.ensureRegistryNotEmpty(); err != nil {
+		return err
+	}
 	if err := m.Setup(ctx); err != nil {
 		return err
 	}
@@ -310,6 +314,10 @@ func (m *Migrator) Refresh(ctx context.Context) error {
 // Fresh 删除所有表并重新执行所有迁移.
 // ⚠️ 危险操作：会丢失所有数据.
 func (m *Migrator) Fresh(ctx context.Context) error {
+	// 删表前先校验 registry 非空：漏 import 迁移包时绝不删光数据却不重建.
+	if err := m.ensureRegistryNotEmpty(); err != nil {
+		return err
+	}
 	if err := m.ensureConcurrentConns(); err != nil {
 		return err
 	}
@@ -339,6 +347,9 @@ func (m *Migrator) Fresh(ctx context.Context) error {
 // Status 返回所有迁移的执行状态.
 func (m *Migrator) Status(ctx context.Context) ([]MigrationStatus, error) {
 	if err := m.Setup(ctx); err != nil {
+		return nil, err
+	}
+	if err := m.ensureRegistryNotEmpty(); err != nil {
 		return nil, err
 	}
 
@@ -378,6 +389,9 @@ func (m *Migrator) Pending(ctx context.Context) ([]string, error) {
 	if err := m.Setup(ctx); err != nil {
 		return nil, err
 	}
+	if err := m.ensureRegistryNotEmpty(); err != nil {
+		return nil, err
+	}
 
 	migrateFiles := m.registeredFiles()
 
@@ -403,6 +417,9 @@ func (m *Migrator) Pending(ctx context.Context) ([]string, error) {
 // 返回实际被标记的迁移文件名（升序）.
 func (m *Migrator) MarkApplied(ctx context.Context, toFile string) ([]string, error) {
 	if err := m.Setup(ctx); err != nil {
+		return nil, err
+	}
+	if err := m.ensureRegistryNotEmpty(); err != nil {
 		return nil, err
 	}
 
@@ -519,6 +536,9 @@ func (m *Migrator) ensureConcurrentConns() error {
 
 // upWithoutLock 执行迁移（不获取锁，供 Fresh 内部使用）.
 func (m *Migrator) upWithoutLock(ctx context.Context) error {
+	if err := m.ensureRegistryNotEmpty(); err != nil {
+		return err
+	}
 	migrateFiles := m.registeredFiles()
 
 	batch, err := m.getBatch(ctx)
@@ -553,8 +573,8 @@ func (m *Migrator) upWithoutLock(ctx context.Context) error {
 // 此为 MySQL 固有限制，此时事务仅保护记录写入.
 func (m *Migrator) runUpMigration(ctx context.Context, mfile MigrationFile, batch int) (retErr error) {
 	if mfile.Up == nil {
-		// 没有 Up 函数，只记录
-		return m.recordMigration(ctx, mfile.FileName, batch)
+		// fail-closed：无 Up 函数却记为已执行会让账本与真实 schema 不一致，直接报错.
+		return fmt.Errorf("migration %s has no up function", mfile.FileName)
 	}
 
 	// 捕获迁移函数中的 panic，转化为 error（gorm.Transaction 遇 panic 会先回滚再向上抛出）
@@ -575,25 +595,26 @@ func (m *Migrator) runUpMigration(ctx context.Context, mfile MigrationFile, batc
 	})
 }
 
-// recordMigration 写入迁移记录.
-func (m *Migrator) recordMigration(ctx context.Context, fileName string, batch int) error {
-	return m.DB.WithContext(ctx).Create(&Migration{
-		Migration: fileName,
-		Batch:     batch,
-	}).Error
-}
-
 // rollbackMigrations 按倒序执行迁移的 Down 方法.
 func (m *Migrator) rollbackMigrations(ctx context.Context, migrations []Migration) error {
 	if len(migrations) == 0 {
 		return nil
 	}
 
+	// 前置全量预检：任一待回滚记录在 registry 缺失或无 Down 则整体拒绝，
+	// 避免"回滚了一部分才失败"的部分回滚.
 	for _, record := range migrations {
 		mfile, ok := m.registry.Get(record.Migration)
 		if !ok {
-			return fmt.Errorf("rollback %s: migration file %q not found in registry", record.Migration, record.Migration)
+			return fmt.Errorf("rollback aborted: migration %q not found in registry", record.Migration)
 		}
+		if mfile.Down == nil {
+			return fmt.Errorf("rollback aborted: migration %q has no down function", record.Migration)
+		}
+	}
+
+	for _, record := range migrations {
+		mfile, _ := m.registry.Get(record.Migration)
 
 		m.logger.Info("rolling back", "file", record.Migration, "batch", record.Batch)
 
@@ -618,10 +639,13 @@ func (m *Migrator) runDownMigration(ctx context.Context, mfile MigrationFile, re
 	}()
 
 	return m.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if mfile.Down != nil {
-			if err := mfile.Down(tx); err != nil {
-				return fmt.Errorf("execute down for %s: %w", record.Migration, err)
-			}
+		// fail-closed：无 Down 函数不能删记录，否则表还在、记录没了=账本损坏.
+		// "不可回滚"应显式用 Irreversible（非 nil、返回 error）表达.
+		if mfile.Down == nil {
+			return fmt.Errorf("migration %s has no down function; cannot roll back", record.Migration)
+		}
+		if err := mfile.Down(tx); err != nil {
+			return fmt.Errorf("execute down for %s: %w", record.Migration, err)
 		}
 		if err := tx.Delete(&record).Error; err != nil {
 			return fmt.Errorf("delete migration record %s: %w", record.Migration, err)
@@ -686,13 +710,23 @@ func (m *Migrator) registeredFiles() []MigrationFile {
 // registry 为空（通常是漏 import 迁移包），或存在"已应用但当前 binary 未注册"的
 // 迁移（结构可能已漂移）时返回错误，禁止在这两种状态下继续执行.
 func (m *Migrator) checkRegistryConsistency(migrated map[string]struct{}) error {
-	if m.registry.Len() == 0 {
-		return errors.New("no migrations registered; did you forget to import the migrations package?")
+	if err := m.ensureRegistryNotEmpty(); err != nil {
+		return err
 	}
 	for name := range migrated {
 		if _, ok := m.registry.Get(name); !ok {
 			return fmt.Errorf("applied migration %q is not registered in the current binary; schema may have drifted", name)
 		}
+	}
+	return nil
+}
+
+// ensureRegistryNotEmpty 校验 registry 至少注册了一条迁移，fail-closed.
+// 空 registry 通常是漏 import 迁移包——诊断命令会误报"无待执行/已最新"，
+// 破坏性命令则会删光数据却不重建，故所有相关入口在动手前都必须先过此检查.
+func (m *Migrator) ensureRegistryNotEmpty() error {
+	if m.registry.Len() == 0 {
+		return errors.New("no migrations registered; did you forget to import the migrations package?")
 	}
 	return nil
 }
