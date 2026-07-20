@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
@@ -286,16 +287,18 @@ func lintFileContent(file diskMigrationFile) []LintIssue {
 		}
 	}
 
-	lc := strings.ToLower(file.Content)
-	if strings.Contains(lc, "alter table") && !strings.Contains(lc, "algorithm") {
+	// 在线 DDL / 危险 DDL 只看真实 SQL 字符串字面量，排除注释干扰
+	// （注释里的 ALGORITHM/LOCK 关键词不能算作已标注在线 DDL 策略）.
+	missingOnlineDDL, destructive := lintMigrationSQL(file.Content)
+	if missingOnlineDDL {
 		issues = append(issues, LintIssue{
 			Severity: LintSeverityWarning,
 			Code:     "missing_online_ddl",
 			Name:     file.Name,
-			Message:  "raw ALTER TABLE without an online-DDL strategy (ALGORITHM/LOCK); large tables may block",
+			Message:  "raw ALTER TABLE without an online-DDL strategy (needs both ALGORITHM and LOCK); large tables may block",
 		})
 	}
-	if strings.Contains(lc, "drop table") || strings.Contains(lc, "drop database") || strings.Contains(lc, "truncate") {
+	if destructive {
 		issues = append(issues, LintIssue{
 			Severity: LintSeverityWarning,
 			Code:     "destructive_migration",
@@ -305,6 +308,45 @@ func lintFileContent(file diskMigrationFile) []LintIssue {
 	}
 
 	return issues
+}
+
+// lintMigrationSQL 用 AST 提取迁移文件中的字符串字面量（真实 SQL），逐条判定：
+// 是否存在缺在线 DDL 策略的 ALTER TABLE，以及是否存在危险 DDL.
+// 只看字符串字面量，注释里的关键词不参与判定；解析失败时退回全文文本（降级）.
+func lintMigrationSQL(content string) (missingOnlineDDL, destructive bool) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", content, 0)
+	if err != nil {
+		return sqlDDLChecks(content)
+	}
+	ast.Inspect(f, func(n ast.Node) bool {
+		lit, ok := n.(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return true
+		}
+		s, err := strconv.Unquote(lit.Value)
+		if err != nil {
+			return true
+		}
+		mo, d := sqlDDLChecks(s)
+		missingOnlineDDL = missingOnlineDDL || mo
+		destructive = destructive || d
+		return true
+	})
+	return missingOnlineDDL, destructive
+}
+
+// sqlDDLChecks 对单段 SQL 文本判定在线 DDL 策略缺失与危险 DDL.
+// 缺在线 DDL 策略：含 ALTER TABLE 但未同时标注 ALGORITHM 与 LOCK.
+func sqlDDLChecks(sql string) (missingOnlineDDL, destructive bool) {
+	lc := strings.ToLower(sql)
+	if strings.Contains(lc, "alter table") && (!strings.Contains(lc, "algorithm") || !strings.Contains(lc, "lock")) {
+		missingOnlineDDL = true
+	}
+	if strings.Contains(lc, "drop table") || strings.Contains(lc, "drop database") || strings.Contains(lc, "truncate") {
+		destructive = true
+	}
+	return missingOnlineDDL, destructive
 }
 
 // migrationImports 解析迁移文件的 import 路径；解析失败返回空（其余文本检查照常进行）.

@@ -146,6 +146,41 @@ func TestMigratorLintDestructiveAndCleanMigration(t *testing.T) {
 	}
 }
 
+func TestMigratorLintOnlineDDLIgnoresComments(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+
+	dir := t.TempDir()
+	// 注释里有 ALGORITHM/LOCK 关键词，但真实 SQL 字符串没有 → 仍应报 missing_online_ddl。
+	commentOnly := "2026_03_24_120000_add_a_to_users_table"
+	writeMigrationFile(t, dir, commentOnly,
+		"package migrations\n\nfunc up() {\n\t// 建议标注 ALGORITHM=INPLACE, LOCK=NONE\n\t_ = \"ALTER TABLE `users` ADD COLUMN `a` INT\"\n}\n")
+	// SQL 字符串里同时含 ALGORITHM 与 LOCK → 不应报。
+	proper := "2026_03_24_120001_add_b_to_users_table"
+	writeMigrationFile(t, dir, proper,
+		"package migrations\n\nfunc up() { _ = \"ALTER TABLE `users` ADD COLUMN `b` INT, ALGORITHM=INPLACE, LOCK=NONE\" }\n")
+
+	registry := NewRegistry()
+	noop := func(*gorm.DB) error { return nil }
+	registry.Add(commentOnly, noop, noop)
+	registry.Add(proper, noop, noop)
+
+	report, err := NewMigrator(dir, db, WithRegistry(registry)).Lint(t.Context(), LintOptions{SkipDatabase: true})
+	if err != nil {
+		t.Fatalf("lint: %v", err)
+	}
+
+	assertLintHasIssue(t, report.Issues, "missing_online_ddl", commentOnly)
+
+	for _, issue := range report.Issues {
+		if issue.Name == proper && issue.Code == "missing_online_ddl" {
+			t.Fatalf("SQL with real ALGORITHM+LOCK must not be flagged, got: %s", issue.Message)
+		}
+	}
+}
+
 func writeMigrationFile(t *testing.T, dir, name, content string) {
 	t.Helper()
 	path := filepath.Join(dir, name+".go")

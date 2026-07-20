@@ -41,7 +41,8 @@ go get github.com/gtkit/migrate/v2@latest
 | `make ddl diff <model>` | 比较当前模型 DDL 与已提交 SQL | CI 检查 schema 漂移 |
 | `migrate pending` | 查看待执行 migration | 上线前确认 |
 | `migrate up` | 执行未运行 migration | 发布时执行 |
-| `migrate down` | 回滚最后一批 migration | 紧急回滚 |
+| `migrate down --force` | 回滚最后一批 migration（需 `--force`） | 紧急回滚 |
+| `migrate down-to <version> --force` | 回滚到指定版本（需 `--force`，目标须已应用） | 回退到某版本 |
 | `migrate reset --force` | 回滚全部 migration（需 `--force`） | 测试环境重置 |
 | `migrate refresh --force` | 回滚全部再重放（需 `--force`） | 测试环境验证 |
 | `migrate fresh --force` | 删库内所有表再重放 migration（需 `--force`） | 仅测试环境 |
@@ -65,6 +66,10 @@ import (
     "github.com/spf13/cobra"
     "gorm.io/driver/mysql"
     "gorm.io/gorm"
+
+    // 关键：副作用导入迁移包，让各迁移文件的 init() 注册进 registry。
+    // migrate up 以编译进 binary 的 registry 为执行源；不导入则 registry 为空、up 会直接报错（fail-closed）。
+    _ "yourapp/database/migrations"
 )
 
 func main() {
@@ -312,8 +317,11 @@ myapp migrate status
 myapp migrate lint
 myapp migrate lint --strict
 
-# 回滚最后一批迁移
-myapp migrate down
+# 回滚最后一批迁移（破坏性，需 --force）
+myapp migrate down --force
+
+# 回滚到指定版本（回滚所有比它新的迁移，需 --force）
+myapp migrate down-to 2026_03_17_120000_create_users_table --force
 
 # 回滚所有迁移（破坏性，需 --force）
 myapp migrate reset --force
@@ -325,7 +333,9 @@ myapp migrate refresh --force
 myapp migrate fresh --force
 ```
 
-> `reset` / `refresh` / `fresh` 会回滚或删除数据，必须显式加 `--force` 才执行，缺失时直接报错拒绝，避免误触丢数据。
+> `down` / `down-to` / `reset` / `refresh` / `fresh` 会回滚或删除数据，必须显式加 `--force` 才执行，缺失时直接报错拒绝，避免误触丢数据。核心生产可在组装 CLI 时干脆不注册这些回滚命令。
+>
+> `down-to <version>` 的目标必须是真实已应用的版本；`RollbackSteps` 的步数必须为正数——否则直接报错，不会误回滚全部。
 
 各命令语义：
 
@@ -468,8 +478,8 @@ MIGRATE_ENV = $(if $(ENV),$(ENV),dev)
 migrate:                ## 执行迁移
 	go run . migrate up -c $(MIGRATE_ENV)
 
-migrate-down:           ## 回滚最后一批
-	go run . migrate down -c $(MIGRATE_ENV)
+migrate-down:           ## 回滚最后一批（破坏性，需 --force）
+	go run . migrate down --force -c $(MIGRATE_ENV)
 
 migrate-status:         ## 查看迁移状态
 	go run . migrate status -c $(MIGRATE_ENV)
@@ -515,7 +525,7 @@ ddl-diff:               ## 对比 DDL 漂移: make ddl-diff user / make ddl-diff
 | Makefile 命令 | 等价于 | 作用 |
 |---------------|--------|------|
 | `make migrate` | `migrate up` | 执行所有未运行的迁移 |
-| `make migrate-down` | `migrate down` | 回滚最后一批迁移 |
+| `make migrate-down` | `migrate down --force` | 回滚最后一批迁移 |
 | `make migrate-status` | `migrate status` | 查看迁移状态 |
 | `make migrate-pending` | `migrate pending` | 预览待执行迁移 |
 | `make migrate-lint` | `migrate lint` | 检查漂移和回滚风险 |

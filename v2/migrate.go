@@ -298,6 +298,8 @@ func init() {
 	CmdMigrateLint.Flags().Bool("strict", false, "Fail on warnings as well as errors")
 	CmdMigrateLint.Flags().Bool("skip-db", false, "Skip database-applied migration drift checks")
 
+	CmdMigrateRollback.Flags().Bool("force", false, "Required: confirm rolling back the last batch")
+	CmdMigrateDownTo.Flags().Bool("force", false, "Required: confirm rolling back migrations newer than the target")
 	CmdMigrateReset.Flags().Bool("force", false, "Required: confirm rolling back all migrations")
 	CmdMigrateRefresh.Flags().Bool("force", false, "Required: confirm rolling back and re-running all migrations")
 	CmdMigrateFresh.Flags().Bool("force", false, "Required: confirm dropping all tables and destroying all data")
@@ -345,6 +347,10 @@ func runUp(cmd *cobra.Command, _ []string) error {
 }
 
 func runDown(cmd *cobra.Command, _ []string) error {
+	if err := requireForce(cmd, "down rolls back the last batch of migrations and can drop data"); err != nil {
+		return err
+	}
+
 	ctx, cancel := newContext()
 	defer cancel()
 
@@ -513,6 +519,10 @@ func runLint(cmd *cobra.Command, _ []string) error {
 }
 
 func runDownTo(cmd *cobra.Command, args []string) error {
+	if err := requireForce(cmd, "down-to rolls back all migrations newer than the target and can drop data"); err != nil {
+		return err
+	}
+
 	target := strings.TrimSpace(args[0])
 	if target == "" {
 		return fmt.Errorf("down-to requires a target migration version")

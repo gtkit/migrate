@@ -15,6 +15,9 @@
 - **⚠ 破坏性变更** `migrate up` 与 `IsUpToDate` 改以编译期注册表（registry）为迁移集合的唯一真实来源，不再依赖运行时的 `.go` 源文件目录。此前在部署环境缺少源目录时，`up` 会读到空目录并静默报告「已最新」、漏执行整批迁移；现在以已 import 编译进 binary 的迁移为准。
 - **⚠ 破坏性变更** `migrate reset` / `refresh` / `fresh` 现在必须显式加 `--force` 才执行，缺失时直接返回错误并拒绝执行，防止误触导致数据丢失。
 - **⚠ 破坏性变更** `make migration` 的 `add`/`update`/`drop`/`drop_column`/`drop_index` 模板改为自包含、显式的 raw SQL：不再 import 业务 model、`update` 不再使用 `AutoMigrate`。新生成的迁移带 `TODO` 占位，需补全（大表建议标注在线 DDL 策略）后才能通过 `migrate lint`。
+- **⚠ 破坏性变更** `RollbackSteps(steps)` 要求 `steps > 0`，否则直接返回错误（此前负数经 GORM `Limit(-1)` 会取消行数限制而回滚全部）。
+- **⚠ 破坏性变更** `RollbackTo(target)` 在 `target` 非空时要求它是真实已应用的版本，否则返回错误（此前传 `0` 或早于首个版本的字符串会误回滚全部）。
+- **⚠ 破坏性变更** CLI `down`、`down-to` 现在必须显式加 `--force`，与 `reset`/`refresh`/`fresh` 一致。
 
 ### Removed
 
@@ -27,6 +30,7 @@
 
 ### Migration Notes
 
-- 使用 `reset` / `refresh` / `fresh` 的脚本需补 `--force`。
-- 依赖「迁移目录为空即视为已最新」的旧行为会开始报错，属预期修正——请确保迁移包已被 import 进入 binary。
+- 使用 `down` / `down-to` / `reset` / `refresh` / `fresh` 的脚本需补 `--force`。
+- 依赖「迁移目录为空即视为已最新」的旧行为会开始报错，属预期修正——请确保迁移包已被 import 进入 binary（如 `_ "yourapp/database/migrations"`）。
 - 新生成的 `add`/`update`/`drop` 迁移形态改为 raw SQL，需按提示补全 `TODO`；`migrate lint` 会拦截未补全、`AutoMigrate` 与非自包含 import。
+- `RollbackSteps` 需传正数；`down-to`/`RollbackTo` 的目标必须是已应用版本，否则报错——不会再误回滚全部。

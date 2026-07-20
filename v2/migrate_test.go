@@ -24,11 +24,13 @@ func TestRequireForce(t *testing.T) {
 	}
 }
 
-// TestDestructiveRunFuncsRequireForce 验证 reset/refresh/fresh 未传 --force 时
+// TestDestructiveRunFuncsRequireForce 验证 down/down-to/reset/refresh/fresh 未传 --force 时
 // 直接返回错误并在触达数据库之前拒绝执行（app 未初始化仍不 panic，
 // 证明 requireForce 在 newContext/newMigrator 之前短路）.
 func TestDestructiveRunFuncsRequireForce(t *testing.T) {
 	funcs := map[string]func(*cobra.Command, []string) error{
+		"down":    runDown,
+		"down-to": runDownTo,
 		"reset":   runReset,
 		"refresh": runRefresh,
 		"fresh":   runFresh,
@@ -39,7 +41,8 @@ func TestDestructiveRunFuncsRequireForce(t *testing.T) {
 			cmd := &cobra.Command{}
 			cmd.Flags().Bool("force", false, "")
 
-			err := fn(cmd, nil)
+			// down-to 会读取 args[0]，但 requireForce 在此之前短路；传一个占位 arg 以防万一。
+			err := fn(cmd, []string{"2026_01_01_000000_placeholder"})
 			if err == nil {
 				t.Fatalf("%s without --force should return an error", name)
 			}

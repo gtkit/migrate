@@ -223,7 +223,11 @@ func (m *Migrator) Rollback(ctx context.Context) error {
 }
 
 // RollbackSteps 回滚指定步数的迁移.
+// steps 必须为正数：<=0 直接返回错误，避免负数经 GORM Limit(-1) 取消行数限制而回滚全部.
 func (m *Migrator) RollbackSteps(ctx context.Context, steps int) error {
+	if steps <= 0 {
+		return fmt.Errorf("rollback steps must be greater than 0, got %d", steps)
+	}
 	if err := m.Setup(ctx); err != nil {
 		return err
 	}
@@ -463,6 +467,19 @@ func (m *Migrator) RollbackTo(ctx context.Context, targetFile string) error {
 		return fmt.Errorf("acquire migration lock: %w", err)
 	}
 	defer release()
+
+	// targetFile 非空时必须是真实已应用版本，否则（如传 "0" 或早于首个版本的字符串）
+	// 会命中"全部已应用"而误回滚全部.
+	if targetFile != "" {
+		var count int64
+		if err := m.DB.WithContext(ctx).Model(&Migration{}).
+			Where("migration = ?", targetFile).Count(&count).Error; err != nil {
+			return fmt.Errorf("check target migration: %w", err)
+		}
+		if count == 0 {
+			return fmt.Errorf("target migration %q is not an applied migration", targetFile)
+		}
+	}
 
 	// 按迁移文件名（版本）倒序回滚，保证后应用的先回滚.
 	query := m.DB.WithContext(ctx).Order("migration DESC")

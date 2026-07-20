@@ -269,6 +269,81 @@ func TestMigratorRollbackTo(t *testing.T) {
 	}
 }
 
+// setupThreeApplied 建三条已应用迁移（各建一张表），返回 Migrator 与版本名.
+func setupThreeApplied(t *testing.T, db *gorm.DB) (*Migrator, [3]string) {
+	t.Helper()
+	f1 := "2026_03_24_120000_create_a_table"
+	f2 := "2026_03_24_120001_create_b_table"
+	f3 := "2026_03_24_120002_create_c_table"
+	tables := map[string]string{f1: "rb_a", f2: "rb_b", f3: "rb_c"}
+	registry := NewRegistry()
+	for _, f := range []string{f1, f2, f3} {
+		tbl := tables[f]
+		registry.Add(f,
+			func(tx *gorm.DB) error { return tx.Exec("CREATE TABLE " + tbl + " (id integer primary key)").Error },
+			func(tx *gorm.DB) error { return tx.Exec("DROP TABLE " + tbl).Error },
+		)
+	}
+	m := NewMigrator(t.TempDir(), db, WithRegistry(registry))
+	if err := m.Up(t.Context()); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+	return m, [3]string{f1, f2, f3}
+}
+
+func countMigrations(t *testing.T, db *gorm.DB) int64 {
+	t.Helper()
+	var n int64
+	if err := db.Model(&Migration{}).Count(&n).Error; err != nil {
+		t.Fatalf("count migrations: %v", err)
+	}
+	return n
+}
+
+// TestMigratorRollbackStepsRejectsNonPositive 验证 steps<=0 报错且不回滚任何迁移
+// （防止负数经 GORM Limit(-1) 取消 LIMIT 回滚全部）.
+func TestMigratorRollbackStepsRejectsNonPositive(t *testing.T) {
+	db := openExecTestDB(t, "rollback_steps_guard")
+	m, _ := setupThreeApplied(t, db)
+
+	for _, steps := range []int{0, -1} {
+		if err := m.RollbackSteps(t.Context(), steps); err == nil {
+			t.Fatalf("RollbackSteps(%d) should return an error", steps)
+		}
+		if n := countMigrations(t, db); n != 3 {
+			t.Fatalf("RollbackSteps(%d) must not roll back; expected 3 records, got %d", steps, n)
+		}
+	}
+
+	if err := m.RollbackSteps(t.Context(), 2); err != nil {
+		t.Fatalf("RollbackSteps(2): %v", err)
+	}
+	if n := countMigrations(t, db); n != 1 {
+		t.Fatalf("RollbackSteps(2) should leave 1 record, got %d", n)
+	}
+}
+
+// TestMigratorRollbackToRejectsUnknownTarget 验证无效目标报错且不回滚.
+func TestMigratorRollbackToRejectsUnknownTarget(t *testing.T) {
+	db := openExecTestDB(t, "rollback_to_guard")
+	m, versions := setupThreeApplied(t, db)
+
+	if err := m.RollbackTo(t.Context(), "0"); err == nil {
+		t.Fatalf("RollbackTo(\"0\") should return an error for an unknown target")
+	}
+	if n := countMigrations(t, db); n != 3 {
+		t.Fatalf("RollbackTo with unknown target must not roll back; expected 3, got %d", n)
+	}
+
+	// 有效目标（f1）：只回滚 f2、f3.
+	if err := m.RollbackTo(t.Context(), versions[0]); err != nil {
+		t.Fatalf("RollbackTo(%s): %v", versions[0], err)
+	}
+	if n := countMigrations(t, db); n != 1 {
+		t.Fatalf("RollbackTo(f1) should leave 1 record, got %d", n)
+	}
+}
+
 // TestMigratorUpUsesRegistryWithoutDiskFiles 验证 Up 以 registry 为执行源：
 // 迁移目录为空（模拟部署后不带 .go 源目录）时仍执行 registry 中的迁移，
 // 而非旧行为「空目录 → database is up to date」的静默漏执行.
