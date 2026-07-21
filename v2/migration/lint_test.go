@@ -6,15 +6,11 @@ import (
 	"strings"
 	"testing"
 
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
 func TestMigratorLintDetectsDiskRegistryAndDBDrift(t *testing.T) {
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
+	db := openExecTestDB(t, t.Name())
 
 	dir := t.TempDir()
 	writeMigrationFile(t, dir, "2026_03_24_120000_create_users_table", "package migrations\n")
@@ -55,10 +51,7 @@ func TestMigratorLintDetectsDiskRegistryAndDBDrift(t *testing.T) {
 }
 
 func TestMigratorLintDetectsDuplicateTimestamps(t *testing.T) {
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
+	db := openExecTestDB(t, t.Name())
 
 	dir := t.TempDir()
 	writeMigrationFile(t, dir, "2026_03_24_120000_create_users_table", "package migrations\n")
@@ -77,10 +70,7 @@ func TestMigratorLintDetectsDuplicateTimestamps(t *testing.T) {
 }
 
 func TestMigratorLintDetectsContentIssues(t *testing.T) {
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
+	db := openExecTestDB(t, t.Name())
 
 	dir := t.TempDir()
 	todoFile := "2026_03_24_120000_add_email_to_users_table"
@@ -112,10 +102,7 @@ func TestMigratorLintDetectsContentIssues(t *testing.T) {
 }
 
 func TestMigratorLintDestructiveAndCleanMigration(t *testing.T) {
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
+	db := openExecTestDB(t, t.Name())
 
 	dir := t.TempDir()
 	dropFile := "2026_03_24_120000_drop_users_table"
@@ -147,10 +134,7 @@ func TestMigratorLintDestructiveAndCleanMigration(t *testing.T) {
 }
 
 func TestMigratorLintOnlineDDLIgnoresComments(t *testing.T) {
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
+	db := openExecTestDB(t, t.Name())
 
 	dir := t.TempDir()
 	// 注释里有 ALGORITHM/LOCK 关键词，但真实 SQL 字符串没有 → 仍应报 missing_online_ddl。
@@ -182,10 +166,7 @@ func TestMigratorLintOnlineDDLIgnoresComments(t *testing.T) {
 }
 
 func TestMigratorLintOnlineDDLIgnoresSQLComments(t *testing.T) {
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
+	db := openExecTestDB(t, t.Name())
 
 	dir := t.TempDir()
 	// 在线 DDL 策略写在 SQL 块注释里 → 应仍报 missing_online_ddl.
@@ -216,10 +197,7 @@ func TestMigratorLintOnlineDDLIgnoresSQLComments(t *testing.T) {
 }
 
 func TestMigratorLintDetectsDuplicateRegistration(t *testing.T) {
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
+	db := openExecTestDB(t, t.Name())
 
 	dir := t.TempDir()
 	name := "2026_03_24_120000_create_users_table"
@@ -235,6 +213,43 @@ func TestMigratorLintDetectsDuplicateRegistration(t *testing.T) {
 		t.Fatalf("lint: %v", err)
 	}
 	assertLintHasIssue(t, report.Issues, "duplicate_registration", name)
+}
+
+func TestMigratorLintOnlineDDLMatchesRealClauses(t *testing.T) {
+	db := openExecTestDB(t, t.Name())
+	dir := t.TempDir()
+
+	// 这些都缺真实在线 DDL 子句，应报 missing_online_ddl.
+	bad := map[string]string{
+		"2026_03_24_120000_col_name":   "ALTER TABLE users ADD COLUMN algorithm INT, ADD COLUMN lock INT",                     // algorithm/lock 只是列名
+		"2026_03_24_120001_str_val":    "ALTER TABLE users ADD COLUMN note VARCHAR(64) DEFAULT 'algorithm lock'",              // 出现在字符串值里
+		"2026_03_24_120002_hash":       "ALTER TABLE users ADD COLUMN x INT # ALGORITHM=INPLACE, LOCK=NONE",                   // 写在 # 注释里
+		"2026_03_24_120004_str_clause": "ALTER TABLE users ADD COLUMN note VARCHAR(64) DEFAULT 'algorithm=INPLACE lock=NONE'", // 写在字符串值里
+	}
+	registry := NewRegistry()
+	noop := func(*gorm.DB) error { return nil }
+	for name, sql := range bad {
+		writeMigrationFile(t, dir, name, "package migrations\n\nfunc up() { _ = \""+sql+"\" }\n")
+		registry.Add(name, noop, noop)
+	}
+	// 真实子句，不应报.
+	realName := "2026_03_24_120003_real"
+	writeMigrationFile(t, dir, realName, "package migrations\n\nfunc up() { _ = \"ALTER TABLE users ADD COLUMN y INT, ALGORITHM=INPLACE, LOCK=NONE\" }\n")
+	registry.Add(realName, noop, noop)
+
+	report, err := NewMigrator(dir, db, WithRegistry(registry)).Lint(t.Context(), LintOptions{SkipDatabase: true})
+	if err != nil {
+		t.Fatalf("lint: %v", err)
+	}
+
+	for name := range bad {
+		assertLintHasIssue(t, report.Issues, "missing_online_ddl", name)
+	}
+	for _, issue := range report.Issues {
+		if issue.Name == realName && issue.Code == "missing_online_ddl" {
+			t.Fatalf("real ALGORITHM+LOCK clause must not be flagged, got: %s", issue.Message)
+		}
+	}
 }
 
 func writeMigrationFile(t *testing.T, dir, name, content string) {

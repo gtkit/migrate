@@ -397,6 +397,75 @@ func TestMigratorRollbackAbortsOnUnregisteredRecord(t *testing.T) {
 	}
 }
 
+// TestMigratorFreshFailsClosedOnNilUp 验证 registry 含 nil Up 时 Fresh 在删表前失败、不动数据.
+func TestMigratorFreshFailsClosedOnNilUp(t *testing.T) {
+	db := openExecTestDB(t, "fresh_nil_up")
+	if err := db.Exec("CREATE TABLE sentinel (id integer primary key)").Error; err != nil {
+		t.Fatalf("create sentinel: %v", err)
+	}
+	registry := NewRegistry()
+	registry.Add("2026_03_24_120000_bad", nil, func(*gorm.DB) error { return nil }) // nil Up
+	m := NewMigrator(t.TempDir(), db, WithRegistry(registry))
+
+	if err := m.Fresh(t.Context()); err == nil {
+		t.Fatalf("Fresh should fail-closed when a migration has nil Up")
+	}
+	if !db.Migrator().HasTable("sentinel") {
+		t.Fatalf("Fresh must not drop tables when validation fails")
+	}
+}
+
+// TestMigratorUpFailsClosedOnDuplicateRegistration 验证重复注册名时 Up 报错.
+func TestMigratorUpFailsClosedOnDuplicateRegistration(t *testing.T) {
+	db := openExecTestDB(t, "dup_reg")
+	up := func(tx *gorm.DB) error { return tx.Exec("CREATE TABLE d (id integer primary key)").Error }
+	down := func(*gorm.DB) error { return nil }
+	registry := NewRegistry()
+	registry.Add("2026_03_24_120000_dup", up, down)
+	registry.Add("2026_03_24_120000_dup", up, down) // 同名重复
+	m := NewMigrator(t.TempDir(), db, WithRegistry(registry))
+
+	if err := m.Up(t.Context()); err == nil {
+		t.Fatalf("Up should fail-closed on duplicate registration")
+	}
+}
+
+// TestMigratorDiagnosticsFailClosedOnDrift 验证存在未注册 ghost 迁移时
+// Pending/Status/MarkApplied 报错（不掩盖漂移）.
+func TestMigratorDiagnosticsFailClosedOnDrift(t *testing.T) {
+	db := openExecTestDB(t, "diag_drift")
+	registry := NewRegistry()
+	registry.Add("2026_03_24_120000_a", func(*gorm.DB) error { return nil }, func(*gorm.DB) error { return nil })
+	m := NewMigrator(t.TempDir(), db, WithRegistry(registry))
+	if err := m.Setup(t.Context()); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	if err := db.Create(&Migration{Migration: "2026_03_24_119999_ghost", Batch: 1}).Error; err != nil {
+		t.Fatalf("seed ghost record: %v", err)
+	}
+
+	if _, err := m.Pending(t.Context()); err == nil {
+		t.Fatalf("Pending should fail-closed on drift")
+	}
+	if _, err := m.Status(t.Context()); err == nil {
+		t.Fatalf("Status should fail-closed on drift")
+	}
+	if _, err := m.MarkApplied(t.Context(), ""); err == nil {
+		t.Fatalf("MarkApplied should fail-closed on drift")
+	}
+}
+
+// TestNewMigratorNilDBReturnsError 验证 nil db 不 panic，方法返回可处理错误.
+func TestNewMigratorNilDBReturnsError(t *testing.T) {
+	m := NewMigrator(t.TempDir(), nil, WithRegistry(NewRegistry()))
+	if m == nil {
+		t.Fatalf("NewMigrator must not return nil")
+	}
+	if err := m.Setup(t.Context()); err == nil {
+		t.Fatalf("Setup should return an error for a nil db")
+	}
+}
+
 // setupThreeApplied 建三条已应用迁移（各建一张表），返回 Migrator 与版本名.
 func setupThreeApplied(t *testing.T, db *gorm.DB) (*Migrator, [3]string) {
 	t.Helper()

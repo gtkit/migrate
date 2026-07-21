@@ -94,6 +94,9 @@ func NewMigrator(folder string, db *gorm.DB, opts ...MigratorOption) *Migrator {
 // Setup 创建 migrations 表（如不存在）.
 // 并发安全：如果多个进程同时调用，重复创建会被忽略.
 func (m *Migrator) Setup(ctx context.Context) error {
+	if m.DB == nil {
+		return errors.New("migrate: database connection is required")
+	}
 	migrator := m.DB.WithContext(ctx).Migrator()
 	if migrator.HasTable(&Migration{}) {
 		return nil
@@ -115,9 +118,9 @@ func (m *Migrator) Up(ctx context.Context) error {
 	}
 
 	// 获取迁移锁
-	release, err := m.lock.Acquire(ctx)
+	release, err := m.acquireLock(ctx)
 	if err != nil {
-		return fmt.Errorf("acquire migration lock: %w", err)
+		return err
 	}
 	defer release()
 
@@ -196,9 +199,9 @@ func (m *Migrator) Rollback(ctx context.Context) error {
 		return err
 	}
 
-	release, err := m.lock.Acquire(ctx)
+	release, err := m.acquireLock(ctx)
 	if err != nil {
-		return fmt.Errorf("acquire migration lock: %w", err)
+		return err
 	}
 	defer release()
 
@@ -232,9 +235,9 @@ func (m *Migrator) RollbackSteps(ctx context.Context, steps int) error {
 		return err
 	}
 
-	release, err := m.lock.Acquire(ctx)
+	release, err := m.acquireLock(ctx)
 	if err != nil {
-		return fmt.Errorf("acquire migration lock: %w", err)
+		return err
 	}
 	defer release()
 
@@ -255,9 +258,9 @@ func (m *Migrator) Reset(ctx context.Context) error {
 		return err
 	}
 
-	release, err := m.lock.Acquire(ctx)
+	release, err := m.acquireLock(ctx)
 	if err != nil {
-		return fmt.Errorf("acquire migration lock: %w", err)
+		return err
 	}
 	defer release()
 
@@ -277,21 +280,17 @@ func (m *Migrator) Reset(ctx context.Context) error {
 
 // Refresh 回滚所有迁移，然后重新执行.
 func (m *Migrator) Refresh(ctx context.Context) error {
-	// 回滚前先校验 registry 非空：空则不回滚，避免回滚后无迁移可重建.
-	if err := m.ensureRegistryNotEmpty(); err != nil {
+	// 回滚前先做完整执行校验：空 registry / 重复名 / nil Up 都在回滚之前拦下.
+	if err := m.validateRegistryForExecution(); err != nil {
 		return err
 	}
 	if err := m.Setup(ctx); err != nil {
 		return err
 	}
 
-	if err := m.ensureConcurrentConns(); err != nil {
-		return err
-	}
-
-	release, err := m.lock.Acquire(ctx)
+	release, err := m.acquireLock(ctx)
 	if err != nil {
-		return fmt.Errorf("acquire migration lock: %w", err)
+		return err
 	}
 	defer release()
 
@@ -314,17 +313,14 @@ func (m *Migrator) Refresh(ctx context.Context) error {
 // Fresh 删除所有表并重新执行所有迁移.
 // ⚠️ 危险操作：会丢失所有数据.
 func (m *Migrator) Fresh(ctx context.Context) error {
-	// 删表前先校验 registry 非空：漏 import 迁移包时绝不删光数据却不重建.
-	if err := m.ensureRegistryNotEmpty(); err != nil {
-		return err
-	}
-	if err := m.ensureConcurrentConns(); err != nil {
+	// 删表前先做完整执行校验：空 registry / 重复名 / nil Up 都在删表之前拦下，绝不删光数据却不重建.
+	if err := m.validateRegistryForExecution(); err != nil {
 		return err
 	}
 
-	release, err := m.lock.Acquire(ctx)
+	release, err := m.acquireLock(ctx)
 	if err != nil {
-		return fmt.Errorf("acquire migration lock: %w", err)
+		return err
 	}
 	defer release()
 
@@ -349,16 +345,21 @@ func (m *Migrator) Status(ctx context.Context) ([]MigrationStatus, error) {
 	if err := m.Setup(ctx); err != nil {
 		return nil, err
 	}
-	if err := m.ensureRegistryNotEmpty(); err != nil {
-		return nil, err
-	}
-
-	migrateFiles := m.registeredFiles()
 
 	migrated, err := m.getMigratedMap(ctx)
 	if err != nil {
 		return nil, err
 	}
+
+	set := make(map[string]struct{}, len(migrated))
+	for name := range migrated {
+		set[name] = struct{}{}
+	}
+	if err := m.checkRegistryConsistency(set); err != nil {
+		return nil, err
+	}
+
+	migrateFiles := m.registeredFiles()
 
 	result := make([]MigrationStatus, 0, len(migrateFiles))
 	for _, mfile := range migrateFiles {
@@ -389,16 +390,16 @@ func (m *Migrator) Pending(ctx context.Context) ([]string, error) {
 	if err := m.Setup(ctx); err != nil {
 		return nil, err
 	}
-	if err := m.ensureRegistryNotEmpty(); err != nil {
-		return nil, err
-	}
-
-	migrateFiles := m.registeredFiles()
 
 	migrated, err := m.getMigratedSet(ctx)
 	if err != nil {
 		return nil, err
 	}
+	if err := m.checkRegistryConsistency(migrated); err != nil {
+		return nil, err
+	}
+
+	migrateFiles := m.registeredFiles()
 
 	var pending []string
 	for _, mfile := range migrateFiles {
@@ -419,22 +420,23 @@ func (m *Migrator) MarkApplied(ctx context.Context, toFile string) ([]string, er
 	if err := m.Setup(ctx); err != nil {
 		return nil, err
 	}
-	if err := m.ensureRegistryNotEmpty(); err != nil {
+
+	release, err := m.acquireLock(ctx)
+	if err != nil {
 		return nil, err
 	}
-
-	release, err := m.lock.Acquire(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("acquire migration lock: %w", err)
-	}
 	defer release()
-
-	migrateFiles := m.registeredFiles()
 
 	migrated, err := m.getMigratedSet(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("get migrated records: %w", err)
 	}
+	// 完整一致性校验（空/重复/nil Up + 漂移）：不在漂移状态下写新 baseline.
+	if err := m.checkRegistryConsistency(migrated); err != nil {
+		return nil, err
+	}
+
+	migrateFiles := m.registeredFiles()
 
 	batch, err := m.getBatch(ctx)
 	if err != nil {
@@ -479,9 +481,9 @@ func (m *Migrator) RollbackTo(ctx context.Context, targetFile string) error {
 		return err
 	}
 
-	release, err := m.lock.Acquire(ctx)
+	release, err := m.acquireLock(ctx)
 	if err != nil {
-		return fmt.Errorf("acquire migration lock: %w", err)
+		return err
 	}
 	defer release()
 
@@ -514,11 +516,28 @@ func (m *Migrator) RollbackTo(ctx context.Context, targetFile string) error {
 
 // --- 内部方法 ---
 
+// acquireLock 校验连接池容量后获取迁移锁.
+// 任何持锁方法都应经此获取：锁会占用一条连接，后续操作还需另一条，
+// MaxOpenConns=1（非 SQLite）时会阻塞到超时，故先快速拒绝.
+func (m *Migrator) acquireLock(ctx context.Context) (func(), error) {
+	if err := m.ensureConcurrentConns(); err != nil {
+		return nil, err
+	}
+	release, err := m.lock.Acquire(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("acquire migration lock: %w", err)
+	}
+	return release, nil
+}
+
 // ensureConcurrentConns 确保连接池允许并发连接.
-// fresh/refresh 需要一条连接持有迁移锁、另一条执行删表/回滚/重建；
+// 持锁命令需要一条连接持有迁移锁、另一条执行实际操作；
 // MySQL、PostgreSQL 的锁绑定在专属连接上，连接池上限为 1 时会一直死等到超时，此处提前快速拒绝.
 // SQLite 使用 noopLock（不占用连接），无此约束.
 func (m *Migrator) ensureConcurrentConns() error {
+	if m.DB == nil {
+		return errors.New("migrate: database connection is required")
+	}
 	if m.dbType == DBTypeSQLite {
 		return nil
 	}
@@ -528,7 +547,7 @@ func (m *Migrator) ensureConcurrentConns() error {
 	}
 	if sqlDB.Stats().MaxOpenConnections == 1 {
 		return fmt.Errorf(
-			"this command needs at least 2 connections (one holds the migration lock while the other drops/rebuilds); increase SetMaxOpenConns",
+			"this command needs at least 2 connections (one holds the migration lock while the other runs the migration); increase SetMaxOpenConns",
 		)
 	}
 	return nil
@@ -536,7 +555,7 @@ func (m *Migrator) ensureConcurrentConns() error {
 
 // upWithoutLock 执行迁移（不获取锁，供 Fresh 内部使用）.
 func (m *Migrator) upWithoutLock(ctx context.Context) error {
-	if err := m.ensureRegistryNotEmpty(); err != nil {
+	if err := m.validateRegistryForExecution(); err != nil {
 		return err
 	}
 	migrateFiles := m.registeredFiles()
@@ -710,7 +729,7 @@ func (m *Migrator) registeredFiles() []MigrationFile {
 // registry 为空（通常是漏 import 迁移包），或存在"已应用但当前 binary 未注册"的
 // 迁移（结构可能已漂移）时返回错误，禁止在这两种状态下继续执行.
 func (m *Migrator) checkRegistryConsistency(migrated map[string]struct{}) error {
-	if err := m.ensureRegistryNotEmpty(); err != nil {
+	if err := m.validateRegistryForExecution(); err != nil {
 		return err
 	}
 	for name := range migrated {
@@ -721,12 +740,20 @@ func (m *Migrator) checkRegistryConsistency(migrated map[string]struct{}) error 
 	return nil
 }
 
-// ensureRegistryNotEmpty 校验 registry 至少注册了一条迁移，fail-closed.
-// 空 registry 通常是漏 import 迁移包——诊断命令会误报"无待执行/已最新"，
-// 破坏性命令则会删光数据却不重建，故所有相关入口在动手前都必须先过此检查.
-func (m *Migrator) ensureRegistryNotEmpty() error {
+// validateRegistryForExecution 校验 registry 适合执行，供执行/破坏性命令在动手前调用：
+// registry 为空（通常漏 import 迁移包）、存在重复注册名（两个包注册同名）、
+// 或任一迁移缺 Up 函数，均返回错误、fail-closed.
+func (m *Migrator) validateRegistryForExecution() error {
 	if m.registry.Len() == 0 {
 		return errors.New("no migrations registered; did you forget to import the migrations package?")
+	}
+	if dups := m.registry.Duplicates(); len(dups) > 0 {
+		return fmt.Errorf("duplicate migration registrations: %s", strings.Join(dups, ", "))
+	}
+	for _, mfile := range m.registry.All() {
+		if mfile.Up == nil {
+			return fmt.Errorf("migration %s has no up function", mfile.FileName)
+		}
 	}
 	return nil
 }

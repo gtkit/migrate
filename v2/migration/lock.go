@@ -2,6 +2,8 @@ package migration
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"hash/fnv"
 	"time"
@@ -11,6 +13,9 @@ import (
 
 // defaultLockTimeout 是获取迁移锁的默认最长等待时间.
 const defaultLockTimeout = 10 * time.Second
+
+// lockReleaseTimeout 是释放锁时独立上下文的超时（与业务上下文无关，保证取消后仍能释放）.
+const lockReleaseTimeout = 10 * time.Second
 
 // migrationLock 迁移锁接口.
 type migrationLock interface {
@@ -55,26 +60,40 @@ func (l *mysqlLock) Acquire(ctx context.Context) (func(), error) {
 	// GET_LOCK 的超时参数以秒为单位，至少为 1 秒.
 	timeoutSec := max(1, int(l.timeout.Seconds()))
 
-	// 通过 Begin 拿到专属连接，确保获取锁和释放锁在同一连接上
-	session := l.db.WithContext(ctx).Session(&gorm.Session{PrepareStmt: false})
-	tx := session.Begin()
-	if tx.Error != nil {
-		return nil, fmt.Errorf("begin lock session: %w", tx.Error)
+	// 用专属 *sql.Conn 获取锁：GET_LOCK 是会话锁，获取与释放必须在同一连接上，
+	// 且不能用绑业务 ctx 的事务（取消后无法可靠释放）.
+	sqlDB, err := l.db.DB()
+	if err != nil {
+		return nil, fmt.Errorf("get sql.DB for lock: %w", err)
+	}
+	conn, err := sqlDB.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reserve lock connection: %w", err)
 	}
 
-	var result int
-	if err := tx.Raw("SELECT GET_LOCK(?, ?)", l.lockName, timeoutSec).Scan(&result).Error; err != nil {
-		tx.Rollback()
+	var result sql.NullInt64
+	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", l.lockName, timeoutSec).Scan(&result); err != nil {
+		_ = conn.Close()
 		return nil, fmt.Errorf("acquire mysql lock %q: %w", l.lockName, err)
 	}
-	if result != 1 {
-		tx.Rollback()
+	if !result.Valid || result.Int64 != 1 {
+		_ = conn.Close()
 		return nil, fmt.Errorf("failed to acquire mysql advisory lock %q (timeout %ds)", l.lockName, timeoutSec)
 	}
 
+	lockName := l.lockName
 	release := func() {
-		_ = tx.Exec("SELECT RELEASE_LOCK(?)", l.lockName).Error
-		tx.Rollback() // 释放连接回连接池
+		// 用独立上下文释放：即使业务 ctx 已取消/超时，RELEASE_LOCK 仍能执行.
+		relCtx, cancel := context.WithTimeout(context.Background(), lockReleaseTimeout)
+		defer cancel()
+
+		var released sql.NullInt64
+		err := conn.QueryRowContext(relCtx, "SELECT RELEASE_LOCK(?)", lockName).Scan(&released)
+		if err != nil || !released.Valid || released.Int64 != 1 {
+			// 释放不确定：标记为坏连接，Close 时物理关闭、结束会话，确保命名锁被释放.
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+		_ = conn.Close()
 	}
 	return release, nil
 }
@@ -88,28 +107,42 @@ type postgresLock struct {
 }
 
 func (l *postgresLock) Acquire(ctx context.Context) (func(), error) {
-	// 通过 Begin 拿到专属连接
-	tx := l.db.WithContext(ctx).Begin()
-	if tx.Error != nil {
-		return nil, fmt.Errorf("begin lock session: %w", tx.Error)
+	// 用专属 *sql.Conn：pg_advisory_lock（会话级）获取与释放须同一连接，且不绑业务 ctx.
+	sqlDB, err := l.db.DB()
+	if err != nil {
+		return nil, fmt.Errorf("get sql.DB for lock: %w", err)
+	}
+	conn, err := sqlDB.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reserve lock connection: %w", err)
 	}
 
-	// pg_advisory_lock 不受 lock_timeout 约束，用 statement_timeout 给这次获取锁的语句加超时，
-	// 避免另一个实例正在执行长迁移时本实例无限阻塞. SET LOCAL 仅作用于当前事务连接.
+	// pg_advisory_lock 不受 lock_timeout 约束，用 statement_timeout 给获取锁的语句加超时.
 	timeoutMS := max(int64(1), l.timeout.Milliseconds())
-	if err := tx.Exec(fmt.Sprintf("SET LOCAL statement_timeout = %d", timeoutMS)).Error; err != nil {
-		tx.Rollback()
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET statement_timeout = %d", timeoutMS)); err != nil {
+		_ = conn.Close()
 		return nil, fmt.Errorf("set postgres lock statement_timeout: %w", err)
 	}
-
-	if err := tx.Exec("SELECT pg_advisory_lock(?)", l.lockKey).Error; err != nil {
-		tx.Rollback()
+	if _, err := conn.ExecContext(ctx, "SELECT pg_advisory_lock($1)", l.lockKey); err != nil {
+		_ = conn.Close()
 		return nil, fmt.Errorf("acquire postgres lock (key=%d, timeout %dms): %w", l.lockKey, timeoutMS, err)
 	}
 
+	lockKey := l.lockKey
 	release := func() {
-		_ = tx.Exec("SELECT pg_advisory_unlock(?)", l.lockKey).Error
-		tx.Rollback() // 释放连接回连接池
+		relCtx, cancel := context.WithTimeout(context.Background(), lockReleaseTimeout)
+		defer cancel()
+
+		// 先清掉本连接的 statement_timeout（连接会回池复用），再解锁.
+		_, _ = conn.ExecContext(relCtx, "SET statement_timeout = 0")
+
+		var released sql.NullBool
+		err := conn.QueryRowContext(relCtx, "SELECT pg_advisory_unlock($1)", lockKey).Scan(&released)
+		if err != nil || !released.Valid || !released.Bool {
+			// 释放不确定：标记为坏连接，Close 时物理关闭、结束会话，确保锁被释放.
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+		_ = conn.Close()
 	}
 	return release, nil
 }

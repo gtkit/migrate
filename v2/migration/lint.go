@@ -346,22 +346,42 @@ func lintMigrationSQL(content string) (missingOnlineDDL, destructive bool) {
 }
 
 // sqlCommentPattern 匹配 SQL 块注释 /* ... */ 与行注释 -- ... 到行尾.
-var sqlCommentPattern = regexp.MustCompile(`(?s)/\*.*?\*/|--[^\n]*`)
+// sqlCommentPattern 匹配 SQL 注释：块注释 /* */、行注释 -- 与 MySQL # 到行尾.
+var sqlCommentPattern = regexp.MustCompile(`(?s)/\*.*?\*/|--[^\n]*|#[^\n]*`)
+
+// 在线 DDL / 危险 DDL 用真实子句/词界匹配，避免误判列名、字符串值或含下划线的标识符.
+var (
+	alterTablePattern      = regexp.MustCompile(`(?is)alter\s+table`)
+	algorithmClausePattern = regexp.MustCompile(`(?i)algorithm\s*=`)
+	lockClausePattern      = regexp.MustCompile(`(?i)lock\s*=`)
+	dropTablePattern       = regexp.MustCompile(`(?i)drop\s+table`)
+	dropDatabasePattern    = regexp.MustCompile(`(?i)drop\s+(database|schema)`)
+	truncatePattern        = regexp.MustCompile(`(?i)\btruncate\b`)
+)
+
+// sqlStringPattern 匹配 SQL 字符串字面量：单引号（含 ” 与 \ 转义）与双引号.
+var sqlStringPattern = regexp.MustCompile(`'(?:''|\\.|[^'])*'|"(?:""|\\.|[^"])*"`)
 
 // stripSQLComments 去除 SQL 注释，避免注释里的 ALGORITHM/LOCK 等关键词误导判定.
 func stripSQLComments(sql string) string {
 	return sqlCommentPattern.ReplaceAllString(sql, " ")
 }
 
+// stripSQLStrings 屏蔽 SQL 字符串字面量内容，避免引号内的关键词被当成真实子句.
+func stripSQLStrings(sql string) string {
+	return sqlStringPattern.ReplaceAllString(sql, " ")
+}
+
 // sqlDDLChecks 对单段 SQL 文本判定在线 DDL 策略缺失与危险 DDL.
 // 缺在线 DDL 策略：含 ALTER TABLE 但未同时标注 ALGORITHM 与 LOCK.
 // 判定前先剥离 SQL 注释——注释中的关键词不算作已标注策略.
 func sqlDDLChecks(sql string) (missingOnlineDDL, destructive bool) {
-	lc := strings.ToLower(stripSQLComments(sql))
-	if strings.Contains(lc, "alter table") && (!strings.Contains(lc, "algorithm") || !strings.Contains(lc, "lock")) {
+	cleaned := stripSQLStrings(stripSQLComments(sql))
+	if alterTablePattern.MatchString(cleaned) &&
+		(!algorithmClausePattern.MatchString(cleaned) || !lockClausePattern.MatchString(cleaned)) {
 		missingOnlineDDL = true
 	}
-	if strings.Contains(lc, "drop table") || strings.Contains(lc, "drop database") || strings.Contains(lc, "truncate") {
+	if dropTablePattern.MatchString(cleaned) || dropDatabasePattern.MatchString(cleaned) || truncatePattern.MatchString(cleaned) {
 		destructive = true
 	}
 	return missingOnlineDDL, destructive

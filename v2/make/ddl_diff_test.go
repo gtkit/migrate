@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -92,14 +91,4 @@ func executeMakeCommandWithError(args ...string) error {
 	CmdMake.SilenceUsage = true
 	CmdMake.SetArgs(args)
 	return CmdMake.Execute()
-}
-
-type ddlUserDiff struct {
-	ID        int64     `gorm:"column:id;primaryKey;autoIncrement"`
-	Email     string    `gorm:"column:email;size:128;not null;uniqueIndex"`
-	CreatedAt time.Time `gorm:"column:created_at;not null"`
-}
-
-func (ddlUserDiff) TableName() string {
-	return "users"
 }

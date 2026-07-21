@@ -14,6 +14,9 @@
 
 ### Changed
 
+- **⚠ 破坏性变更** 迁移执行与破坏性命令（`up`/`fresh`/`refresh`）在动手前统一校验 registry：为空、存在重复注册名、或任一迁移缺 `Up` 时直接报错——`fresh`/`refresh` 在删表/回滚**之前**拦下，绝不删光数据却不重建；重复注册名运行时也不再静默用第一个实现。
+- **⚠ 破坏性变更** `Pending`/`Status`/`MarkApplied` 改用完整一致性校验（含"数据库已应用但当前 binary 未注册"的漂移），漂移时报错而非静默返回成功。
+- **⚠ 破坏性变更** 所有获取迁移锁的命令（`up`/`down`/`down-to`/`reset`/`refresh`/`fresh`/`mark-applied`）在取锁前校验连接池容量；`MaxOpenConns=1`（非 SQLite）时直接报错而非阻塞至超时。
 - **⚠ 破坏性变更** `migrate up` 与 `IsUpToDate` 改以编译期注册表（registry）为迁移集合的唯一真实来源，不再依赖运行时的 `.go` 源文件目录。此前在部署环境缺少源目录时，`up` 会读到空目录并静默报告「已最新」、漏执行整批迁移；现在以已 import 编译进 binary 的迁移为准。
 - **⚠ 破坏性变更** `migrate reset` / `refresh` / `fresh` 现在必须显式加 `--force` 才执行，缺失时直接返回错误并拒绝执行，防止误触导致数据丢失。
 - **⚠ 破坏性变更** `make migration` 的 `add`/`update`/`drop`/`drop_column`/`drop_index` 模板改为自包含、显式的 raw SQL：不再 import 业务 model、`update` 不再使用 `AutoMigrate`。新生成的迁移带 `TODO` 占位，需补全（大表建议标注在线 DDL 策略）后才能通过 `migrate lint`。
@@ -34,6 +37,10 @@
 - `migrate fresh`：MySQL 删表时的 `SET foreign_key_checks=0` → 删表 → 恢复 `=1` 改为固定在同一数据库连接上执行，并保证在连接归还连接池前恢复；此前经连接池分发可能使关闭态落不到删表连接，或将关闭态残留污染被业务复用的池内连接。
 - `migrate fresh`：修复上述同连接删表在真实 MySQL（非空库）上因 `db.Connection` 内调用 `Migrator().DropTable` 返回 `invalid db` 而失败的问题（`db.Connection` 提供的是 `*sql.Conn`，Migrator 需 `*sql.DB`），改为在该连接上直接执行 raw `DROP TABLE`。由新增的真实 MySQL 集成测试发现并覆盖。
 - `migrate lint`：修复在线 DDL 检查可被 SQL 注释绕过的问题——`ALTER TABLE ... /* ALGORITHM=INPLACE, LOCK=NONE */` 此前因注释含关键词被判为合规；现改为判定前先剥离 SQL 注释（`/* */` 与 `--`）。
+- `migrate lint`：进一步修复在线 DDL 误判——改为匹配真实子句 `ALGORITHM\s*=`/`LOCK\s*=`（不再把列名 `algorithm`/`lock`、字符串值或 `#` 注释里的关键词当作已标注策略），并剥离 MySQL `#` 行注释。
+- `migration.NewMigrator` 传入 nil db 不再直接 panic；`Setup` 等路径返回可处理错误。
+- 迁移锁改用专属 `*sql.Conn` 获取/释放，并用独立超时上下文执行释放：业务上下文取消/超时后仍能可靠释放；释放不确定时物理关闭连接以结束会话，避免会话级命名锁残留在连接池（MySQL `GET_LOCK`、PostgreSQL `pg_advisory_lock`）。
+- `migrate lint`：在线 DDL 判定前屏蔽 SQL 字符串字面量，修复 `DEFAULT 'algorithm=... lock=...'` 等把引号内关键词误当真实子句的绕过。
 
 ### Migration Notes
 

@@ -229,6 +229,35 @@ func TestMigratorMySQLLockContention(t *testing.T) {
 	relB()
 }
 
+// TestMigratorMySQLLockReleasedAfterContextCancel 验证业务 ctx 取消后锁仍被可靠释放：
+// 取消后调用释放函数，另一个实例应能立即获取同名锁（会话锁不残留在连接池）.
+func TestMigratorMySQLLockReleasedAfterContextCancel(t *testing.T) {
+	dbA := openMySQLTestDB(t)
+	dbB := openMySQLTestDB(t)
+
+	lockName := fmt.Sprintf("migrate_cancel_%d", time.Now().UnixNano())
+	mA := NewMigrator(t.TempDir(), dbA, WithRegistry(NewRegistry()), WithLockName(lockName))
+	mB := NewMigrator(t.TempDir(), dbB, WithRegistry(NewRegistry()),
+		WithLockName(lockName), WithLockTimeout(2*time.Second))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	release, err := mA.lock.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("A acquire: %v", err)
+	}
+
+	// 取消业务 ctx 后再释放（模拟迁移超时/取消后走 defer release）.
+	cancel()
+	release()
+
+	// A 的锁应已可靠释放，B 立即可获取.
+	relB, err := mB.lock.Acquire(t.Context())
+	if err != nil {
+		t.Fatalf("B should acquire the lock after A released it post-cancel: %v", err)
+	}
+	relB()
+}
+
 func writeIntegrationMigrationFile(t *testing.T, dir, fileName string) {
 	t.Helper()
 	path := filepath.Join(dir, fileName+".go")
