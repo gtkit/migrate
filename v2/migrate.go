@@ -2,9 +2,11 @@ package migrate
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gtkit/migrate/v2/make"
@@ -161,7 +163,8 @@ func defaultConfig() *Config {
 }
 
 // app 全局配置实例（由 Setup 初始化）.
-var app *Config
+// 原子指针：Setup 与命令执行可能不在同一 goroutine，避免数据竞争.
+var app atomic.Pointer[Config]
 
 // Setup 初始化迁移工具.
 // 必须在使用任何迁移命令之前调用.
@@ -177,7 +180,7 @@ func Setup(db *gorm.DB, opts ...Option) error {
 		opt(cfg)
 	}
 
-	app = cfg
+	app.Store(cfg)
 
 	make.SetConfig(make.Config{
 		ProjectName:   cfg.ProjectName,
@@ -192,17 +195,13 @@ func Setup(db *gorm.DB, opts ...Option) error {
 	return nil
 }
 
-// mustApp 获取配置，未初始化时 panic（仅在 cobra.Command.Run 中使用）.
-func mustApp() *Config {
-	if app == nil {
-		panic("migrate: Setup() must be called before using migration commands")
+// commandEnv 返回执行迁移命令所需的 Migrator 与带超时的 context.
+// Setup 未调用时返回错误（库代码不 panic）.
+func commandEnv() (*migration.Migrator, context.Context, context.CancelFunc, error) {
+	cfg := app.Load()
+	if cfg == nil {
+		return nil, nil, nil, errors.New("migrate: Setup() must be called before using migration commands")
 	}
-	return app
-}
-
-// newMigrator 创建 Migrator 实例.
-func newMigrator() *migration.Migrator {
-	cfg := mustApp()
 
 	var opts []migration.MigratorOption
 	if cfg.LockName != "" {
@@ -215,13 +214,9 @@ func newMigrator() *migration.Migrator {
 		opts = append(opts, migration.WithLogger(cfg.Logger))
 	}
 
-	return migration.NewMigrator(cfg.MigrationDir, cfg.DB, opts...)
-}
-
-// newContext 创建带超时的 context.
-func newContext() (context.Context, context.CancelFunc) {
-	cfg := mustApp()
-	return context.WithTimeout(context.Background(), cfg.Timeout)
+	m := migration.NewMigrator(cfg.MigrationDir, cfg.DB, opts...)
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
+	return m, ctx, cancel, nil
 }
 
 // --- Cobra Commands ---
@@ -322,22 +317,23 @@ func init() {
 }
 
 func runUp(cmd *cobra.Command, _ []string) error {
-	ctx, cancel := newContext()
+	m, ctx, cancel, err := commandEnv()
+	if err != nil {
+		return err
+	}
 	defer cancel()
 
-	m := newMigrator()
-
-	// 先检查是否需要迁移
-	upToDate, err := m.IsUpToDate(ctx)
+	// 预检待执行清单：无事可做时直接提示，避免误导性的 "Running migrations..."
+	pending, err := m.Pending(ctx)
 	if err != nil {
-		return fmt.Errorf("check migration status: %w", err)
+		return fmt.Errorf("check pending migrations: %w", err)
 	}
-	if upToDate {
+	if len(pending) == 0 {
 		cmd.Println("Database is up to date.")
 		return nil
 	}
 
-	cmd.Println("Running migrations...")
+	cmd.Printf("Running %d migration(s)...\n", len(pending))
 	if err := m.Up(ctx); err != nil {
 		return fmt.Errorf("migrate up: %w", err)
 	}
@@ -351,11 +347,14 @@ func runDown(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	ctx, cancel := newContext()
+	m, ctx, cancel, err := commandEnv()
+	if err != nil {
+		return err
+	}
 	defer cancel()
 
 	cmd.Println("Rolling back last batch...")
-	if err := newMigrator().Rollback(ctx); err != nil {
+	if err := m.Rollback(ctx); err != nil {
 		return fmt.Errorf("migrate rollback: %w", err)
 	}
 
@@ -380,11 +379,14 @@ func runReset(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	ctx, cancel := newContext()
+	m, ctx, cancel, err := commandEnv()
+	if err != nil {
+		return err
+	}
 	defer cancel()
 
 	cmd.Println("Resetting all migrations...")
-	if err := newMigrator().Reset(ctx); err != nil {
+	if err := m.Reset(ctx); err != nil {
 		return fmt.Errorf("migrate reset: %w", err)
 	}
 
@@ -397,11 +399,14 @@ func runRefresh(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	ctx, cancel := newContext()
+	m, ctx, cancel, err := commandEnv()
+	if err != nil {
+		return err
+	}
 	defer cancel()
 
 	cmd.Println("Refreshing all migrations...")
-	if err := newMigrator().Refresh(ctx); err != nil {
+	if err := m.Refresh(ctx); err != nil {
 		return fmt.Errorf("migrate refresh: %w", err)
 	}
 
@@ -414,11 +419,14 @@ func runFresh(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	ctx, cancel := newContext()
+	m, ctx, cancel, err := commandEnv()
+	if err != nil {
+		return err
+	}
 	defer cancel()
 
 	cmd.Println("Dropping all tables and re-running migrations...")
-	if err := newMigrator().Fresh(ctx); err != nil {
+	if err := m.Fresh(ctx); err != nil {
 		return fmt.Errorf("migrate fresh: %w", err)
 	}
 
@@ -427,10 +435,13 @@ func runFresh(cmd *cobra.Command, _ []string) error {
 }
 
 func runStatus(cmd *cobra.Command, _ []string) error {
-	ctx, cancel := newContext()
+	m, ctx, cancel, err := commandEnv()
+	if err != nil {
+		return err
+	}
 	defer cancel()
 
-	statuses, err := newMigrator().Status(ctx)
+	statuses, err := m.Status(ctx)
 	if err != nil {
 		return fmt.Errorf("migrate status: %w", err)
 	}
@@ -454,10 +465,13 @@ func runStatus(cmd *cobra.Command, _ []string) error {
 }
 
 func runPending(cmd *cobra.Command, _ []string) error {
-	ctx, cancel := newContext()
+	m, ctx, cancel, err := commandEnv()
+	if err != nil {
+		return err
+	}
 	defer cancel()
 
-	pending, err := newMigrator().Pending(ctx)
+	pending, err := m.Pending(ctx)
 	if err != nil {
 		return fmt.Errorf("migrate pending: %w", err)
 	}
@@ -477,9 +491,6 @@ func runPending(cmd *cobra.Command, _ []string) error {
 }
 
 func runLint(cmd *cobra.Command, _ []string) error {
-	ctx, cancel := newContext()
-	defer cancel()
-
 	strict, err := cmd.Flags().GetBool("strict")
 	if err != nil {
 		return err
@@ -489,7 +500,13 @@ func runLint(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	report, err := newMigrator().Lint(ctx, migration.LintOptions{
+	m, ctx, cancel, err := commandEnv()
+	if err != nil {
+		return err
+	}
+	defer cancel()
+
+	report, err := m.Lint(ctx, migration.LintOptions{
 		SkipDatabase: skipDB,
 	})
 	if err != nil {
@@ -528,11 +545,14 @@ func runDownTo(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("down-to requires a target migration version")
 	}
 
-	ctx, cancel := newContext()
+	m, ctx, cancel, err := commandEnv()
+	if err != nil {
+		return err
+	}
 	defer cancel()
 
 	cmd.Printf("Rolling back migrations newer than %s...\n", target)
-	if err := newMigrator().RollbackTo(ctx, target); err != nil {
+	if err := m.RollbackTo(ctx, target); err != nil {
 		return fmt.Errorf("migrate down-to: %w", err)
 	}
 
@@ -541,14 +561,8 @@ func runDownTo(cmd *cobra.Command, args []string) error {
 }
 
 func runMarkApplied(cmd *cobra.Command, _ []string) error {
-	force, err := cmd.Flags().GetBool("force")
-	if err != nil {
+	if err := requireForce(cmd, "mark-applied records versions as applied WITHOUT running their SQL and can hide schema drift"); err != nil {
 		return err
-	}
-	if !force {
-		return fmt.Errorf(
-			"mark-applied records versions as applied WITHOUT running their SQL and can hide schema drift; re-run with --force to confirm",
-		)
 	}
 
 	to, err := cmd.Flags().GetString("to")
@@ -557,10 +571,13 @@ func runMarkApplied(cmd *cobra.Command, _ []string) error {
 	}
 	to = strings.TrimSpace(to)
 
-	ctx, cancel := newContext()
+	m, ctx, cancel, err := commandEnv()
+	if err != nil {
+		return err
+	}
 	defer cancel()
 
-	marked, err := newMigrator().MarkApplied(ctx, to)
+	marked, err := m.MarkApplied(ctx, to)
 	if err != nil {
 		return fmt.Errorf("migrate mark-applied: %w", err)
 	}

@@ -1,6 +1,7 @@
 package migration
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -177,7 +178,7 @@ func (m *Migrator) Lint(ctx context.Context, opts LintOptions) (LintReport, erro
 		})
 	}
 
-	if !opts.SkipDatabase && m.DB != nil {
+	if !opts.SkipDatabase && m.db != nil {
 		issues, err := m.lintDatabase(ctx, diskMap, registryMap)
 		if err != nil {
 			return LintReport{}, err
@@ -190,7 +191,7 @@ func (m *Migrator) Lint(ctx context.Context, opts LintOptions) (LintReport, erro
 }
 
 func (m *Migrator) lintDatabase(ctx context.Context, diskMap map[string]diskMigrationFile, registryMap map[string]MigrationFile) ([]LintIssue, error) {
-	db := m.DB.WithContext(ctx)
+	db := m.db.WithContext(ctx)
 	if !db.Migrator().HasTable(&Migration{}) {
 		return nil, nil
 	}
@@ -224,9 +225,9 @@ func (m *Migrator) lintDatabase(ctx context.Context, diskMap map[string]diskMigr
 }
 
 func (m *Migrator) readDiskMigrationFiles() ([]diskMigrationFile, error) {
-	entries, err := os.ReadDir(m.Folder)
+	entries, err := os.ReadDir(m.folder)
 	if err != nil {
-		return nil, fmt.Errorf("read migration dir %s: %w", m.Folder, err)
+		return nil, fmt.Errorf("read migration dir %s: %w", m.folder, err)
 	}
 
 	result := make([]diskMigrationFile, 0, len(entries))
@@ -243,7 +244,7 @@ func (m *Migrator) readDiskMigrationFiles() ([]diskMigrationFile, error) {
 			continue
 		}
 
-		path := filepath.Join(m.Folder, entry.Name())
+		path := filepath.Join(m.folder, entry.Name())
 		content, err := os.ReadFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("read migration file %s: %w", path, err)
@@ -345,7 +346,6 @@ func lintMigrationSQL(content string) (missingOnlineDDL, destructive bool) {
 	return missingOnlineDDL, destructive
 }
 
-// sqlCommentPattern 匹配 SQL 块注释 /* ... */ 与行注释 -- ... 到行尾.
 // sqlCommentPattern 匹配 SQL 注释：块注释 /* */、行注释 -- 与 MySQL # 到行尾.
 var sqlCommentPattern = regexp.MustCompile(`(?s)/\*.*?\*/|--[^\n]*|#[^\n]*`)
 
@@ -359,7 +359,7 @@ var (
 	truncatePattern        = regexp.MustCompile(`(?i)\btruncate\b`)
 )
 
-// sqlStringPattern 匹配 SQL 字符串字面量：单引号（含 ” 与 \ 转义）与双引号.
+// sqlStringPattern 匹配 SQL 字符串字面量：单引号（含成对单引号转义与反斜杠转义）与双引号.
 var sqlStringPattern = regexp.MustCompile(`'(?:''|\\.|[^'])*'|"(?:""|\\.|[^"])*"`)
 
 // stripSQLComments 去除 SQL 注释，避免注释里的 ALGORITHM/LOCK 等关键词误导判定.
@@ -428,12 +428,10 @@ func sortLintIssues(issues []LintIssue) {
 	}
 
 	slices.SortFunc(issues, func(a, b LintIssue) int {
-		if aw, bw := weight(a.Severity), weight(b.Severity); aw != bw {
-			return aw - bw
-		}
-		if cmp := strings.Compare(a.Name, b.Name); cmp != 0 {
-			return cmp
-		}
-		return strings.Compare(a.Code, b.Code)
+		return cmp.Or(
+			cmp.Compare(weight(a.Severity), weight(b.Severity)),
+			strings.Compare(a.Name, b.Name),
+			strings.Compare(a.Code, b.Code),
+		)
 	})
 }

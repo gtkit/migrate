@@ -69,17 +69,9 @@ func (r *Registry) Duplicates() []string {
 	if len(r.dupes) == 0 {
 		return nil
 	}
-	seen := make(map[string]struct{}, len(r.dupes))
-	result := make([]string, 0, len(r.dupes))
-	for _, name := range r.dupes {
-		if _, ok := seen[name]; ok {
-			continue
-		}
-		seen[name] = struct{}{}
-		result = append(result, name)
-	}
+	result := slices.Clone(r.dupes)
 	slices.Sort(result)
-	return result
+	return slices.Compact(result)
 }
 
 // Get 通过名称获取迁移文件.

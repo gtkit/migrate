@@ -3,12 +3,10 @@ package make
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"slices"
 	"strings"
 	"time"
 
-	"github.com/gtkit/migrate/v2/console"
 	"github.com/gtkit/stringx"
 	"github.com/spf13/cobra"
 	"gorm.io/gorm"
@@ -65,7 +63,6 @@ func runMakeDDL(cmd *cobra.Command, args []string) error {
 		if err := writeGeneratedFile(filePath, []byte(sql), mode); err != nil {
 			return err
 		}
-		console.Success(fmt.Sprintf("[%s] generated for %s (%s).", filepath.Clean(filePath), target.StructName, target.TableName))
 	}
 
 	return nil
@@ -105,9 +102,9 @@ func (l *ddlCaptureLogger) LogMode(gormlogger.LogLevel) gormlogger.Interface {
 	return l
 }
 
-func (l *ddlCaptureLogger) Info(context.Context, string, ...interface{})  {}
-func (l *ddlCaptureLogger) Warn(context.Context, string, ...interface{})  {}
-func (l *ddlCaptureLogger) Error(context.Context, string, ...interface{}) {}
+func (l *ddlCaptureLogger) Info(context.Context, string, ...any)  {}
+func (l *ddlCaptureLogger) Warn(context.Context, string, ...any)  {}
+func (l *ddlCaptureLogger) Error(context.Context, string, ...any) {}
 
 func (l *ddlCaptureLogger) Trace(_ context.Context, _ time.Time, fc func() (string, int64), _ error) {
 	sql, _ := fc()

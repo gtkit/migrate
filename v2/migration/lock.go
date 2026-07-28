@@ -81,14 +81,13 @@ func (l *mysqlLock) Acquire(ctx context.Context) (func(), error) {
 		return nil, fmt.Errorf("failed to acquire mysql advisory lock %q (timeout %ds)", l.lockName, timeoutSec)
 	}
 
-	lockName := l.lockName
 	release := func() {
 		// 用独立上下文释放：即使业务 ctx 已取消/超时，RELEASE_LOCK 仍能执行.
 		relCtx, cancel := context.WithTimeout(context.Background(), lockReleaseTimeout)
 		defer cancel()
 
 		var released sql.NullInt64
-		err := conn.QueryRowContext(relCtx, "SELECT RELEASE_LOCK(?)", lockName).Scan(&released)
+		err := conn.QueryRowContext(relCtx, "SELECT RELEASE_LOCK(?)", l.lockName).Scan(&released)
 		if err != nil || !released.Valid || released.Int64 != 1 {
 			// 释放不确定：标记为坏连接，Close 时物理关闭、结束会话，确保命名锁被释放.
 			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
@@ -128,7 +127,6 @@ func (l *postgresLock) Acquire(ctx context.Context) (func(), error) {
 		return nil, fmt.Errorf("acquire postgres lock (key=%d, timeout %dms): %w", l.lockKey, timeoutMS, err)
 	}
 
-	lockKey := l.lockKey
 	release := func() {
 		relCtx, cancel := context.WithTimeout(context.Background(), lockReleaseTimeout)
 		defer cancel()
@@ -137,7 +135,7 @@ func (l *postgresLock) Acquire(ctx context.Context) (func(), error) {
 		_, _ = conn.ExecContext(relCtx, "SET statement_timeout = 0")
 
 		var released sql.NullBool
-		err := conn.QueryRowContext(relCtx, "SELECT pg_advisory_unlock($1)", lockKey).Scan(&released)
+		err := conn.QueryRowContext(relCtx, "SELECT pg_advisory_unlock($1)", l.lockKey).Scan(&released)
 		if err != nil || !released.Valid || !released.Bool {
 			// 释放不确定：标记为坏连接，Close 时物理关闭、结束会话，确保锁被释放.
 			_ = conn.Raw(func(any) error { return driver.ErrBadConn })

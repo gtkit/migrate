@@ -48,6 +48,7 @@ go get github.com/gtkit/migrate/v2@latest
 | `migrate fresh --force` | 删库内所有表再重放 migration（需 `--force`） | 仅测试环境 |
 | `migrate status` | 查看运行状态 | 运维排查 |
 | `migrate lint` | 检查文件、registry、数据库记录漂移 | CI / 发布前检查 |
+| `migrate mark-applied --force [--to <version>]` | 把 pending 迁移记为已应用而不执行（baseline 存量库，需 `--force`，`--to` 目标须已注册） | 存量库纳管 |
 
 ## 快速开始
 
@@ -335,7 +336,7 @@ myapp migrate fresh --force
 
 > `down` / `down-to` / `reset` / `refresh` / `fresh` 会回滚或删除数据，必须显式加 `--force` 才执行，缺失时直接报错拒绝，避免误触丢数据。核心生产可在组装 CLI 时干脆不注册这些回滚命令。
 >
-> `down-to <version>` 的目标必须是真实已应用的版本；`RollbackSteps` 的步数必须为正数——否则直接报错，不会误回滚全部。
+> `down-to <version>` 的目标必须是真实已应用的版本；`mark-applied --to <version>` 的目标必须是已注册的迁移名；`RollbackSteps` 的步数必须为正数——否则直接报错，不会误回滚全部或标记错误范围。
 
 各命令语义：
 
@@ -585,7 +586,7 @@ Run 'migrate up' to execute these migrations.
 
 ```bash
 $ myapp migrate up
-Running migrations...
+Running 2 migration(s)...
 [INFO]  migrating                                          file=2026_03_17_120000_create_users_table batch=1
 [INFO]  migrated                                           file=2026_03_17_120000_create_users_table
 [INFO]  migrating                                          file=2026_03_17_120100_create_orders_table batch=1

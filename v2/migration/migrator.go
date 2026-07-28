@@ -13,8 +13,8 @@ import (
 
 // Migrator 数据迁移操作核心.
 type Migrator struct {
-	Folder      string
-	DB          *gorm.DB
+	folder      string
+	db          *gorm.DB
 	dbType      DBType
 	lock        migrationLock
 	lockName    string
@@ -72,8 +72,8 @@ const defaultLockName = "migrate_lock"
 func NewMigrator(folder string, db *gorm.DB, opts ...MigratorOption) *Migrator {
 	dbType := DetectDBType(db)
 	m := &Migrator{
-		Folder:      folder,
-		DB:          db,
+		folder:      folder,
+		db:          db,
 		dbType:      dbType,
 		lockName:    defaultLockName,
 		lockTimeout: defaultLockTimeout,
@@ -94,10 +94,10 @@ func NewMigrator(folder string, db *gorm.DB, opts ...MigratorOption) *Migrator {
 // Setup 创建 migrations 表（如不存在）.
 // 并发安全：如果多个进程同时调用，重复创建会被忽略.
 func (m *Migrator) Setup(ctx context.Context) error {
-	if m.DB == nil {
+	if m.db == nil {
 		return errors.New("migrate: database connection is required")
 	}
-	migrator := m.DB.WithContext(ctx).Migrator()
+	migrator := m.db.WithContext(ctx).Migrator()
 	if migrator.HasTable(&Migration{}) {
 		return nil
 	}
@@ -124,48 +124,7 @@ func (m *Migrator) Up(ctx context.Context) error {
 	}
 	defer release()
 
-	// registry 为迁移集合的唯一真实来源，按文件名升序执行
-	migrateFiles := m.registeredFiles()
-
-	// 获取所有已执行的迁移记录
-	migrated, err := m.getMigratedSet(ctx)
-	if err != nil {
-		return fmt.Errorf("get migrated records: %w", err)
-	}
-
-	// fail-closed：空 registry 或已应用迁移在当前 binary 缺失时报错
-	if err := m.checkRegistryConsistency(migrated); err != nil {
-		return err
-	}
-
-	// 获取当前批次
-	batch, err := m.getBatch(ctx)
-	if err != nil {
-		return fmt.Errorf("get batch: %w", err)
-	}
-
-	// 执行未迁移的文件
-	ran := false
-	for _, mfile := range migrateFiles {
-		if _, ok := migrated[mfile.FileName]; ok {
-			continue // 已执行过
-		}
-
-		m.logger.Info("migrating", "file", mfile.FileName, "batch", batch)
-		if err := m.runUpMigration(ctx, mfile, batch); err != nil {
-			m.logger.Error("migration failed", "file", mfile.FileName, "error", err)
-			return fmt.Errorf("migration %s failed: %w", mfile.FileName, err)
-		}
-		m.logger.Info("migrated", "file", mfile.FileName)
-		ran = true
-	}
-
-	if !ran {
-		m.logger.Info("database is up to date")
-		return nil
-	}
-
-	return nil
+	return m.upWithoutLock(ctx)
 }
 
 // IsUpToDate 检查数据库是否已是最新.
@@ -174,7 +133,7 @@ func (m *Migrator) IsUpToDate(ctx context.Context) (bool, error) {
 		return false, err
 	}
 
-	migrated, err := m.getMigratedSet(ctx)
+	migrated, err := m.getMigratedMap(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -207,7 +166,7 @@ func (m *Migrator) Rollback(ctx context.Context) error {
 
 	// 获取最后一批次的迁移记录
 	lastMigration := Migration{}
-	if err := m.DB.WithContext(ctx).Order("id DESC").First(&lastMigration).Error; err != nil {
+	if err := m.db.WithContext(ctx).Order("id DESC").First(&lastMigration).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil // 没有迁移记录
 		}
@@ -215,7 +174,7 @@ func (m *Migrator) Rollback(ctx context.Context) error {
 	}
 
 	var migrations []Migration
-	if err := m.DB.WithContext(ctx).
+	if err := m.db.WithContext(ctx).
 		Where("batch = ?", lastMigration.Batch).
 		Order("id DESC").
 		Find(&migrations).Error; err != nil {
@@ -242,7 +201,7 @@ func (m *Migrator) RollbackSteps(ctx context.Context, steps int) error {
 	defer release()
 
 	var migrations []Migration
-	if err := m.DB.WithContext(ctx).
+	if err := m.db.WithContext(ctx).
 		Order("id DESC").
 		Limit(steps).
 		Find(&migrations).Error; err != nil {
@@ -265,7 +224,7 @@ func (m *Migrator) Reset(ctx context.Context) error {
 	defer release()
 
 	var migrations []Migration
-	if err := m.DB.WithContext(ctx).
+	if err := m.db.WithContext(ctx).
 		Order("id DESC").
 		Find(&migrations).Error; err != nil {
 		return fmt.Errorf("get all migrations: %w", err)
@@ -296,7 +255,7 @@ func (m *Migrator) Refresh(ctx context.Context) error {
 
 	// 回滚所有迁移
 	var migrations []Migration
-	if err := m.DB.WithContext(ctx).
+	if err := m.db.WithContext(ctx).
 		Order("id DESC").
 		Find(&migrations).Error; err != nil {
 		return fmt.Errorf("get all migrations: %w", err)
@@ -324,10 +283,10 @@ func (m *Migrator) Fresh(ctx context.Context) error {
 	}
 	defer release()
 
-	dbname := CurrentDatabase(m.DB)
+	dbname := CurrentDatabase(m.db)
 	m.logger.Warn("dropping all tables", "database", dbname)
 
-	if err := DeleteAllTables(m.DB); err != nil {
+	if err := DeleteAllTables(m.db); err != nil {
 		return fmt.Errorf("delete all tables: %w", err)
 	}
 	m.logger.Info("all tables dropped", "database", dbname)
@@ -351,11 +310,7 @@ func (m *Migrator) Status(ctx context.Context) ([]MigrationStatus, error) {
 		return nil, err
 	}
 
-	set := make(map[string]struct{}, len(migrated))
-	for name := range migrated {
-		set[name] = struct{}{}
-	}
-	if err := m.checkRegistryConsistency(set); err != nil {
+	if err := m.checkRegistryConsistency(migrated); err != nil {
 		return nil, err
 	}
 
@@ -391,7 +346,7 @@ func (m *Migrator) Pending(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 
-	migrated, err := m.getMigratedSet(ctx)
+	migrated, err := m.getMigratedMap(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -417,6 +372,14 @@ func (m *Migrator) Pending(ctx context.Context) ([]string, error) {
 // ⚠️ 它不校验数据库真实结构是否与这些迁移等价——标错会让后续 up 跳过真实建表、造成漂移.
 // 返回实际被标记的迁移文件名（升序）.
 func (m *Migrator) MarkApplied(ctx context.Context, toFile string) ([]string, error) {
+	// toFile 必须是已注册迁移名：拼写错误的目标会静默标记错误范围（比目标晚的全跳过、
+	// 早的全标），对 baseline 这类破坏性操作必须 fail-closed.
+	if toFile != "" {
+		if _, ok := m.registry.Get(toFile); !ok {
+			return nil, fmt.Errorf("mark-applied target %q is not a registered migration", toFile)
+		}
+	}
+
 	if err := m.Setup(ctx); err != nil {
 		return nil, err
 	}
@@ -427,7 +390,7 @@ func (m *Migrator) MarkApplied(ctx context.Context, toFile string) ([]string, er
 	}
 	defer release()
 
-	migrated, err := m.getMigratedSet(ctx)
+	migrated, err := m.getMigratedMap(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("get migrated records: %w", err)
 	}
@@ -460,7 +423,7 @@ func (m *Migrator) MarkApplied(ctx context.Context, toFile string) ([]string, er
 	}
 
 	// 同一事务写入所有 baseline 记录，全成或全败，不留部分标记.
-	if err := m.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	if err := m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		for _, name := range toMark {
 			if err := tx.Create(&Migration{Migration: name, Batch: batch}).Error; err != nil {
 				return fmt.Errorf("mark %s applied: %w", name, err)
@@ -491,7 +454,7 @@ func (m *Migrator) RollbackTo(ctx context.Context, targetFile string) error {
 	// 会命中"全部已应用"而误回滚全部.
 	if targetFile != "" {
 		var count int64
-		if err := m.DB.WithContext(ctx).Model(&Migration{}).
+		if err := m.db.WithContext(ctx).Model(&Migration{}).
 			Where("migration = ?", targetFile).Count(&count).Error; err != nil {
 			return fmt.Errorf("check target migration: %w", err)
 		}
@@ -501,7 +464,7 @@ func (m *Migrator) RollbackTo(ctx context.Context, targetFile string) error {
 	}
 
 	// 按迁移文件名（版本）倒序回滚，保证后应用的先回滚.
-	query := m.DB.WithContext(ctx).Order("migration DESC")
+	query := m.db.WithContext(ctx).Order("migration DESC")
 	if targetFile != "" {
 		query = query.Where("migration > ?", targetFile)
 	}
@@ -535,13 +498,13 @@ func (m *Migrator) acquireLock(ctx context.Context) (func(), error) {
 // MySQL、PostgreSQL 的锁绑定在专属连接上，连接池上限为 1 时会一直死等到超时，此处提前快速拒绝.
 // SQLite 使用 noopLock（不占用连接），无此约束.
 func (m *Migrator) ensureConcurrentConns() error {
-	if m.DB == nil {
+	if m.db == nil {
 		return errors.New("migrate: database connection is required")
 	}
 	if m.dbType == DBTypeSQLite {
 		return nil
 	}
-	sqlDB, err := m.DB.DB()
+	sqlDB, err := m.db.DB()
 	if err != nil {
 		return fmt.Errorf("get sql.DB: %w", err)
 	}
@@ -553,33 +516,42 @@ func (m *Migrator) ensureConcurrentConns() error {
 	return nil
 }
 
-// upWithoutLock 执行迁移（不获取锁，供 Fresh 内部使用）.
+// upWithoutLock 执行所有未迁移的文件（不获取锁，调用方需已持锁）.
+// registry 为迁移集合的唯一真实来源，按文件名升序执行.
 func (m *Migrator) upWithoutLock(ctx context.Context) error {
-	if err := m.validateRegistryForExecution(); err != nil {
+	// 获取所有已执行的迁移记录
+	migrated, err := m.getMigratedMap(ctx)
+	if err != nil {
+		return fmt.Errorf("get migrated records: %w", err)
+	}
+
+	// fail-closed：空 registry、重复注册、缺 Up 或已应用迁移在当前 binary 缺失时报错
+	if err := m.checkRegistryConsistency(migrated); err != nil {
 		return err
 	}
-	migrateFiles := m.registeredFiles()
 
 	batch, err := m.getBatch(ctx)
 	if err != nil {
 		return fmt.Errorf("get batch: %w", err)
 	}
 
-	migrated, err := m.getMigratedSet(ctx)
-	if err != nil {
-		return fmt.Errorf("get migrated records: %w", err)
-	}
-
-	for _, mfile := range migrateFiles {
+	ran := false
+	for _, mfile := range m.registeredFiles() {
 		if _, ok := migrated[mfile.FileName]; ok {
-			continue
+			continue // 已执行过
 		}
+
 		m.logger.Info("migrating", "file", mfile.FileName, "batch", batch)
 		if err := m.runUpMigration(ctx, mfile, batch); err != nil {
 			m.logger.Error("migration failed", "file", mfile.FileName, "error", err)
 			return fmt.Errorf("migration %s failed: %w", mfile.FileName, err)
 		}
 		m.logger.Info("migrated", "file", mfile.FileName)
+		ran = true
+	}
+
+	if !ran {
+		m.logger.Info("database is up to date")
 	}
 
 	return nil
@@ -603,7 +575,7 @@ func (m *Migrator) runUpMigration(ctx context.Context, mfile MigrationFile, batc
 		}
 	}()
 
-	return m.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := mfile.Up(tx); err != nil {
 			return fmt.Errorf("execute up: %w", err)
 		}
@@ -657,7 +629,7 @@ func (m *Migrator) runDownMigration(ctx context.Context, mfile MigrationFile, re
 		}
 	}()
 
-	return m.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// fail-closed：无 Down 函数不能删记录，否则表还在、记录没了=账本损坏.
 		// "不可回滚"应显式用 Irreversible（非 nil、返回 error）表达.
 		if mfile.Down == nil {
@@ -676,7 +648,7 @@ func (m *Migrator) runDownMigration(ctx context.Context, mfile MigrationFile, re
 // getBatch 获取下一个批次号.
 func (m *Migrator) getBatch(ctx context.Context) (int, error) {
 	var lastMigration Migration
-	err := m.DB.WithContext(ctx).Order("id DESC").First(&lastMigration).Error
+	err := m.db.WithContext(ctx).Order("id DESC").First(&lastMigration).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return 1, nil
@@ -686,24 +658,10 @@ func (m *Migrator) getBatch(ctx context.Context) (int, error) {
 	return lastMigration.Batch + 1, nil
 }
 
-// getMigratedSet 获取所有已执行的迁移文件名集合（O(1) 查询）.
-func (m *Migrator) getMigratedSet(ctx context.Context) (map[string]struct{}, error) {
-	var migrations []Migration
-	if err := m.DB.WithContext(ctx).Find(&migrations).Error; err != nil {
-		return nil, err
-	}
-
-	set := make(map[string]struct{}, len(migrations))
-	for _, mg := range migrations {
-		set[mg.Migration] = struct{}{}
-	}
-	return set, nil
-}
-
 // getMigratedMap 获取所有已执行的迁移记录映射.
 func (m *Migrator) getMigratedMap(ctx context.Context) (map[string]Migration, error) {
 	var migrations []Migration
-	if err := m.DB.WithContext(ctx).Find(&migrations).Error; err != nil {
+	if err := m.db.WithContext(ctx).Find(&migrations).Error; err != nil {
 		return nil, err
 	}
 
@@ -728,7 +686,7 @@ func (m *Migrator) registeredFiles() []MigrationFile {
 // checkRegistryConsistency 在执行前校验 registry 与已应用记录的一致性，fail-closed.
 // registry 为空（通常是漏 import 迁移包），或存在"已应用但当前 binary 未注册"的
 // 迁移（结构可能已漂移）时返回错误，禁止在这两种状态下继续执行.
-func (m *Migrator) checkRegistryConsistency(migrated map[string]struct{}) error {
+func (m *Migrator) checkRegistryConsistency(migrated map[string]Migration) error {
 	if err := m.validateRegistryForExecution(); err != nil {
 		return err
 	}

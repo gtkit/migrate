@@ -3,24 +3,25 @@ package console
 
 import (
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/mgutz/ansi"
 )
 
-// Success 打印一条成功消息，绿色输出.
+// Success 打印一条成功消息，绿色输出到 stdout.
 func Success(msg string) {
-	colorOut(msg, "green")
+	colorOut(os.Stdout, msg, "green")
 }
 
-// Error 打印一条报错消息，红色输出.
+// Error 打印一条报错消息，红色输出到 stderr.
 func Error(msg string) {
-	colorOut(msg, "red")
+	colorOut(os.Stderr, msg, "red")
 }
 
-// Warning 打印一条提示消息，黄色输出.
+// Warning 打印一条提示消息，黄色输出到 stdout.
 func Warning(msg string) {
-	colorOut(msg, "yellow")
+	colorOut(os.Stdout, msg, "yellow")
 }
 
 // Exit 打印一条报错消息，并退出 os.Exit(1).
@@ -39,6 +40,6 @@ func ExitIf(err error) {
 }
 
 // colorOut 内部使用，设置高亮颜色.
-func colorOut(message, color string) {
-	_, _ = fmt.Fprintln(os.Stdout, ansi.Color(message, color))
+func colorOut(w io.Writer, message, color string) {
+	_, _ = fmt.Fprintln(w, ansi.Color(message, color))
 }

@@ -72,53 +72,52 @@ func ensureMigrationSupportFiles(cfg Config, model Model) error {
 }
 
 func parseMigrationName(arg string) (action, objectName, tableName, columnName string, err error) {
-	index := strings.Index(arg, "_")
-	if index < 0 {
+	action, rest, found := strings.Cut(arg, "_")
+	if !found {
 		return "", "", "", "", fmt.Errorf("invalid migration name: %s", arg)
 	}
 
-	action = arg[:index]
-	validActions := map[string]bool{
-		"add": true, "drop": true, "update": true, "create": true,
-	}
-	if !validActions[action] {
+	switch action {
+	case "add", "drop", "update", "create":
+	default:
 		return "", "", "", "", fmt.Errorf("invalid action: %s (expected: add, drop, update, create)", action)
 	}
 
-	lastIndex := strings.LastIndex(arg, "_")
-	if lastIndex < 0 || arg[lastIndex+1:] != "table" {
+	// rest 形如 <body>_table，先剥掉固定后缀.
+	body, found := strings.CutSuffix(rest, "_table")
+	if !found {
 		return "", "", "", "", fmt.Errorf("invalid migration suffix in %s (expected: *_table)", arg)
 	}
 
 	switch action {
 	case "add":
-		toIndex := strings.Index(arg, "_to_")
-		if toIndex < 0 {
+		column, table, found := strings.Cut(body, "_to_")
+		if !found {
 			return "", "", "", "", fmt.Errorf("invalid add migration name: %s (expected: add_<column>_to_<table>_table)", arg)
 		}
-		columnName = arg[index+1 : toIndex]
-		tableName = arg[toIndex+4 : lastIndex]
+		columnName = column
+		tableName = table
 		objectName = "column"
 	case "drop":
-		fromIndex := strings.Index(arg, "_from_")
-		if fromIndex < 0 {
-			tableName = arg[index+1 : lastIndex]
+		target, table, found := strings.Cut(body, "_from_")
+		if !found {
+			tableName = body
 			objectName = "table"
 			break
 		}
-		tableName = arg[fromIndex+6 : lastIndex]
+		tableName = table
 		switch {
-		case strings.HasPrefix(arg[index+1:fromIndex], "index_"):
-			columnName = strings.TrimPrefix(arg[index+1:fromIndex], "index_")
+		case strings.HasPrefix(target, "index_"):
+			columnName = strings.TrimPrefix(target, "index_")
 			objectName = "index"
-		case strings.HasPrefix(arg[index+1:fromIndex], "column_"):
-			columnName = strings.TrimPrefix(arg[index+1:fromIndex], "column_")
+		case strings.HasPrefix(target, "column_"):
+			columnName = strings.TrimPrefix(target, "column_")
 			objectName = "column"
 		default:
 			return "", "", "", "", fmt.Errorf("invalid drop migration name: %s (expected drop_column_* or drop_index_*)", arg)
 		}
 	case "create", "update":
-		tableName = arg[index+1 : lastIndex]
+		tableName = body
 		objectName = "table"
 	}
 

@@ -45,15 +45,6 @@ func SetConfig(cfg Config) {
 	currentConfig = normalizeConfig(cfg)
 }
 
-// SetProjectName 兼容旧调用方式。
-func SetProjectName(name string) {
-	cfg := CurrentConfig()
-	if name != "" {
-		cfg.ProjectName = name
-	}
-	SetConfig(cfg)
-}
-
 // CurrentConfig 返回当前配置副本。
 func CurrentConfig() Config {
 	configMu.RLock()

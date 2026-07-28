@@ -223,6 +223,32 @@ func TestMigratorMarkAppliedTo(t *testing.T) {
 	}
 }
 
+// TestMigratorMarkAppliedToUnregisteredTarget 验证 --to 传入未注册版本时报错且不写任何记录.
+func TestMigratorMarkAppliedToUnregisteredTarget(t *testing.T) {
+	db := openExecTestDB(t, "migrator_mark_applied_bad_target")
+	dir := t.TempDir()
+
+	f1 := "2026_03_24_120000_create_a_table"
+	noop := func(*gorm.DB) error { return nil }
+	registry := NewRegistry()
+	writeMigrationFile(t, dir, f1, "package migrations\n")
+	registry.Add(f1, noop, noop)
+
+	m := NewMigrator(dir, db, WithRegistry(registry))
+
+	if _, err := m.MarkApplied(t.Context(), "2026_03_24_999999_typo_table"); err == nil {
+		t.Fatalf("MarkApplied should reject an unregistered target")
+	}
+
+	pending, err := m.Pending(t.Context())
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	if len(pending) != 1 || pending[0] != f1 {
+		t.Fatalf("no migration should be marked after rejected target, pending = %v", pending)
+	}
+}
+
 // TestMigratorRollbackTo 验证 down-to 只回滚版本高于目标（不含目标）的迁移.
 func TestMigratorRollbackTo(t *testing.T) {
 	db := openExecTestDB(t, "migrator_rollback_to")

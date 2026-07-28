@@ -112,7 +112,8 @@ func deletePostgresTables(db *gorm.DB) error {
 
 	// CASCADE 删除所有表及其依赖
 	for _, table := range tables {
-		if err := db.Exec("DROP TABLE IF EXISTS \"" + table + "\" CASCADE").Error; err != nil {
+		quoted := `"` + strings.ReplaceAll(table, `"`, `""`) + `"`
+		if err := db.Exec("DROP TABLE IF EXISTS " + quoted + " CASCADE").Error; err != nil {
 			return fmt.Errorf("drop table %s: %w", table, err)
 		}
 	}

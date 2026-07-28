@@ -2,6 +2,12 @@
 
 基于 GORM + Cobra 的 Go 数据库迁移工具，支持 MySQL、PostgreSQL、SQLite。
 
+> **⚠️ 维护状态**：本目录是 v1 线（`github.com/gtkit/migrate`），已进入维护模式，仅接收关键修复，新功能与安全加固只在 v2 线发布。新项目请使用 [v2](./v2/README.md)：
+>
+> ```bash
+> go get github.com/gtkit/migrate/v2@latest
+> ```
+
 ## 特性
 
 - 迁移文件按时间戳排序，支持 up / down / reset / refresh / fresh

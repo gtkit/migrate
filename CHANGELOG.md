@@ -26,10 +26,16 @@
 - **⚠ 破坏性变更** `Fresh`/`Refresh` 在删表/回滚之前先校验 registry 非空；空 registry（通常是漏 import 迁移包）时直接报错、绝不删光数据却不重建。
 - **⚠ 破坏性变更** `Pending`/`Status`/`MarkApplied`/`upWithoutLock` 在空 registry 时 fail-closed 报错，不再返回"空列表/静默"的误导性结果。
 - **⚠ 破坏性变更** 迁移 `Up` 为 nil 时执行直接报错（不再静默记为已执行）；`Down` 为 nil 时回滚直接报错且不删除迁移记录（"不可回滚"请显式用 `Irreversible`）。
+- **⚠ 破坏性变更** `mark-applied --to <version>`（`MarkApplied`）的目标非空时必须是已注册的迁移名，否则报错且不标记任何迁移（此前拼写错误的目标会静默标记错误范围）。
+- **⚠ 破坏性变更** `file.CreateDirIfNotExists` 移除从未使用的 `perm` 可变参数，签名收窄为 `CreateDirIfNotExists(dirname string) error`。
+- **⚠ 破坏性变更** `migration.Migrator` 的 `Folder`/`DB` 字段改为非导出，构造统一走 `NewMigrator`（此前导出字段可被外部改写、破坏封装）。
+- `migrate up` 预检输出待执行数量（`Running N migration(s)...`），无待执行时提示 `Database is up to date.` 后直接返回。
 
 ### Removed
 
 - 删除死模板 `migration.stub`（旧的 `AutoMigrate` + 业务 model 范例，已无引用）与 `migration_add_raw.stub`（逻辑合并进 `migration_add`，`--after` 改为注入 `AFTER` 子句）。
+- **⚠ 破坏性变更** 删除 `make.SetProjectName`（v1 兼容垫片，请改用 `migrate.Setup` + `WithProjectName`）。
+- **⚠ 破坏性变更** 删除 `file.FileNameWithoutExtension`（全仓库无调用的死代码）。
 
 ### Fixed
 
@@ -41,6 +47,9 @@
 - `migration.NewMigrator` 传入 nil db 不再直接 panic；`Setup` 等路径返回可处理错误。
 - 迁移锁改用专属 `*sql.Conn` 获取/释放，并用独立超时上下文执行释放：业务上下文取消/超时后仍能可靠释放；释放不确定时物理关闭连接以结束会话，避免会话级命名锁残留在连接池（MySQL `GET_LOCK`、PostgreSQL `pg_advisory_lock`）。
 - `migrate lint`：在线 DDL 判定前屏蔽 SQL 字符串字面量，修复 `DEFAULT 'algorithm=... lock=...'` 等把引号内关键词误当真实子句的绕过。
+- `console.Error`（含 `console.Exit` 的消息）改输出到 stderr，重定向 stdout 时错误消息不再混入正常输出；`Success`/`Warning` 仍走 stdout。
+- `migrate fresh`：PostgreSQL 删表时对表名做双引号标识符转义，与 MySQL 分支的反引号转义一致。
+- 未调用 `migrate.Setup` 就执行迁移命令时返回错误而不再 panic；全局配置改为原子指针存取，消除并发场景下的数据竞争。
 
 ### Migration Notes
 

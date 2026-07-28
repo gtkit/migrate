@@ -17,26 +17,23 @@ type Logger interface {
 type defaultLogger struct{}
 
 func (l *defaultLogger) Info(msg string, keysAndValues ...any) {
-	if len(keysAndValues) > 0 {
-		fmt.Printf("[INFO]  %-50s %s\n", msg, formatKV(keysAndValues))
-	} else {
-		fmt.Printf("[INFO]  %s\n", msg)
-	}
+	logf("[INFO] ", msg, keysAndValues)
 }
 
 func (l *defaultLogger) Warn(msg string, keysAndValues ...any) {
-	if len(keysAndValues) > 0 {
-		fmt.Printf("[WARN]  %-50s %s\n", msg, formatKV(keysAndValues))
-	} else {
-		fmt.Printf("[WARN]  %s\n", msg)
-	}
+	logf("[WARN] ", msg, keysAndValues)
 }
 
 func (l *defaultLogger) Error(msg string, keysAndValues ...any) {
+	logf("[ERROR]", msg, keysAndValues)
+}
+
+// logf 按统一格式输出一条日志到 stdout.
+func logf(level, msg string, keysAndValues []any) {
 	if len(keysAndValues) > 0 {
-		fmt.Printf("[ERROR] %-50s %s\n", msg, formatKV(keysAndValues))
+		fmt.Printf("%s %-50s %s\n", level, msg, formatKV(keysAndValues))
 	} else {
-		fmt.Printf("[ERROR] %s\n", msg)
+		fmt.Printf("%s %s\n", level, msg)
 	}
 }
 
