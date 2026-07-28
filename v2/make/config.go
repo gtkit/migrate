@@ -45,6 +45,18 @@ func SetConfig(cfg Config) {
 	currentConfig = normalizeConfig(cfg)
 }
 
+// SetProjectName 单独设置项目名称。
+//
+// Deprecated: 仅为兼容保留；请使用 migrate.Setup 配合 WithProjectName，
+// 或直接调用 SetConfig。
+func SetProjectName(name string) {
+	cfg := CurrentConfig()
+	if name != "" {
+		cfg.ProjectName = name
+	}
+	SetConfig(cfg)
+}
+
 // CurrentConfig 返回当前配置副本。
 func CurrentConfig() Config {
 	configMu.RLock()

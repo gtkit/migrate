@@ -9,6 +9,14 @@ import (
 	"gorm.io/gorm"
 )
 
+// newMySQLLintMigrator 构造 dbType 视为 MySQL 的 Migrator，
+// 用于测试 MySQL 专属的在线 DDL lint 规则（SQLite 测试库下该规则默认跳过）.
+func newMySQLLintMigrator(dir string, db *gorm.DB, registry *Registry) *Migrator {
+	m := NewMigrator(dir, db, WithRegistry(registry))
+	m.dbType = DBTypeMySQL
+	return m
+}
+
 func TestMigratorLintDetectsDiskRegistryAndDBDrift(t *testing.T) {
 	db := openExecTestDB(t, t.Name())
 
@@ -90,7 +98,7 @@ func TestMigratorLintDetectsContentIssues(t *testing.T) {
 	registry.Add(autoFile, noop, noop)
 	registry.Add(importFile, noop, noop)
 
-	report, err := NewMigrator(dir, db, WithRegistry(registry)).Lint(t.Context(), LintOptions{SkipDatabase: true})
+	report, err := newMySQLLintMigrator(dir, db, registry).Lint(t.Context(), LintOptions{SkipDatabase: true})
 	if err != nil {
 		t.Fatalf("lint: %v", err)
 	}
@@ -151,7 +159,7 @@ func TestMigratorLintOnlineDDLIgnoresComments(t *testing.T) {
 	registry.Add(commentOnly, noop, noop)
 	registry.Add(proper, noop, noop)
 
-	report, err := NewMigrator(dir, db, WithRegistry(registry)).Lint(t.Context(), LintOptions{SkipDatabase: true})
+	report, err := newMySQLLintMigrator(dir, db, registry).Lint(t.Context(), LintOptions{SkipDatabase: true})
 	if err != nil {
 		t.Fatalf("lint: %v", err)
 	}
@@ -183,7 +191,7 @@ func TestMigratorLintOnlineDDLIgnoresSQLComments(t *testing.T) {
 	registry.Add(commented, noop, noop)
 	registry.Add(real, noop, noop)
 
-	report, err := NewMigrator(dir, db, WithRegistry(registry)).Lint(t.Context(), LintOptions{SkipDatabase: true})
+	report, err := newMySQLLintMigrator(dir, db, registry).Lint(t.Context(), LintOptions{SkipDatabase: true})
 	if err != nil {
 		t.Fatalf("lint: %v", err)
 	}
@@ -237,7 +245,7 @@ func TestMigratorLintOnlineDDLMatchesRealClauses(t *testing.T) {
 	writeMigrationFile(t, dir, realName, "package migrations\n\nfunc up() { _ = \"ALTER TABLE users ADD COLUMN y INT, ALGORITHM=INPLACE, LOCK=NONE\" }\n")
 	registry.Add(realName, noop, noop)
 
-	report, err := NewMigrator(dir, db, WithRegistry(registry)).Lint(t.Context(), LintOptions{SkipDatabase: true})
+	report, err := newMySQLLintMigrator(dir, db, registry).Lint(t.Context(), LintOptions{SkipDatabase: true})
 	if err != nil {
 		t.Fatalf("lint: %v", err)
 	}

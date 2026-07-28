@@ -285,9 +285,9 @@ type integrationDDLLogger struct {
 }
 
 func (l *integrationDDLLogger) LogMode(gormlogger.LogLevel) gormlogger.Interface { return l }
-func (l *integrationDDLLogger) Info(context.Context, string, ...interface{})     {}
-func (l *integrationDDLLogger) Warn(context.Context, string, ...interface{})     {}
-func (l *integrationDDLLogger) Error(context.Context, string, ...interface{})    {}
+func (l *integrationDDLLogger) Info(context.Context, string, ...any)             {}
+func (l *integrationDDLLogger) Warn(context.Context, string, ...any)             {}
+func (l *integrationDDLLogger) Error(context.Context, string, ...any)            {}
 func (l *integrationDDLLogger) Trace(_ context.Context, _ time.Time, fc func() (string, int64), _ error) {
 	sql, _ := fc()
 	sql = strings.TrimSpace(sql)
@@ -323,4 +323,49 @@ type integrationUserV2 struct {
 
 func (integrationUserV2) TableName() string {
 	return "integration_users"
+}
+
+// TestMigratorPostgresLockTimeoutDoesNotPoisonPool 验证等锁超时失败后，
+// 归还连接池的连接不残留 statement_timeout（否则复用该连接的业务查询会被莫名取消）.
+func TestMigratorPostgresLockTimeoutDoesNotPoisonPool(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("MIGRATE_TEST_POSTGRES_DSN"))
+	if dsn == "" {
+		t.Skip("postgres integration test skipped: MIGRATE_TEST_POSTGRES_DSN is not set")
+	}
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open postgres: %v", err)
+	}
+	if name := strings.ToLower(CurrentDatabase(db)); !strings.Contains(name, "test") && os.Getenv("MIGRATE_TEST_ALLOW_ANY_DB") != "1" {
+		t.Skipf("postgres integration test skipped: database %q does not look like a test database", name)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("get sql db: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(2)
+	sqlDB.SetMaxIdleConns(2)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	key := hashLockName("poison_pool_test")
+	holder := &postgresLock{db: db, lockKey: key, timeout: 5 * time.Second}
+	release, err := holder.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("holder acquire: %v", err)
+	}
+
+	// waiter 以 1 秒超时等同一把锁，必然失败（statement_timeout=1000ms 生效在其专属连接上）.
+	waiter := &postgresLock{db: db, lockKey: key, timeout: time.Second}
+	if _, err := waiter.Acquire(context.Background()); err == nil {
+		release()
+		t.Fatalf("waiter should time out while holder keeps the lock")
+	}
+	release()
+
+	// 连续两次覆盖池内两条连接：若失败路径残留 statement_timeout=1s，pg_sleep(1.5) 会被取消.
+	for i := range 2 {
+		if err := db.Exec("SELECT pg_sleep(1.5)").Error; err != nil {
+			t.Fatalf("pooled connection %d appears poisoned by leftover statement_timeout: %v", i, err)
+		}
+	}
 }

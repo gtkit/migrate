@@ -12,13 +12,17 @@ import (
 )
 
 // Migrator 数据迁移操作核心.
+//
+// Folder 与 DB 为兼容保留的导出字段，仅供读取；请通过 NewMigrator 构造，
+// 构造后修改这两个字段的行为未定义.
 type Migrator struct {
-	folder      string
-	db          *gorm.DB
+	Folder      string
+	DB          *gorm.DB
 	dbType      DBType
 	lock        migrationLock
 	lockName    string
 	lockTimeout time.Duration
+	tableName   string
 	registry    *Registry
 	logger      Logger
 }
@@ -65,18 +69,34 @@ func WithRegistry(r *Registry) MigratorOption {
 	}
 }
 
-const defaultLockName = "migrate_lock"
+// WithMigrationsTable 设置迁移记录表名（默认 "migrations"）.
+// 当同一数据库被多个项目共用时，各项目应使用独立的记录表（并配合 WithLockName
+// 使用独立锁名），迁移账本与一致性校验互不干扰.
+// 传入空白字符串时忽略，保持默认.
+func WithMigrationsTable(name string) MigratorOption {
+	return func(m *Migrator) {
+		if strings.TrimSpace(name) != "" {
+			m.tableName = name
+		}
+	}
+}
+
+const (
+	defaultLockName  = "migrate_lock"
+	defaultTableName = "migrations"
+)
 
 // NewMigrator 创建 Migrator 实例.
 // 自动检测数据库类型，默认使用全局注册表和 stdout 日志.
 func NewMigrator(folder string, db *gorm.DB, opts ...MigratorOption) *Migrator {
 	dbType := DetectDBType(db)
 	m := &Migrator{
-		folder:      folder,
-		db:          db,
+		Folder:      folder,
+		DB:          db,
 		dbType:      dbType,
 		lockName:    defaultLockName,
 		lockTimeout: defaultLockTimeout,
+		tableName:   defaultTableName,
 		registry:    defaultRegistry,
 		logger:      &defaultLogger{},
 	}
@@ -91,24 +111,30 @@ func NewMigrator(folder string, db *gorm.DB, opts ...MigratorOption) *Migrator {
 	return m
 }
 
-// Setup 创建 migrations 表（如不存在）.
+// Setup 创建迁移记录表（如不存在），表名由 WithMigrationsTable 配置.
 // 并发安全：如果多个进程同时调用，重复创建会被忽略.
 func (m *Migrator) Setup(ctx context.Context) error {
-	if m.db == nil {
+	if m.DB == nil {
 		return errors.New("migrate: database connection is required")
 	}
-	migrator := m.db.WithContext(ctx).Migrator()
-	if migrator.HasTable(&Migration{}) {
+	db := m.DB.WithContext(ctx)
+	if db.Migrator().HasTable(m.tableName) {
 		return nil
 	}
-	if err := migrator.CreateTable(&Migration{}); err != nil {
+	if err := db.Table(m.tableName).Migrator().CreateTable(&Migration{}); err != nil {
 		// 并发场景下另一个进程可能已经创建了表，再次检查
-		if migrator.HasTable(&Migration{}) {
+		if db.Migrator().HasTable(m.tableName) {
 			return nil
 		}
-		return fmt.Errorf("create migrations table: %w", err)
+		return fmt.Errorf("create migrations table %s: %w", m.tableName, err)
 	}
 	return nil
+}
+
+// records 返回绑定迁移记录表与上下文的查询入口.
+// 所有迁移记录的读写统一经此走配置表名，避免散落的默认表名查询.
+func (m *Migrator) records(ctx context.Context) *gorm.DB {
+	return m.DB.WithContext(ctx).Table(m.tableName)
 }
 
 // Up 执行所有未迁移的文件.
@@ -166,7 +192,7 @@ func (m *Migrator) Rollback(ctx context.Context) error {
 
 	// 获取最后一批次的迁移记录
 	lastMigration := Migration{}
-	if err := m.db.WithContext(ctx).Order("id DESC").First(&lastMigration).Error; err != nil {
+	if err := m.records(ctx).Order("id DESC").First(&lastMigration).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil // 没有迁移记录
 		}
@@ -174,7 +200,7 @@ func (m *Migrator) Rollback(ctx context.Context) error {
 	}
 
 	var migrations []Migration
-	if err := m.db.WithContext(ctx).
+	if err := m.records(ctx).
 		Where("batch = ?", lastMigration.Batch).
 		Order("id DESC").
 		Find(&migrations).Error; err != nil {
@@ -201,7 +227,7 @@ func (m *Migrator) RollbackSteps(ctx context.Context, steps int) error {
 	defer release()
 
 	var migrations []Migration
-	if err := m.db.WithContext(ctx).
+	if err := m.records(ctx).
 		Order("id DESC").
 		Limit(steps).
 		Find(&migrations).Error; err != nil {
@@ -224,7 +250,7 @@ func (m *Migrator) Reset(ctx context.Context) error {
 	defer release()
 
 	var migrations []Migration
-	if err := m.db.WithContext(ctx).
+	if err := m.records(ctx).
 		Order("id DESC").
 		Find(&migrations).Error; err != nil {
 		return fmt.Errorf("get all migrations: %w", err)
@@ -255,7 +281,7 @@ func (m *Migrator) Refresh(ctx context.Context) error {
 
 	// 回滚所有迁移
 	var migrations []Migration
-	if err := m.db.WithContext(ctx).
+	if err := m.records(ctx).
 		Order("id DESC").
 		Find(&migrations).Error; err != nil {
 		return fmt.Errorf("get all migrations: %w", err)
@@ -283,10 +309,11 @@ func (m *Migrator) Fresh(ctx context.Context) error {
 	}
 	defer release()
 
-	dbname := CurrentDatabase(m.db)
+	// 携带 ctx：删表 DDL 与库名查询同样受外部取消/超时约束.
+	dbname := CurrentDatabase(m.DB.WithContext(ctx))
 	m.logger.Warn("dropping all tables", "database", dbname)
 
-	if err := DeleteAllTables(m.db); err != nil {
+	if err := DeleteAllTables(m.DB.WithContext(ctx)); err != nil {
 		return fmt.Errorf("delete all tables: %w", err)
 	}
 	m.logger.Info("all tables dropped", "database", dbname)
@@ -423,9 +450,9 @@ func (m *Migrator) MarkApplied(ctx context.Context, toFile string) ([]string, er
 	}
 
 	// 同一事务写入所有 baseline 记录，全成或全败，不留部分标记.
-	if err := m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	if err := m.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		for _, name := range toMark {
-			if err := tx.Create(&Migration{Migration: name, Batch: batch}).Error; err != nil {
+			if err := tx.Table(m.tableName).Create(&Migration{Migration: name, Batch: batch}).Error; err != nil {
 				return fmt.Errorf("mark %s applied: %w", name, err)
 			}
 		}
@@ -454,7 +481,7 @@ func (m *Migrator) RollbackTo(ctx context.Context, targetFile string) error {
 	// 会命中"全部已应用"而误回滚全部.
 	if targetFile != "" {
 		var count int64
-		if err := m.db.WithContext(ctx).Model(&Migration{}).
+		if err := m.records(ctx).
 			Where("migration = ?", targetFile).Count(&count).Error; err != nil {
 			return fmt.Errorf("check target migration: %w", err)
 		}
@@ -464,7 +491,7 @@ func (m *Migrator) RollbackTo(ctx context.Context, targetFile string) error {
 	}
 
 	// 按迁移文件名（版本）倒序回滚，保证后应用的先回滚.
-	query := m.db.WithContext(ctx).Order("migration DESC")
+	query := m.records(ctx).Order("migration DESC")
 	if targetFile != "" {
 		query = query.Where("migration > ?", targetFile)
 	}
@@ -498,13 +525,13 @@ func (m *Migrator) acquireLock(ctx context.Context) (func(), error) {
 // MySQL、PostgreSQL 的锁绑定在专属连接上，连接池上限为 1 时会一直死等到超时，此处提前快速拒绝.
 // SQLite 使用 noopLock（不占用连接），无此约束.
 func (m *Migrator) ensureConcurrentConns() error {
-	if m.db == nil {
+	if m.DB == nil {
 		return errors.New("migrate: database connection is required")
 	}
 	if m.dbType == DBTypeSQLite {
 		return nil
 	}
-	sqlDB, err := m.db.DB()
+	sqlDB, err := m.DB.DB()
 	if err != nil {
 		return fmt.Errorf("get sql.DB: %w", err)
 	}
@@ -575,11 +602,11 @@ func (m *Migrator) runUpMigration(ctx context.Context, mfile MigrationFile, batc
 		}
 	}()
 
-	return m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return m.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := mfile.Up(tx); err != nil {
 			return fmt.Errorf("execute up: %w", err)
 		}
-		if err := tx.Create(&Migration{Migration: mfile.FileName, Batch: batch}).Error; err != nil {
+		if err := tx.Table(m.tableName).Create(&Migration{Migration: mfile.FileName, Batch: batch}).Error; err != nil {
 			return fmt.Errorf("record migration %s: %w", mfile.FileName, err)
 		}
 		return nil
@@ -629,7 +656,7 @@ func (m *Migrator) runDownMigration(ctx context.Context, mfile MigrationFile, re
 		}
 	}()
 
-	return m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return m.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// fail-closed：无 Down 函数不能删记录，否则表还在、记录没了=账本损坏.
 		// "不可回滚"应显式用 Irreversible（非 nil、返回 error）表达.
 		if mfile.Down == nil {
@@ -638,7 +665,7 @@ func (m *Migrator) runDownMigration(ctx context.Context, mfile MigrationFile, re
 		if err := mfile.Down(tx); err != nil {
 			return fmt.Errorf("execute down for %s: %w", record.Migration, err)
 		}
-		if err := tx.Delete(&record).Error; err != nil {
+		if err := tx.Table(m.tableName).Delete(&Migration{}, record.ID).Error; err != nil {
 			return fmt.Errorf("delete migration record %s: %w", record.Migration, err)
 		}
 		return nil
@@ -648,7 +675,7 @@ func (m *Migrator) runDownMigration(ctx context.Context, mfile MigrationFile, re
 // getBatch 获取下一个批次号.
 func (m *Migrator) getBatch(ctx context.Context) (int, error) {
 	var lastMigration Migration
-	err := m.db.WithContext(ctx).Order("id DESC").First(&lastMigration).Error
+	err := m.records(ctx).Order("id DESC").First(&lastMigration).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return 1, nil
@@ -661,7 +688,7 @@ func (m *Migrator) getBatch(ctx context.Context) (int, error) {
 // getMigratedMap 获取所有已执行的迁移记录映射.
 func (m *Migrator) getMigratedMap(ctx context.Context) (map[string]Migration, error) {
 	var migrations []Migration
-	if err := m.db.WithContext(ctx).Find(&migrations).Error; err != nil {
+	if err := m.records(ctx).Find(&migrations).Error; err != nil {
 		return nil, err
 	}
 

@@ -640,3 +640,53 @@ func TestMigratorFailsClosedOnDrift(t *testing.T) {
 		t.Fatalf("expected Up to fail on applied-but-unregistered migration")
 	}
 }
+
+// TestMigratorMultiProjectSharedDatabase 验证两个项目以独立记录表共用同一数据库时，
+// 迁移账本与漂移校验互不干扰（配合独立锁名即可安全共库）.
+func TestMigratorMultiProjectSharedDatabase(t *testing.T) {
+	db := openExecTestDB(t, "migrator_multi_project")
+
+	fA := "2026_03_24_120000_create_proj_a_table"
+	fB := "2026_03_24_120001_create_proj_b_table"
+	noop := func(*gorm.DB) error { return nil }
+
+	dirA, dirB := t.TempDir(), t.TempDir()
+	regA, regB := NewRegistry(), NewRegistry()
+	writeMigrationFile(t, dirA, fA, "package migrations\n")
+	writeMigrationFile(t, dirB, fB, "package migrations\n")
+	regA.Add(fA, noop, noop)
+	regB.Add(fB, noop, noop)
+
+	mA := NewMigrator(dirA, db, WithRegistry(regA), WithMigrationsTable("migrations_proj_a"))
+	mB := NewMigrator(dirB, db, WithRegistry(regB), WithMigrationsTable("migrations_proj_b"))
+
+	if err := mA.Up(t.Context()); err != nil {
+		t.Fatalf("project A up: %v", err)
+	}
+	// B 的漂移校验不应把 A 表中的记录当作"已应用但未注册"
+	if err := mB.Up(t.Context()); err != nil {
+		t.Fatalf("project B up should not be blocked by A's ledger: %v", err)
+	}
+
+	for name, m := range map[string]*Migrator{fA: mA, fB: mB} {
+		statuses, err := m.Status(t.Context())
+		if err != nil {
+			t.Fatalf("status for %s: %v", name, err)
+		}
+		if len(statuses) != 1 || !statuses[0].Ran || statuses[0].Name != name {
+			t.Fatalf("expected exactly [%s] ran, got %#v", name, statuses)
+		}
+	}
+
+	// 回滚 B 不影响 A 的账本
+	if err := mB.Rollback(t.Context()); err != nil {
+		t.Fatalf("project B rollback: %v", err)
+	}
+	upToDate, err := mA.IsUpToDate(t.Context())
+	if err != nil {
+		t.Fatalf("project A up-to-date check: %v", err)
+	}
+	if !upToDate {
+		t.Fatalf("project A ledger should be untouched by B's rollback")
+	}
+}

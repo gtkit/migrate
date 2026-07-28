@@ -126,7 +126,8 @@ func (m *Migrator) Lint(ctx context.Context, opts LintOptions) (LintReport, erro
 				Message:  "migration declares manual down logic is required",
 			})
 		}
-		report.Issues = append(report.Issues, lintFileContent(file)...)
+		// ALGORITHM/LOCK 在线 DDL 子句是 MySQL 专属语法，其他方言不适用、不检查.
+		report.Issues = append(report.Issues, lintFileContent(file, m.dbType == DBTypeMySQL)...)
 	}
 
 	for _, file := range registryFiles {
@@ -178,7 +179,7 @@ func (m *Migrator) Lint(ctx context.Context, opts LintOptions) (LintReport, erro
 		})
 	}
 
-	if !opts.SkipDatabase && m.db != nil {
+	if !opts.SkipDatabase && m.DB != nil {
 		issues, err := m.lintDatabase(ctx, diskMap, registryMap)
 		if err != nil {
 			return LintReport{}, err
@@ -191,13 +192,12 @@ func (m *Migrator) Lint(ctx context.Context, opts LintOptions) (LintReport, erro
 }
 
 func (m *Migrator) lintDatabase(ctx context.Context, diskMap map[string]diskMigrationFile, registryMap map[string]MigrationFile) ([]LintIssue, error) {
-	db := m.db.WithContext(ctx)
-	if !db.Migrator().HasTable(&Migration{}) {
+	if !m.DB.WithContext(ctx).Migrator().HasTable(m.tableName) {
 		return nil, nil
 	}
 
 	var records []Migration
-	if err := db.Find(&records).Error; err != nil {
+	if err := m.records(ctx).Find(&records).Error; err != nil {
 		return nil, fmt.Errorf("query migration records: %w", err)
 	}
 
@@ -225,9 +225,9 @@ func (m *Migrator) lintDatabase(ctx context.Context, diskMap map[string]diskMigr
 }
 
 func (m *Migrator) readDiskMigrationFiles() ([]diskMigrationFile, error) {
-	entries, err := os.ReadDir(m.folder)
+	entries, err := os.ReadDir(m.Folder)
 	if err != nil {
-		return nil, fmt.Errorf("read migration dir %s: %w", m.folder, err)
+		return nil, fmt.Errorf("read migration dir %s: %w", m.Folder, err)
 	}
 
 	result := make([]diskMigrationFile, 0, len(entries))
@@ -244,7 +244,7 @@ func (m *Migrator) readDiskMigrationFiles() ([]diskMigrationFile, error) {
 			continue
 		}
 
-		path := filepath.Join(m.folder, entry.Name())
+		path := filepath.Join(m.Folder, entry.Name())
 		content, err := os.ReadFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("read migration file %s: %w", path, err)
@@ -265,7 +265,8 @@ func (m *Migrator) readDiskMigrationFiles() ([]diskMigrationFile, error) {
 }
 
 // lintFileContent 对单个迁移文件做内容级检查：结构性问题报 error，风险性问题报 warning.
-func lintFileContent(file diskMigrationFile) []LintIssue {
+// checkOnlineDDL 为 true 时才检查在线 DDL 策略（MySQL 专属规则）.
+func lintFileContent(file diskMigrationFile, checkOnlineDDL bool) []LintIssue {
 	var issues []LintIssue
 
 	if strings.Contains(file.Content, "TODO") {
@@ -300,7 +301,7 @@ func lintFileContent(file diskMigrationFile) []LintIssue {
 	// 在线 DDL / 危险 DDL 只看真实 SQL 字符串字面量，排除注释干扰
 	// （注释里的 ALGORITHM/LOCK 关键词不能算作已标注在线 DDL 策略）.
 	missingOnlineDDL, destructive := lintMigrationSQL(file.Content)
-	if missingOnlineDDL {
+	if missingOnlineDDL && checkOnlineDDL {
 		issues = append(issues, LintIssue{
 			Severity: LintSeverityWarning,
 			Code:     "missing_online_ddl",

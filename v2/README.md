@@ -2,6 +2,8 @@
 
 基于 GORM + Cobra 的 Go 数据库迁移工具，支持 MySQL、PostgreSQL、SQLite。
 
+> **方言说明**：迁移执行引擎（up/down/锁/记录表）完整支持三种数据库；`make migration` 生成的模板 SQL 当前为 **MySQL 语法**（反引号、`AFTER` 子句、`ALGORITHM`/`LOCK` 在线 DDL 子句），PostgreSQL/SQLite 项目生成后需按方言调整。`migrate lint` 的在线 DDL 规则仅对 MySQL 数据库生效。
+
 ## 特性
 
 - 迁移文件按时间戳排序，支持 up / down / reset / refresh / fresh
@@ -143,6 +145,8 @@ func setupMigrate(db *gorm.DB) {
 | `WithDDLModels` | 空 | 注册可用于 `make ddl` / `make ddl diff` 的模型 |
 | `WithTimeout` | `5m` | `migrate` 命令执行超时 |
 | `WithLockName` | `migrate_lock` | 分布式 advisory lock 名称 |
+| `WithLockTimeout` | `10s` | 获取迁移锁的最长等待时间 |
+| `WithMigrationsTable` | `migrations` | 迁移记录表名（多项目共库时各用独立表） |
 | `WithLogger` | stdout logger | 自定义结构化日志 |
 
 注意：
@@ -728,17 +732,26 @@ migrate.Setup(db, migrate.WithLogger(&migration.NopLogger{}))
 
 ## 多项目共用数据库
 
-当多个服务共享同一个数据库时，使用 `WithLockName` 避免迁移锁冲突：
+当多个服务共享同一个数据库时，必须同时隔离**迁移锁**与**迁移记录表**：
 
 ```go
 // user-service
-migrate.Setup(db, migrate.WithLockName("user_svc_migrate"))
+migrate.Setup(db,
+    migrate.WithLockName("user_svc_migrate"),
+    migrate.WithMigrationsTable("migrations_user_svc"),
+)
 
 // order-service
-migrate.Setup(db, migrate.WithLockName("order_svc_migrate"))
+migrate.Setup(db,
+    migrate.WithLockName("order_svc_migrate"),
+    migrate.WithMigrationsTable("migrations_order_svc"),
+)
 ```
 
-不同的 lock name 会生成不同的 advisory lock key，各项目的迁移互不阻塞。
+- `WithLockName`：不同 lock name 生成不同的 advisory lock key，各项目迁移互不阻塞。
+- `WithMigrationsTable`：各项目使用独立的迁移记录表（默认 `migrations`）。**必须配置**——若共用同一张记录表，项目 B 的漂移校验会把项目 A 的记录判为"已应用但未注册"而拒绝执行。
+
+编程式调用使用 `migration.WithMigrationsTable(...)` MigratorOption，效果相同。
 
 ## 编程式调用
 

@@ -372,3 +372,16 @@ type ddlUser struct {
 func (ddlUser) TableName() string {
 	return "users"
 }
+
+func TestSetProjectNameOverridesConfig(t *testing.T) {
+	resetMakeTestState(t)
+	SetConfig(Config{ProjectName: "example.com/old"})
+	SetProjectName("example.com/new")
+	if got := CurrentConfig().ProjectName; got != "example.com/new" {
+		t.Fatalf("SetProjectName should override project name, got %q", got)
+	}
+	SetProjectName("") // 空值忽略
+	if got := CurrentConfig().ProjectName; got != "example.com/new" {
+		t.Fatalf("empty SetProjectName should be ignored, got %q", got)
+	}
+}

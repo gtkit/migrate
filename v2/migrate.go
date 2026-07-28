@@ -51,6 +51,10 @@ type Config struct {
 	// 传入 nil 时使用默认的 stdout 日志.
 	Logger migration.Logger
 
+	// MigrationsTable 迁移记录表名（默认 "migrations"）.
+	// 多项目共用同一数据库时，各项目应使用独立的记录表.
+	MigrationsTable string
+
 	// DDLModels 用于 make ddl 的模型注册表。
 	DDLModels []any
 }
@@ -141,6 +145,17 @@ func WithLogger(l migration.Logger) Option {
 	}
 }
 
+// WithMigrationsTable 设置迁移记录表名（默认 "migrations"）.
+// 多项目共用同一数据库时，各项目应使用独立的记录表并配合 WithLockName 使用独立锁名，
+// 迁移账本与漂移校验互不干扰.空白字符串忽略.
+func WithMigrationsTable(name string) Option {
+	return func(c *Config) {
+		if strings.TrimSpace(name) != "" {
+			c.MigrationsTable = name
+		}
+	}
+}
+
 // WithDDLModels 注册可用于 make ddl 的 GORM 模型。
 func WithDDLModels(models ...any) Option {
 	return func(c *Config) {
@@ -196,8 +211,10 @@ func Setup(db *gorm.DB, opts ...Option) error {
 }
 
 // commandEnv 返回执行迁移命令所需的 Migrator 与带超时的 context.
+// context 基于 cmd.Context() 派生：调用方经 ExecuteContext 传入的取消信号
+// （如 signal.NotifyContext）能贯通到迁移执行.
 // Setup 未调用时返回错误（库代码不 panic）.
-func commandEnv() (*migration.Migrator, context.Context, context.CancelFunc, error) {
+func commandEnv(cmd *cobra.Command) (*migration.Migrator, context.Context, context.CancelFunc, error) {
 	cfg := app.Load()
 	if cfg == nil {
 		return nil, nil, nil, errors.New("migrate: Setup() must be called before using migration commands")
@@ -213,9 +230,17 @@ func commandEnv() (*migration.Migrator, context.Context, context.CancelFunc, err
 	if cfg.Logger != nil {
 		opts = append(opts, migration.WithLogger(cfg.Logger))
 	}
+	if cfg.MigrationsTable != "" {
+		opts = append(opts, migration.WithMigrationsTable(cfg.MigrationsTable))
+	}
+
+	parent := context.Background()
+	if cmd != nil && cmd.Context() != nil {
+		parent = cmd.Context()
+	}
 
 	m := migration.NewMigrator(cfg.MigrationDir, cfg.DB, opts...)
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
+	ctx, cancel := context.WithTimeout(parent, cfg.Timeout)
 	return m, ctx, cancel, nil
 }
 
@@ -317,7 +342,7 @@ func init() {
 }
 
 func runUp(cmd *cobra.Command, _ []string) error {
-	m, ctx, cancel, err := commandEnv()
+	m, ctx, cancel, err := commandEnv(cmd)
 	if err != nil {
 		return err
 	}
@@ -347,7 +372,7 @@ func runDown(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	m, ctx, cancel, err := commandEnv()
+	m, ctx, cancel, err := commandEnv(cmd)
 	if err != nil {
 		return err
 	}
@@ -379,7 +404,7 @@ func runReset(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	m, ctx, cancel, err := commandEnv()
+	m, ctx, cancel, err := commandEnv(cmd)
 	if err != nil {
 		return err
 	}
@@ -399,7 +424,7 @@ func runRefresh(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	m, ctx, cancel, err := commandEnv()
+	m, ctx, cancel, err := commandEnv(cmd)
 	if err != nil {
 		return err
 	}
@@ -419,7 +444,7 @@ func runFresh(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	m, ctx, cancel, err := commandEnv()
+	m, ctx, cancel, err := commandEnv(cmd)
 	if err != nil {
 		return err
 	}
@@ -435,7 +460,7 @@ func runFresh(cmd *cobra.Command, _ []string) error {
 }
 
 func runStatus(cmd *cobra.Command, _ []string) error {
-	m, ctx, cancel, err := commandEnv()
+	m, ctx, cancel, err := commandEnv(cmd)
 	if err != nil {
 		return err
 	}
@@ -465,7 +490,7 @@ func runStatus(cmd *cobra.Command, _ []string) error {
 }
 
 func runPending(cmd *cobra.Command, _ []string) error {
-	m, ctx, cancel, err := commandEnv()
+	m, ctx, cancel, err := commandEnv(cmd)
 	if err != nil {
 		return err
 	}
@@ -500,7 +525,7 @@ func runLint(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	m, ctx, cancel, err := commandEnv()
+	m, ctx, cancel, err := commandEnv(cmd)
 	if err != nil {
 		return err
 	}
@@ -545,7 +570,7 @@ func runDownTo(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("down-to requires a target migration version")
 	}
 
-	m, ctx, cancel, err := commandEnv()
+	m, ctx, cancel, err := commandEnv(cmd)
 	if err != nil {
 		return err
 	}
@@ -571,7 +596,7 @@ func runMarkApplied(cmd *cobra.Command, _ []string) error {
 	}
 	to = strings.TrimSpace(to)
 
-	m, ctx, cancel, err := commandEnv()
+	m, ctx, cancel, err := commandEnv(cmd)
 	if err != nil {
 		return err
 	}

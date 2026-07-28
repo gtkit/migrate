@@ -11,6 +11,7 @@
 - `migrate lint` 新增内容级门禁：残留 `TODO` 占位、使用 `AutoMigrate`、非自包含 import（业务/第三方包）判为 error；raw `ALTER TABLE` 缺 `ALGORITHM`/`LOCK` 在线 DDL 策略、raw 危险 DDL（`DROP TABLE`/`DROP DATABASE`/`TRUNCATE`）判为 warning（`--strict` 下升为失败）。
 - `migrate lint` 新增 `duplicate_registration`（error）：同名迁移被注册多次时报告（运行时仍先注册者赢），使"两个包注册同名迁移"可被发现。
 - 回滚（`down`/`down-to`/`reset`/`refresh`）在回滚任一迁移之前做全量预检：任一待回滚记录不在 registry 或缺 `Down` 则整体拒绝，杜绝"回滚一半才失败"的部分回滚。
+- 新增 `WithMigrationsTable`（顶层 Option 与 `migration.WithMigrationsTable` MigratorOption）：迁移记录表名可配置。多项目共用同一数据库时各用独立记录表 + 独立锁名，迁移账本与漂移校验互不干扰——此前文档宣称仅配 `WithLockName` 即可共库，实际第二个项目会把第一个项目的记录判为漂移而拒绝执行。
 
 ### Changed
 
@@ -27,15 +28,13 @@
 - **⚠ 破坏性变更** `Pending`/`Status`/`MarkApplied`/`upWithoutLock` 在空 registry 时 fail-closed 报错，不再返回"空列表/静默"的误导性结果。
 - **⚠ 破坏性变更** 迁移 `Up` 为 nil 时执行直接报错（不再静默记为已执行）；`Down` 为 nil 时回滚直接报错且不删除迁移记录（"不可回滚"请显式用 `Irreversible`）。
 - **⚠ 破坏性变更** `mark-applied --to <version>`（`MarkApplied`）的目标非空时必须是已注册的迁移名，否则报错且不标记任何迁移（此前拼写错误的目标会静默标记错误范围）。
-- **⚠ 破坏性变更** `file.CreateDirIfNotExists` 移除从未使用的 `perm` 可变参数，签名收窄为 `CreateDirIfNotExists(dirname string) error`。
-- **⚠ 破坏性变更** `migration.Migrator` 的 `Folder`/`DB` 字段改为非导出，构造统一走 `NewMigrator`（此前导出字段可被外部改写、破坏封装）。
 - `migrate up` 预检输出待执行数量（`Running N migration(s)...`），无待执行时提示 `Database is up to date.` 后直接返回。
+- `migrate lint` 的 `missing_online_ddl`（`ALGORITHM`/`LOCK` 为 MySQL 专属语法）仅在数据库类型为 MySQL 时上报，PostgreSQL/SQLite 项目不再误报；危险 DDL 检查保持全方言生效。
+- `make.SetProjectName` 与 `file.FileNameWithoutExtension` 标记为 Deprecated（保留兼容，推荐分别改用 `Setup`+`WithProjectName` 与标准库）。
 
 ### Removed
 
 - 删除死模板 `migration.stub`（旧的 `AutoMigrate` + 业务 model 范例，已无引用）与 `migration_add_raw.stub`（逻辑合并进 `migration_add`，`--after` 改为注入 `AFTER` 子句）。
-- **⚠ 破坏性变更** 删除 `make.SetProjectName`（v1 兼容垫片，请改用 `migrate.Setup` + `WithProjectName`）。
-- **⚠ 破坏性变更** 删除 `file.FileNameWithoutExtension`（全仓库无调用的死代码）。
 
 ### Fixed
 
@@ -50,6 +49,8 @@
 - `console.Error`（含 `console.Exit` 的消息）改输出到 stderr，重定向 stdout 时错误消息不再混入正常输出；`Success`/`Warning` 仍走 stdout。
 - `migrate fresh`：PostgreSQL 删表时对表名做双引号标识符转义，与 MySQL 分支的反引号转义一致。
 - 未调用 `migrate.Setup` 就执行迁移命令时返回错误而不再 panic；全局配置改为原子指针存取，消除并发场景下的数据竞争。
+- PostgreSQL 迁移锁：获取锁失败（含等锁超时）后先复位会话级 `statement_timeout` 再归还连接，复位失败则物理关闭连接——此前失败路径会把带超时设置的连接归还连接池，复用该连接的业务查询会被莫名取消；锁释放路径的复位失败同样接入坏连接兜底。
+- CLI 迁移命令的执行上下文改为从 `cmd.Context()` 派生，经 `ExecuteContext` 传入的取消信号（如 Ctrl-C）能中止迁移执行；`fresh` 的删表操作同样受超时/取消约束（此前完全脱离上下文控制）。
 
 ### Migration Notes
 

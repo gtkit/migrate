@@ -5,6 +5,8 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -147,7 +149,9 @@ const (
 )
 
 func writeGeneratedFile(filePath string, data []byte, mode fileWriteMode) error {
-	if file.Exists(filePath) {
+	// 三态判断：存在 / 不存在 / 未知错误——权限等未知错误显式上报，不静默当作已存在.
+	switch _, err := os.Stat(filePath); {
+	case err == nil:
 		switch mode {
 		case writeSkipIfExists:
 			return nil
@@ -158,6 +162,10 @@ func writeGeneratedFile(filePath string, data []byte, mode fileWriteMode) error 
 		default:
 			return errors.New("unsupported file write mode")
 		}
+	case errors.Is(err, fs.ErrNotExist):
+		// 不存在，继续创建
+	default:
+		return fmt.Errorf("stat %s: %w", filePath, err)
 	}
 
 	if err := file.CreateDirIfNotExists(filepath.Dir(filePath)); err != nil {
