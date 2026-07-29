@@ -14,16 +14,20 @@ import (
 
 // Migrator 数据迁移操作核心.
 //
-// Folder 与 DB 为兼容保留的导出字段，仅供读取；请通过 NewMigrator 构造，
-// 构造后修改这两个字段的行为未定义.
+// Folder 与 DB 为兼容保留的导出字段，是构造期快照、仅供读取；
+// 构造后写入不影响迁移执行——迁移、记录读写与加锁始终以 NewMigrator
+// 传入的值为唯一真实来源，避免"旧库持锁、新库跑迁移"的分裂.
 type Migrator struct {
 	Folder      string
 	DB          *gorm.DB
+	folder      string   // 迁移目录唯一真实来源
+	db          *gorm.DB // 数据库唯一真实来源，与 dbType、lock 构造期绑定
 	dbType      DBType
 	lock        migrationLock
 	lockName    string
 	lockTimeout time.Duration
 	tableName   string
+	allowFresh  bool  // Fresh 删全库表，必须经 WithAllowFresh 显式授权
 	configErr   error // 构造期配置错误（如非法表名），所有执行入口 fail-closed 返回
 	registry    *Registry
 	logger      Logger
@@ -74,27 +78,49 @@ func WithRegistry(r *Registry) MigratorOption {
 // WithMigrationsTable 设置迁移记录表名（默认 "migrations"）.
 // 当同一数据库被多个项目共用时，各项目应使用独立的记录表（并配合 WithLockName
 // 使用独立锁名），迁移账本与一致性校验互不干扰.
-// 表名仅允许字母、数字与下划线（见 ValidateMigrationsTable），不支持 schema 限定名；
-// 非法表名会使所有迁移入口 fail-closed 报错.传入空白字符串时忽略，保持默认.
+// 表名仅允许字母、数字与下划线且长度不超过 63（见 ValidateMigrationsTable），
+// 不支持 schema 限定名；首尾空白自动规整.空白字符串同样非法：不静默保持默认
+// （多项目共库下配置意外为空时写默认账本比报错危险得多），与其他非法表名一样
+// 使所有迁移入口 fail-closed 报错.
 func WithMigrationsTable(name string) MigratorOption {
 	return func(m *Migrator) {
-		if trimmed := strings.TrimSpace(name); trimmed != "" {
-			m.tableName = trimmed
-		}
+		m.tableName = strings.TrimSpace(name)
+	}
+}
+
+// WithAllowFresh 显式授权 Fresh 执行.
+// Fresh 会删除库内全部用户表（含其他项目的业务表与迁移账本），默认禁用；
+// 仅当本项目独占该数据库时才应授权.数据库所有权无法从配置推断，必须由调用方声明.
+func WithAllowFresh() MigratorOption {
+	return func(m *Migrator) {
+		m.allowFresh = true
 	}
 }
 
 // migrationsTablePattern 迁移记录表名白名单：普通标识符，不支持 schema.table.
 var migrationsTablePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
+// maxMigrationsTableLen 迁移记录表名长度上限.
+// MySQL 表名上限 64 字符；PostgreSQL 标识符默认上限 63 字节且超长会被静默截断
+// ——截断在共库下可能撞名、写错账本，比报错更危险.取跨方言交集 63；
+// 白名单仅放行 ASCII，字节数即字符数.
+const maxMigrationsTableLen = 63
+
 // ValidateMigrationsTable 校验迁移记录表名是否合法.
-// 仅允许字母、数字与下划线且不以数字开头；不支持 schema 限定名（如 "public.migrations"）.
+// 仅允许字母、数字与下划线且不以数字开头，长度不超过 63；
+// 不支持 schema 限定名（如 "public.migrations"）.
 // 表名会被拼入 SQL，非法字符（空格、反引号、分号等）会被 GORM 当作 SQL 表达式处理，必须拒绝.
 func ValidateMigrationsTable(name string) error {
 	if !migrationsTablePattern.MatchString(name) {
 		return fmt.Errorf(
 			"invalid migrations table name %q: only letters, digits and underscores are allowed (schema-qualified names are not supported)",
 			name,
+		)
+	}
+	if len(name) > maxMigrationsTableLen {
+		return fmt.Errorf(
+			"invalid migrations table name %q: %d chars exceeds the cross-dialect limit of %d (MySQL allows 64, PostgreSQL silently truncates identifiers to 63 bytes)",
+			name, len(name), maxMigrationsTableLen,
 		)
 	}
 	return nil
@@ -112,6 +138,8 @@ func NewMigrator(folder string, db *gorm.DB, opts ...MigratorOption) *Migrator {
 	m := &Migrator{
 		Folder:      folder,
 		DB:          db,
+		folder:      folder,
+		db:          db,
 		dbType:      dbType,
 		lockName:    defaultLockName,
 		lockTimeout: defaultLockTimeout,
@@ -140,10 +168,10 @@ func (m *Migrator) Setup(ctx context.Context) error {
 	if m.configErr != nil {
 		return m.configErr
 	}
-	if m.DB == nil {
+	if m.db == nil {
 		return errors.New("migrate: database connection is required")
 	}
-	db := m.DB.WithContext(ctx)
+	db := m.db.WithContext(ctx)
 	if db.Migrator().HasTable(m.tableName) {
 		return nil
 	}
@@ -160,7 +188,7 @@ func (m *Migrator) Setup(ctx context.Context) error {
 // records 返回绑定迁移记录表与上下文的查询入口.
 // 所有迁移记录的读写统一经此走配置表名，避免散落的默认表名查询.
 func (m *Migrator) records(ctx context.Context) *gorm.DB {
-	return m.DB.WithContext(ctx).Table(m.tableName)
+	return m.db.WithContext(ctx).Table(m.tableName)
 }
 
 // Up 执行所有未迁移的文件.
@@ -322,19 +350,19 @@ func (m *Migrator) Refresh(ctx context.Context) error {
 }
 
 // Fresh 删除所有表并重新执行所有迁移.
-// ⚠️ 危险操作：会丢失所有数据.仅允许在本项目独占的数据库上使用：
-// 配置了非默认迁移记录表名（多项目共库信号）时直接拒绝执行.
+// ⚠️ 危险操作：会丢失所有数据.默认禁用：必须经 WithAllowFresh 显式授权，
+// 且仅当本项目独占该数据库时才应授权（fresh 会删除库内全部用户表，
+// 包括其他项目的业务表与迁移账本）.
 func (m *Migrator) Fresh(ctx context.Context) error {
 	// Fresh 不经 Setup 且先删表，配置错误必须在此独立拦截.
 	if m.configErr != nil {
 		return m.configErr
 	}
-	// fresh 删除的是库内全部用户表——包括其他项目的业务表和迁移账本.
-	// 自定义记录表名表明多项目共库，此时执行 fresh 是跨项目破坏，代码级拒绝.
-	if m.tableName != defaultTableName {
-		return fmt.Errorf(
-			"fresh is disabled when a custom migrations table (%q) is configured: it drops ALL tables in the database, including other projects'; run it only with the default table on a database this project owns exclusively",
-			m.tableName,
+	// 数据库所有权无法从表名等配置推断（共库项目可能用默认表名，独占库
+	// 也可能用自定义表名），删全库表必须由调用方显式授权.
+	if !m.allowFresh {
+		return errors.New(
+			"fresh is disabled by default: it drops ALL tables in the database; enable it with WithAllowFresh only on a database this project owns exclusively",
 		)
 	}
 	// 删表前先做完整执行校验：空 registry / 重复名 / nil Up 都在删表之前拦下，绝不删光数据却不重建.
@@ -349,10 +377,10 @@ func (m *Migrator) Fresh(ctx context.Context) error {
 	defer release()
 
 	// 携带 ctx：删表 DDL 与库名查询同样受外部取消/超时约束.
-	dbname := CurrentDatabase(m.DB.WithContext(ctx))
+	dbname := CurrentDatabase(m.db.WithContext(ctx))
 	m.logger.Warn("dropping all tables", "database", dbname)
 
-	if err := DeleteAllTables(m.DB.WithContext(ctx)); err != nil {
+	if err := DeleteAllTables(m.db.WithContext(ctx)); err != nil {
 		return fmt.Errorf("delete all tables: %w", err)
 	}
 	m.logger.Info("all tables dropped", "database", dbname)
@@ -489,7 +517,7 @@ func (m *Migrator) MarkApplied(ctx context.Context, toFile string) ([]string, er
 	}
 
 	// 同一事务写入所有 baseline 记录，全成或全败，不留部分标记.
-	if err := m.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	if err := m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		for _, name := range toMark {
 			if err := tx.Table(m.tableName).Create(&Migration{Migration: name, Batch: batch}).Error; err != nil {
 				return fmt.Errorf("mark %s applied: %w", name, err)
@@ -564,13 +592,13 @@ func (m *Migrator) acquireLock(ctx context.Context) (func(), error) {
 // MySQL、PostgreSQL 的锁绑定在专属连接上，连接池上限为 1 时会一直死等到超时，此处提前快速拒绝.
 // SQLite 使用 noopLock（不占用连接），无此约束.
 func (m *Migrator) ensureConcurrentConns() error {
-	if m.DB == nil {
+	if m.db == nil {
 		return errors.New("migrate: database connection is required")
 	}
 	if m.dbType == DBTypeSQLite {
 		return nil
 	}
-	sqlDB, err := m.DB.DB()
+	sqlDB, err := m.db.DB()
 	if err != nil {
 		return fmt.Errorf("get sql.DB: %w", err)
 	}
@@ -641,7 +669,7 @@ func (m *Migrator) runUpMigration(ctx context.Context, mfile MigrationFile, batc
 		}
 	}()
 
-	return m.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := mfile.Up(tx); err != nil {
 			return fmt.Errorf("execute up: %w", err)
 		}
@@ -695,7 +723,7 @@ func (m *Migrator) runDownMigration(ctx context.Context, mfile MigrationFile, re
 		}
 	}()
 
-	return m.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// fail-closed：无 Down 函数不能删记录，否则表还在、记录没了=账本损坏.
 		// "不可回滚"应显式用 Irreversible（非 nil、返回 error）表达.
 		if mfile.Down == nil {

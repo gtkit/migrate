@@ -40,6 +40,8 @@ func TestOptionsApply(t *testing.T) {
 		WithLockTimeout(7 * time.Second),
 		WithLogger(logger),
 		WithDDLModels(struct{}{}),
+		WithMigrationsTable("  ledger_svc  "),
+		WithAllowFresh(),
 	} {
 		o(cfg)
 	}
@@ -54,6 +56,12 @@ func TestOptionsApply(t *testing.T) {
 	if cfg.Logger == nil || len(cfg.DDLModels) != 1 {
 		t.Fatalf("logger/ddlmodels not applied: %+v", cfg)
 	}
+	if cfg.MigrationsTable != "ledger_svc" {
+		t.Fatalf("migrations table should be trimmed and applied, got %q", cfg.MigrationsTable)
+	}
+	if !cfg.AllowFresh {
+		t.Fatalf("WithAllowFresh should set AllowFresh")
+	}
 
 	// 空/零值应被忽略（覆盖 if 分支的另一半）。
 	WithProjectName("")(cfg)
@@ -62,6 +70,26 @@ func TestOptionsApply(t *testing.T) {
 	WithLockTimeout(0)(cfg)
 	if cfg.ProjectName != "proj" || cfg.MigrationDir != "db/mig" || cfg.Timeout != 9*time.Minute {
 		t.Fatalf("empty options should be ignored: %+v", cfg)
+	}
+
+	// 表名例外：空白不忽略、原样置空，由 Setup fail-closed 报错（绝不静默回退默认账本）。
+	WithMigrationsTable("   ")(cfg)
+	if cfg.MigrationsTable != "" {
+		t.Fatalf("blank migrations table must not be ignored, got %q", cfg.MigrationsTable)
+	}
+
+	if def := defaultConfig(); def.MigrationsTable != "migrations" {
+		t.Fatalf("default migrations table should be %q, got %q", "migrations", def.MigrationsTable)
+	}
+}
+
+// TestSetupRejectsInvalidMigrationsTable 验证 Setup 对空白/超长/含 SQL 片段的表名 fail-closed.
+func TestSetupRejectsInvalidMigrationsTable(t *testing.T) {
+	db := newHandlerTestDB(t, "setup_invalid_table")
+	for _, name := range []string{"   ", "ledger AS l", strings.Repeat("a", 64)} {
+		if err := Setup(db, WithMigrationsTable(name)); err == nil {
+			t.Fatalf("Setup should reject migrations table %q", name)
+		}
 	}
 }
 
@@ -132,6 +160,17 @@ func TestMigrateHandlersEndToEnd(t *testing.T) {
 		t.Fatalf("widgets should exist after refresh")
 	}
 
+	// fresh 双层保护：--force 只防误触命令，未经 WithAllowFresh 授权仍拒绝.
+	if _, err := execMigrate(t, "fresh", "--force"); err == nil || !strings.Contains(err.Error(), "WithAllowFresh") {
+		t.Fatalf("fresh without WithAllowFresh should be rejected, got: %v", err)
+	}
+	if !db.Migrator().HasTable("widgets") {
+		t.Fatalf("rejected fresh must not drop tables")
+	}
+
+	if err := Setup(db, WithMigrationDir(dir), WithLogger(&migration.NopLogger{}), WithAllowFresh()); err != nil {
+		t.Fatalf("re-setup with WithAllowFresh: %v", err)
+	}
 	if _, err := execMigrate(t, "fresh", "--force"); err != nil {
 		t.Fatalf("fresh --force: %v", err)
 	}

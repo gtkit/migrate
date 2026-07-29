@@ -90,6 +90,11 @@ type diskMigrationFile struct {
 
 // Lint 检查 migration 目录、registry 与数据库记录的一致性。
 func (m *Migrator) Lint(ctx context.Context, opts LintOptions) (LintReport, error) {
+	// Lint 不经 Setup，构造期配置错误（如非法表名）必须在此独立拦截，
+	// 否则非法表名会直达 lintDatabase 的 GORM 查询.
+	if m.configErr != nil {
+		return LintReport{}, m.configErr
+	}
 	diskFiles, err := m.readDiskMigrationFiles()
 	if err != nil {
 		return LintReport{}, err
@@ -179,7 +184,7 @@ func (m *Migrator) Lint(ctx context.Context, opts LintOptions) (LintReport, erro
 		})
 	}
 
-	if !opts.SkipDatabase && m.DB != nil {
+	if !opts.SkipDatabase && m.db != nil {
 		issues, err := m.lintDatabase(ctx, diskMap, registryMap)
 		if err != nil {
 			return LintReport{}, err
@@ -192,7 +197,7 @@ func (m *Migrator) Lint(ctx context.Context, opts LintOptions) (LintReport, erro
 }
 
 func (m *Migrator) lintDatabase(ctx context.Context, diskMap map[string]diskMigrationFile, registryMap map[string]MigrationFile) ([]LintIssue, error) {
-	if !m.DB.WithContext(ctx).Migrator().HasTable(m.tableName) {
+	if !m.db.WithContext(ctx).Migrator().HasTable(m.tableName) {
 		return nil, nil
 	}
 
@@ -225,9 +230,9 @@ func (m *Migrator) lintDatabase(ctx context.Context, diskMap map[string]diskMigr
 }
 
 func (m *Migrator) readDiskMigrationFiles() ([]diskMigrationFile, error) {
-	entries, err := os.ReadDir(m.Folder)
+	entries, err := os.ReadDir(m.folder)
 	if err != nil {
-		return nil, fmt.Errorf("read migration dir %s: %w", m.Folder, err)
+		return nil, fmt.Errorf("read migration dir %s: %w", m.folder, err)
 	}
 
 	result := make([]diskMigrationFile, 0, len(entries))
@@ -244,7 +249,7 @@ func (m *Migrator) readDiskMigrationFiles() ([]diskMigrationFile, error) {
 			continue
 		}
 
-		path := filepath.Join(m.Folder, entry.Name())
+		path := filepath.Join(m.folder, entry.Name())
 		content, err := os.ReadFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("read migration file %s: %w", path, err)

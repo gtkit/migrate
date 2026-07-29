@@ -2,6 +2,7 @@ package migration
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -348,7 +349,7 @@ func TestMigratorFreshRefreshFailClosedOnEmptyRegistry(t *testing.T) {
 	if err := db.Exec("CREATE TABLE sentinel (id integer primary key)").Error; err != nil {
 		t.Fatalf("create sentinel: %v", err)
 	}
-	m := NewMigrator(t.TempDir(), db, WithRegistry(NewRegistry()))
+	m := NewMigrator(t.TempDir(), db, WithRegistry(NewRegistry()), WithAllowFresh())
 
 	if err := m.Fresh(t.Context()); err == nil {
 		t.Fatalf("Fresh should fail-closed on empty registry")
@@ -431,7 +432,7 @@ func TestMigratorFreshFailsClosedOnNilUp(t *testing.T) {
 	}
 	registry := NewRegistry()
 	registry.Add("2026_03_24_120000_bad", nil, func(*gorm.DB) error { return nil }) // nil Up
-	m := NewMigrator(t.TempDir(), db, WithRegistry(registry))
+	m := NewMigrator(t.TempDir(), db, WithRegistry(registry), WithAllowFresh())
 
 	if err := m.Fresh(t.Context()); err == nil {
 		t.Fatalf("Fresh should fail-closed when a migration has nil Up")
@@ -691,9 +692,10 @@ func TestMigratorMultiProjectSharedDatabase(t *testing.T) {
 	}
 }
 
-// TestValidateMigrationsTable 验证表名白名单：非法输入 fail-closed，不支持 schema 限定名.
+// TestValidateMigrationsTable 验证表名白名单：非法输入 fail-closed，不支持 schema 限定名，
+// 长度上限 63（跨方言安全上限）.
 func TestValidateMigrationsTable(t *testing.T) {
-	valid := []string{"migrations", "migrations_svc", "_ledger", "M1"}
+	valid := []string{"migrations", "migrations_svc", "_ledger", "M1", strings.Repeat("a", 63)}
 	for _, name := range valid {
 		if err := ValidateMigrationsTable(name); err != nil {
 			t.Fatalf("%q should be valid: %v", name, err)
@@ -708,6 +710,7 @@ func TestValidateMigrationsTable(t *testing.T) {
 		"public.migrations", // schema 限定名不支持
 		"1migrations",
 		"migrations-svc",
+		strings.Repeat("a", 64), // 超过跨方言上限 63：MySQL 报错、PostgreSQL 静默截断
 	}
 	for _, name := range invalid {
 		if err := ValidateMigrationsTable(name); err == nil {
@@ -732,6 +735,10 @@ func TestMigratorInvalidTableNameFailsClosed(t *testing.T) {
 	if err := m.Fresh(t.Context()); err == nil {
 		t.Fatalf("Fresh should fail-closed on invalid table name")
 	}
+	// Lint 不经 Setup，必须独立拦截非法表名，不得把它传入数据库查询.
+	if _, err := m.Lint(t.Context(), LintOptions{}); err == nil {
+		t.Fatalf("Lint should fail-closed on invalid table name")
+	}
 
 	var tables []string
 	if err := db.Raw("SELECT name FROM sqlite_master WHERE type='table'").Scan(&tables).Error; err != nil {
@@ -739,6 +746,24 @@ func TestMigratorInvalidTableNameFailsClosed(t *testing.T) {
 	}
 	if len(tables) != 0 {
 		t.Fatalf("no table should be created under invalid config, got %v", tables)
+	}
+}
+
+// TestMigratorBlankTableNameFailsClosed 验证显式配置空白表名不静默回退默认账本，入口直接报错.
+func TestMigratorBlankTableNameFailsClosed(t *testing.T) {
+	db := openExecTestDB(t, "migrator_blank_table")
+
+	noop := func(*gorm.DB) error { return nil }
+	registry := NewRegistry()
+	registry.Add("2026_03_24_120000_create_a_table", noop, noop)
+
+	m := NewMigrator(t.TempDir(), db, WithRegistry(registry), WithMigrationsTable("   "))
+
+	if err := m.Up(t.Context()); err == nil {
+		t.Fatalf("Up should fail-closed on blank table name instead of silently using the default ledger")
+	}
+	if db.Migrator().HasTable("migrations") {
+		t.Fatalf("blank table name must not fall back to the default migrations table")
 	}
 }
 
@@ -762,9 +787,10 @@ func TestMigratorTableNameTrimmed(t *testing.T) {
 	}
 }
 
-// TestMigratorFreshRejectedWithCustomTable 验证自定义记录表名（共库信号）下 Fresh 拒绝执行且不删表.
-func TestMigratorFreshRejectedWithCustomTable(t *testing.T) {
-	db := openExecTestDB(t, "migrator_fresh_custom_table")
+// TestMigratorFreshRejectedWithoutAllowFresh 验证未经 WithAllowFresh 显式授权时
+// Fresh 直接拒绝且不删任何表——数据库所有权不得从表名推断，默认表名同样拦截.
+func TestMigratorFreshRejectedWithoutAllowFresh(t *testing.T) {
+	db := openExecTestDB(t, "migrator_fresh_no_allow")
 
 	// 先造一张"其他项目"的表，验证 Fresh 被拦截后它安然无恙.
 	if err := db.Exec("CREATE TABLE other_project_data (id integer primary key)").Error; err != nil {
@@ -778,11 +804,79 @@ func TestMigratorFreshRejectedWithCustomTable(t *testing.T) {
 	writeMigrationFile(t, dir, f, "package migrations\n")
 	registry.Add(f, noop, noop)
 
-	m := NewMigrator(dir, db, WithRegistry(registry), WithMigrationsTable("migrations_svc"))
-	if err := m.Fresh(t.Context()); err == nil {
-		t.Fatalf("Fresh must be rejected with a custom migrations table")
+	// 默认表名与自定义表名都必须拦截：共库项目可能用默认表名，保护不得依赖表名.
+	for name, m := range map[string]*Migrator{
+		"default_table": NewMigrator(dir, db, WithRegistry(registry)),
+		"custom_table":  NewMigrator(dir, db, WithRegistry(registry), WithMigrationsTable("migrations_svc")),
+	} {
+		err := m.Fresh(t.Context())
+		if err == nil {
+			t.Fatalf("%s: Fresh must be rejected without WithAllowFresh", name)
+		}
+		if !strings.Contains(err.Error(), "WithAllowFresh") {
+			t.Fatalf("%s: error should point to WithAllowFresh, got: %v", name, err)
+		}
+		if !db.Migrator().HasTable("other_project_data") {
+			t.Fatalf("%s: Fresh rejection must not drop any table", name)
+		}
 	}
-	if !db.Migrator().HasTable("other_project_data") {
-		t.Fatalf("Fresh rejection must not drop any table")
+}
+
+// TestMigratorFreshAllowedWithAllowFresh 验证显式授权后 Fresh 可执行，
+// 且不再因自定义记录表名被误拒（独占库 + 自定义表名是合法组合）.
+func TestMigratorFreshAllowedWithAllowFresh(t *testing.T) {
+	db := openExecTestDB(t, "migrator_fresh_allowed")
+
+	if err := db.Exec("CREATE TABLE stale_data (id integer primary key)").Error; err != nil {
+		t.Fatalf("create stale table: %v", err)
+	}
+
+	registry := NewRegistry()
+	f := "2026_03_24_120000_create_a_table"
+	dir := t.TempDir()
+	writeMigrationFile(t, dir, f, "package migrations\n")
+	registry.Add(f,
+		func(tx *gorm.DB) error { return tx.Exec("CREATE TABLE a (id integer primary key)").Error },
+		func(tx *gorm.DB) error { return tx.Exec("DROP TABLE a").Error },
+	)
+
+	m := NewMigrator(dir, db, WithRegistry(registry), WithAllowFresh(), WithMigrationsTable("migrations_svc"))
+	if err := m.Fresh(t.Context()); err != nil {
+		t.Fatalf("Fresh with WithAllowFresh should run: %v", err)
+	}
+	if db.Migrator().HasTable("stale_data") {
+		t.Fatalf("Fresh should have dropped pre-existing tables")
+	}
+	if !db.Migrator().HasTable("a") || !db.Migrator().HasTable("migrations_svc") {
+		t.Fatalf("Fresh should re-run migrations into the configured ledger")
+	}
+}
+
+// TestMigratorUpIgnoresDBFieldMutation 验证公开 DB 字段只是构造期快照：
+// 构造后改写不改变迁移执行目标，杜绝"旧库持锁、新库跑迁移"的分裂.
+func TestMigratorUpIgnoresDBFieldMutation(t *testing.T) {
+	dbA := openExecTestDB(t, "field_mutation_a")
+	dbB := openExecTestDB(t, "field_mutation_b")
+
+	registry := NewRegistry()
+	f := "2026_03_24_120000_create_a_table"
+	dir := t.TempDir()
+	writeMigrationFile(t, dir, f, "package migrations\n")
+	registry.Add(f,
+		func(tx *gorm.DB) error { return tx.Exec("CREATE TABLE a (id integer primary key)").Error },
+		func(tx *gorm.DB) error { return tx.Exec("DROP TABLE a").Error },
+	)
+
+	m := NewMigrator(dir, dbA, WithRegistry(registry))
+	m.DB = dbB // 构造后改写公开字段：不得重定向执行目标
+
+	if err := m.Up(t.Context()); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+	if !dbA.Migrator().HasTable("a") || !dbA.Migrator().HasTable("migrations") {
+		t.Fatalf("migrations must run against the DB passed to NewMigrator")
+	}
+	if dbB.Migrator().HasTable("a") || dbB.Migrator().HasTable("migrations") {
+		t.Fatalf("mutating the exported DB field must not redirect execution")
 	}
 }

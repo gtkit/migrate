@@ -53,7 +53,13 @@ type Config struct {
 
 	// MigrationsTable 迁移记录表名（默认 "migrations"）.
 	// 多项目共用同一数据库时，各项目应使用独立的记录表.
+	// 仅允许字母、数字与下划线且长度不超过 63，不支持 schema 限定名；
+	// 空白同样非法，Setup 直接报错，绝不静默回退默认账本.
 	MigrationsTable string
+
+	// AllowFresh 显式授权 fresh 命令（默认 false，fresh 直接报错拒绝）.
+	// fresh 会删除库内全部用户表，仅当本项目独占该数据库时才应授权.
+	AllowFresh bool
 
 	// DDLModels 用于 make ddl 的模型注册表。
 	DDLModels []any
@@ -148,13 +154,22 @@ func WithLogger(l migration.Logger) Option {
 // WithMigrationsTable 设置迁移记录表名（默认 "migrations"）.
 // 多项目共用同一数据库时，各项目应使用独立的记录表并配合 WithLockName 使用独立锁名，
 // 迁移账本与漂移校验互不干扰.
-// 表名仅允许字母、数字与下划线，不支持 schema 限定名；非法表名 Setup 会直接报错.
-// 空白字符串忽略.
+// 表名仅允许字母、数字与下划线且长度不超过 63，不支持 schema 限定名；首尾空白自动规整.
+// 空白字符串同样非法（不静默保持默认，防止配置意外为空时写错账本），
+// 非法表名 Setup 直接报错.
 func WithMigrationsTable(name string) Option {
 	return func(c *Config) {
-		if trimmed := strings.TrimSpace(name); trimmed != "" {
-			c.MigrationsTable = trimmed
-		}
+		c.MigrationsTable = strings.TrimSpace(name)
+	}
+}
+
+// WithAllowFresh 显式授权 fresh 命令.
+// fresh 会删除库内全部用户表（含其他项目的业务表与迁移账本），默认禁用；
+// 仅当本项目独占该数据库时才应授权.数据库所有权无法从配置推断，必须由调用方声明.
+// 该授权与 CLI 的 --force 分层：--force 防误触命令，WithAllowFresh 声明数据库独占.
+func WithAllowFresh() Option {
+	return func(c *Config) {
+		c.AllowFresh = true
 	}
 }
 
@@ -168,14 +183,15 @@ func WithDDLModels(models ...any) Option {
 // defaultConfig 返回默认配置.
 func defaultConfig() *Config {
 	return &Config{
-		ProjectName:   "project_name",
-		MigrationDir:  "database/migrations",
-		ModelDir:      "internal/models",
-		RepositoryDir: "internal/repository",
-		DDLDir:        "database/ddl",
-		Timeout:       5 * time.Minute,
-		LockName:      "migrate_lock",
-		LockTimeout:   10 * time.Second,
+		ProjectName:     "project_name",
+		MigrationDir:    "database/migrations",
+		ModelDir:        "internal/models",
+		RepositoryDir:   "internal/repository",
+		DDLDir:          "database/ddl",
+		Timeout:         5 * time.Minute,
+		LockName:        "migrate_lock",
+		LockTimeout:     10 * time.Second,
+		MigrationsTable: "migrations",
 	}
 }
 
@@ -198,10 +214,9 @@ func Setup(db *gorm.DB, opts ...Option) error {
 	}
 
 	// 表名会被拼入 SQL：配置期就 fail-closed，避免运行命令时才发现（或静默写错账本）.
-	if cfg.MigrationsTable != "" {
-		if err := migration.ValidateMigrationsTable(cfg.MigrationsTable); err != nil {
-			return fmt.Errorf("migrate: %w", err)
-		}
+	// 无条件校验：默认值 "migrations" 恒合法，显式配置的空白/非法值在此报错.
+	if err := migration.ValidateMigrationsTable(cfg.MigrationsTable); err != nil {
+		return fmt.Errorf("migrate: %w", err)
 	}
 
 	app.Store(cfg)
@@ -239,8 +254,9 @@ func commandEnv(cmd *cobra.Command) (*migration.Migrator, context.Context, conte
 	if cfg.Logger != nil {
 		opts = append(opts, migration.WithLogger(cfg.Logger))
 	}
-	if cfg.MigrationsTable != "" {
-		opts = append(opts, migration.WithMigrationsTable(cfg.MigrationsTable))
+	opts = append(opts, migration.WithMigrationsTable(cfg.MigrationsTable))
+	if cfg.AllowFresh {
+		opts = append(opts, migration.WithAllowFresh())
 	}
 
 	parent := context.Background()
@@ -290,7 +306,8 @@ var CmdMigrateRefresh = &cobra.Command{
 	RunE:  runRefresh,
 }
 
-// CmdMigrateFresh 删除库内所有表并重新执行全部迁移（fresh，需 --force；仅限本项目独占的数据库）.
+// CmdMigrateFresh 删除库内所有表并重新执行全部迁移
+// （fresh，需 Setup 时 WithAllowFresh 授权 + 运行时 --force；仅限本项目独占的数据库）.
 var CmdMigrateFresh = &cobra.Command{
 	Use:   "fresh",
 	Short: "Drop all tables and re-run all migrations",

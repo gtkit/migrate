@@ -12,10 +12,13 @@
 - `migrate lint` 新增 `duplicate_registration`（error）：同名迁移被注册多次时报告（运行时仍先注册者赢），使"两个包注册同名迁移"可被发现。
 - 回滚（`down`/`down-to`/`reset`/`refresh`）在回滚任一迁移之前做全量预检：任一待回滚记录不在 registry 或缺 `Down` 则整体拒绝，杜绝"回滚一半才失败"的部分回滚。
 - 新增 `WithMigrationsTable`（顶层 Option 与 `migration.WithMigrationsTable` MigratorOption）：迁移记录表名可配置。多项目共用同一数据库时各用独立记录表 + 独立锁名，迁移账本与漂移校验互不干扰——此前文档宣称仅配 `WithLockName` 即可共库，实际第二个项目会把第一个项目的记录判为漂移而拒绝执行。
-- 新增 `migration.ValidateMigrationsTable`：迁移记录表名合法性校验（仅允许字母、数字、下划线，不支持 schema 限定名）。
+- 新增 `migration.ValidateMigrationsTable`：迁移记录表名合法性校验（仅允许字母、数字、下划线，长度不超过 63——MySQL 上限 64、PostgreSQL 63 字节且超长静默截断，取跨方言交集；不支持 schema 限定名）。
+- 新增 `WithAllowFresh`（顶层 Option 与 `migration.WithAllowFresh` MigratorOption）：显式授权 `fresh` 执行，仅当本项目独占该数据库时才应开启。
 
 ### Changed
 
+- **⚠ 破坏性变更** `fresh`（`Migrator.Fresh`）默认禁用：必须在 `Setup`/构造时经 `WithAllowFresh` 显式授权（CLI 运行时仍需 `--force`），未授权直接报错且不删任何表——fresh 会删除库内全部用户表（含其他项目的表与迁移账本），此前仅有文档警告没有代码拦截；数据库所有权不从记录表名推断（共库项目可能用默认表名、独占库也可能用自定义表名）。
+- `Migrator` 公开字段 `DB`/`Folder` 改为构造期快照：构造后写入不再影响迁移执行、记录读写与加锁（此前该行为未定义，可能出现"旧库持锁、新库跑迁移"的分裂）。
 - **⚠ 破坏性变更** 迁移执行与破坏性命令（`up`/`fresh`/`refresh`）在动手前统一校验 registry：为空、存在重复注册名、或任一迁移缺 `Up` 时直接报错——`fresh`/`refresh` 在删表/回滚**之前**拦下，绝不删光数据却不重建；重复注册名运行时也不再静默用第一个实现。
 - **⚠ 破坏性变更** `Pending`/`Status`/`MarkApplied` 改用完整一致性校验（含"数据库已应用但当前 binary 未注册"的漂移），漂移时报错而非静默返回成功。
 - **⚠ 破坏性变更** 所有获取迁移锁的命令（`up`/`down`/`down-to`/`reset`/`refresh`/`fresh`/`mark-applied`）在取锁前校验连接池容量；`MaxOpenConns=1`（非 SQLite）时直接报错而非阻塞至超时。
@@ -52,13 +55,13 @@
 - 未调用 `migrate.Setup` 就执行迁移命令时返回错误而不再 panic；全局配置改为原子指针存取，消除并发场景下的数据竞争。
 - PostgreSQL 迁移锁：获取锁失败（含等锁超时）后先复位会话级 `statement_timeout` 再归还连接，复位失败则物理关闭连接——此前失败路径会把带超时设置的连接归还连接池，复用该连接的业务查询会被莫名取消；锁释放路径的复位失败同样接入坏连接兜底。
 - CLI 迁移命令的执行上下文改为从 `cmd.Context()` 派生，经 `ExecuteContext` 传入的取消信号（如 Ctrl-C）能中止迁移执行；`fresh` 的删表操作同样受超时/取消约束（此前完全脱离上下文控制）。
-- 迁移记录表名 fail-closed 校验：非法表名（空格、SQL 片段、反引号、schema 限定名等）在 `Setup` 或首个执行入口直接报错，绝不静默回退默认表名（多项目共库下静默回退会写错账本）；首尾空白自动规整。
+- 迁移记录表名 fail-closed 校验：非法表名（空格、SQL 片段、反引号、schema 限定名、纯空白、超过 63 字符等）在 `Setup`、`Lint` 或首个执行入口直接报错，绝不静默回退默认表名（多项目共库下静默回退会写错账本）；首尾空白自动规整。
 - advisory lock 获取查询出错（网络错误、上下文取消等，服务端可能已授锁）时，专属连接改为标记坏连接后物理关闭、结束会话——此前直接归还连接池，可能残留持锁会话导致其他实例长时间等锁。
-- 多项目共库保护：配置了非默认迁移记录表名时 `fresh` 直接拒绝执行——它会删除库内全部用户表（含其他项目的表和账本），此前仅有文档警告没有代码拦截。
 
 ### Migration Notes
 
 - 使用 `down` / `down-to` / `reset` / `refresh` / `fresh` 的脚本需补 `--force`。
+- 继续使用 `fresh` 还需在 `Setup`（或 `NewMigrator`）时加 `WithAllowFresh()` 显式授权，且仅限本项目独占的数据库；共库环境请勿授权。
 - 依赖「迁移目录为空即视为已最新」的旧行为会开始报错，属预期修正——请确保迁移包已被 import 进入 binary（如 `_ "yourapp/database/migrations"`）。
 - 新生成的 `add`/`update`/`drop` 迁移形态改为 raw SQL，需按提示补全 `TODO`；`migrate lint` 会拦截未补全、`AutoMigrate` 与非自包含 import。
 - `RollbackSteps` 需传正数；`down-to`/`RollbackTo` 的目标必须是已应用版本，否则报错——不会再误回滚全部。

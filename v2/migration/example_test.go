@@ -61,3 +61,42 @@ func ExampleValidateMigrationsTable() {
 	// <nil>
 	// true
 }
+
+// ExampleWithAllowFresh 演示 Fresh 的显式授权：默认禁用直接拒绝，
+// 授权后删除库内全部表并重放迁移.仅当本项目独占该数据库时才应授权.
+func ExampleWithAllowFresh() {
+	db, err := gorm.Open(sqlite.Open("file:example_allow_fresh?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		fmt.Println("open:", err)
+		return
+	}
+
+	registry := migration.NewRegistry()
+	registry.Add("2026_01_02_150405_create_users_table",
+		func(tx *gorm.DB) error {
+			return tx.Exec("CREATE TABLE users (id integer primary key)").Error
+		},
+		func(tx *gorm.DB) error {
+			return tx.Exec("DROP TABLE users").Error
+		},
+	)
+
+	// 未授权：Fresh 默认禁用.
+	m := migration.NewMigrator("database/migrations", db,
+		migration.WithRegistry(registry),
+		migration.WithLogger(&migration.NopLogger{}),
+	)
+	fmt.Println("rejected without allow:", m.Fresh(context.Background()) != nil)
+
+	// 显式授权后可执行.
+	m = migration.NewMigrator("database/migrations", db,
+		migration.WithRegistry(registry),
+		migration.WithLogger(&migration.NopLogger{}),
+		migration.WithAllowFresh(),
+	)
+	fmt.Println("fresh with allow:", m.Fresh(context.Background()))
+
+	// Output:
+	// rejected without allow: true
+	// fresh with allow: <nil>
+}
