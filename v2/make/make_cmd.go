@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// CmdMakeCMD 生成 Cobra 命令脚手架文件（make cmd）.
 var CmdMakeCMD = &cobra.Command{
 	Use:   "cmd",
 	Short: "Create a command, should be snake_case, example: make cmd backup_database",

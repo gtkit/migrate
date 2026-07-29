@@ -13,6 +13,7 @@ import (
 	gormlogger "gorm.io/gorm/logger"
 )
 
+// CmdMakeDDL 为已注册的 GORM 模型生成 strict 建表 DDL（make ddl）.
 var CmdMakeDDL = &cobra.Command{
 	Use:   "ddl [model ...]",
 	Short: "Generate strict create table DDL for registered GORM models",

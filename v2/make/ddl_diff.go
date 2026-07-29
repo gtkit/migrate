@@ -19,6 +19,7 @@ type ddlDiff struct {
 	Diff     string
 }
 
+// CmdMakeDDLDiff 比较当前模型生成的 strict DDL 与已落盘 SQL 文件（make ddl diff）.
 var CmdMakeDDLDiff = &cobra.Command{
 	Use:   "diff [model ...]",
 	Short: "Compare generated strict DDL with existing DDL files",

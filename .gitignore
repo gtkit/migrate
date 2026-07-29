@@ -1,16 +1,32 @@
-.idea/
+# 敏感文件（零容忍）
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.*
+credentials.*
+
+# 构建 / 测试产物
+bin/
+dist/
+build/
+coverage/
+coverage.out
+*.test
+*.out
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
-*.test
-*.out
 *.bak
-__MACOSX/
-.DS_Store
-.cache/
-
-.vscode/
-.Ds_Store
 *.log
+
+# OS / IDE
+.DS_Store
+.Ds_Store
+__MACOSX/
+.idea/
+.vscode/
+.cache/

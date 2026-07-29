@@ -147,11 +147,13 @@ func WithLogger(l migration.Logger) Option {
 
 // WithMigrationsTable 设置迁移记录表名（默认 "migrations"）.
 // 多项目共用同一数据库时，各项目应使用独立的记录表并配合 WithLockName 使用独立锁名，
-// 迁移账本与漂移校验互不干扰.空白字符串忽略.
+// 迁移账本与漂移校验互不干扰.
+// 表名仅允许字母、数字与下划线，不支持 schema 限定名；非法表名 Setup 会直接报错.
+// 空白字符串忽略.
 func WithMigrationsTable(name string) Option {
 	return func(c *Config) {
-		if strings.TrimSpace(name) != "" {
-			c.MigrationsTable = name
+		if trimmed := strings.TrimSpace(name); trimmed != "" {
+			c.MigrationsTable = trimmed
 		}
 	}
 }
@@ -193,6 +195,13 @@ func Setup(db *gorm.DB, opts ...Option) error {
 
 	for _, opt := range opts {
 		opt(cfg)
+	}
+
+	// 表名会被拼入 SQL：配置期就 fail-closed，避免运行命令时才发现（或静默写错账本）.
+	if cfg.MigrationsTable != "" {
+		if err := migration.ValidateMigrationsTable(cfg.MigrationsTable); err != nil {
+			return fmt.Errorf("migrate: %w", err)
+		}
 	}
 
 	app.Store(cfg)
@@ -252,12 +261,14 @@ var CmdMigrate = &cobra.Command{
 	Short: "Run database migration",
 }
 
+// CmdMigrateUp 执行所有未运行的迁移（up）.
 var CmdMigrateUp = &cobra.Command{
 	Use:   "up",
 	Short: "Run unmigrated migrations",
 	RunE:  runUp,
 }
 
+// CmdMigrateRollback 回滚最后一个批次的迁移（down/rollback，需 --force）.
 var CmdMigrateRollback = &cobra.Command{
 	Use:     "down",
 	Aliases: []string{"rollback"},
@@ -265,42 +276,49 @@ var CmdMigrateRollback = &cobra.Command{
 	RunE:    runDown,
 }
 
+// CmdMigrateReset 回滚全部迁移（reset，需 --force）.
 var CmdMigrateReset = &cobra.Command{
 	Use:   "reset",
 	Short: "Rollback all database migrations",
 	RunE:  runReset,
 }
 
+// CmdMigrateRefresh 回滚全部迁移后重新执行（refresh，需 --force）.
 var CmdMigrateRefresh = &cobra.Command{
 	Use:   "refresh",
 	Short: "Reset and re-run all migrations",
 	RunE:  runRefresh,
 }
 
+// CmdMigrateFresh 删除库内所有表并重新执行全部迁移（fresh，需 --force；仅限本项目独占的数据库）.
 var CmdMigrateFresh = &cobra.Command{
 	Use:   "fresh",
 	Short: "Drop all tables and re-run all migrations",
 	RunE:  runFresh,
 }
 
+// CmdMigrateStatus 显示每个迁移的执行状态（status）.
 var CmdMigrateStatus = &cobra.Command{
 	Use:   "status",
 	Short: "Show the status of each migration",
 	RunE:  runStatus,
 }
 
+// CmdMigratePending 列出待执行的迁移（pending，dry-run）.
 var CmdMigratePending = &cobra.Command{
 	Use:   "pending",
 	Short: "Show pending migrations that would be executed by 'up' (dry-run)",
 	RunE:  runPending,
 }
 
+// CmdMigrateLint 检查迁移文件、注册表与已应用记录的一致性与回滚风险（lint）.
 var CmdMigrateLint = &cobra.Command{
 	Use:   "lint",
 	Short: "Lint migration files, registry, and applied records for drift and rollback risk",
 	RunE:  runLint,
 }
 
+// CmdMigrateDownTo 回滚所有版本高于目标的迁移（down-to，需 --force，目标须已应用）.
 var CmdMigrateDownTo = &cobra.Command{
 	Use:   "down-to <version>",
 	Short: "Roll back all migrations newer than <version> (exclusive)",
@@ -308,6 +326,7 @@ var CmdMigrateDownTo = &cobra.Command{
 	RunE:  runDownTo,
 }
 
+// CmdMigrateMarkApplied 将 pending 迁移标记为已应用而不执行（mark-applied，baseline 存量库，需 --force）.
 var CmdMigrateMarkApplied = &cobra.Command{
 	Use:   "mark-applied",
 	Short: "Mark pending migrations as applied WITHOUT running them (baseline an existing database)",

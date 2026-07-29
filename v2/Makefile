@@ -13,7 +13,18 @@ check: ## Check vulnerabilities
 	gosec ./...
 
 tag: ## Bump patch version and push tag
-	@current=$$(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' version.go | head -n1 | tr -d 'v'); \
+	@set -e; \
+	if [ -n "$$(git status --porcelain)" ]; then \
+		echo "✗ 工作区不干净，发版前请先提交或清理："; git status --short; exit 1; \
+	fi; \
+	echo "▶️ go vet"; go vet ./...; \
+	echo "▶️ golangci-lint"; golangci-lint run ./...; \
+	echo "▶️ 测试 (race)"; go test -race -count=1 -timeout=5m ./...; \
+	echo "▶️ govulncheck"; govulncheck ./...; \
+	if ! grep -q '^## \[Unreleased\]' ../CHANGELOG.md; then \
+		echo "✗ CHANGELOG.md 缺少 [Unreleased] 区段"; exit 1; \
+	fi; \
+	current=$$(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' version.go | head -n1 | tr -d 'v'); \
 	if [ -z "$$current" ]; then echo "version not found in version.go"; exit 1; fi; \
 	maj=$$(echo $$current | cut -d. -f1); \
 	min=$$(echo $$current | cut -d. -f2); \

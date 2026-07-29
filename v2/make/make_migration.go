@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// CmdMakeMigration 生成迁移文件（make migration），create 动作同时生成 model 脚手架.
 var CmdMakeMigration = &cobra.Command{
 	Use:   "migration",
 	Short: "Create a migration file, example: make migration add_users_table",

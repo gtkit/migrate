@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -23,6 +24,7 @@ type Migrator struct {
 	lockName    string
 	lockTimeout time.Duration
 	tableName   string
+	configErr   error // 构造期配置错误（如非法表名），所有执行入口 fail-closed 返回
 	registry    *Registry
 	logger      Logger
 }
@@ -72,13 +74,30 @@ func WithRegistry(r *Registry) MigratorOption {
 // WithMigrationsTable 设置迁移记录表名（默认 "migrations"）.
 // 当同一数据库被多个项目共用时，各项目应使用独立的记录表（并配合 WithLockName
 // 使用独立锁名），迁移账本与一致性校验互不干扰.
-// 传入空白字符串时忽略，保持默认.
+// 表名仅允许字母、数字与下划线（见 ValidateMigrationsTable），不支持 schema 限定名；
+// 非法表名会使所有迁移入口 fail-closed 报错.传入空白字符串时忽略，保持默认.
 func WithMigrationsTable(name string) MigratorOption {
 	return func(m *Migrator) {
-		if strings.TrimSpace(name) != "" {
-			m.tableName = name
+		if trimmed := strings.TrimSpace(name); trimmed != "" {
+			m.tableName = trimmed
 		}
 	}
+}
+
+// migrationsTablePattern 迁移记录表名白名单：普通标识符，不支持 schema.table.
+var migrationsTablePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// ValidateMigrationsTable 校验迁移记录表名是否合法.
+// 仅允许字母、数字与下划线且不以数字开头；不支持 schema 限定名（如 "public.migrations"）.
+// 表名会被拼入 SQL，非法字符（空格、反引号、分号等）会被 GORM 当作 SQL 表达式处理，必须拒绝.
+func ValidateMigrationsTable(name string) error {
+	if !migrationsTablePattern.MatchString(name) {
+		return fmt.Errorf(
+			"invalid migrations table name %q: only letters, digits and underscores are allowed (schema-qualified names are not supported)",
+			name,
+		)
+	}
+	return nil
 }
 
 const (
@@ -105,6 +124,10 @@ func NewMigrator(folder string, db *gorm.DB, opts ...MigratorOption) *Migrator {
 		opt(m)
 	}
 
+	// 选项无法返回错误：非法表名记入 configErr，由 Setup/Fresh 等入口 fail-closed 返回，
+	// 绝不静默回退默认表名（多项目共库下写错账本比报错危险得多）.
+	m.configErr = ValidateMigrationsTable(m.tableName)
+
 	// 所有选项应用完成后再构建锁，避免 WithLockName 与 WithLockTimeout 的顺序依赖.
 	m.lock = newLock(db, dbType, m.lockName, m.lockTimeout)
 
@@ -114,6 +137,9 @@ func NewMigrator(folder string, db *gorm.DB, opts ...MigratorOption) *Migrator {
 // Setup 创建迁移记录表（如不存在），表名由 WithMigrationsTable 配置.
 // 并发安全：如果多个进程同时调用，重复创建会被忽略.
 func (m *Migrator) Setup(ctx context.Context) error {
+	if m.configErr != nil {
+		return m.configErr
+	}
 	if m.DB == nil {
 		return errors.New("migrate: database connection is required")
 	}
@@ -296,8 +322,21 @@ func (m *Migrator) Refresh(ctx context.Context) error {
 }
 
 // Fresh 删除所有表并重新执行所有迁移.
-// ⚠️ 危险操作：会丢失所有数据.
+// ⚠️ 危险操作：会丢失所有数据.仅允许在本项目独占的数据库上使用：
+// 配置了非默认迁移记录表名（多项目共库信号）时直接拒绝执行.
 func (m *Migrator) Fresh(ctx context.Context) error {
+	// Fresh 不经 Setup 且先删表，配置错误必须在此独立拦截.
+	if m.configErr != nil {
+		return m.configErr
+	}
+	// fresh 删除的是库内全部用户表——包括其他项目的业务表和迁移账本.
+	// 自定义记录表名表明多项目共库，此时执行 fresh 是跨项目破坏，代码级拒绝.
+	if m.tableName != defaultTableName {
+		return fmt.Errorf(
+			"fresh is disabled when a custom migrations table (%q) is configured: it drops ALL tables in the database, including other projects'; run it only with the default table on a database this project owns exclusively",
+			m.tableName,
+		)
+	}
 	// 删表前先做完整执行校验：空 registry / 重复名 / nil Up 都在删表之前拦下，绝不删光数据却不重建.
 	if err := m.validateRegistryForExecution(); err != nil {
 		return err

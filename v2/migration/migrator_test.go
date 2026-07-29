@@ -690,3 +690,99 @@ func TestMigratorMultiProjectSharedDatabase(t *testing.T) {
 		t.Fatalf("project A ledger should be untouched by B's rollback")
 	}
 }
+
+// TestValidateMigrationsTable 验证表名白名单：非法输入 fail-closed，不支持 schema 限定名.
+func TestValidateMigrationsTable(t *testing.T) {
+	valid := []string{"migrations", "migrations_svc", "_ledger", "M1"}
+	for _, name := range valid {
+		if err := ValidateMigrationsTable(name); err != nil {
+			t.Fatalf("%q should be valid: %v", name, err)
+		}
+	}
+
+	invalid := []string{
+		"",
+		"ledger AS l",
+		"migrations; DROP TABLE users",
+		"`migrations`",
+		"public.migrations", // schema 限定名不支持
+		"1migrations",
+		"migrations-svc",
+	}
+	for _, name := range invalid {
+		if err := ValidateMigrationsTable(name); err == nil {
+			t.Fatalf("%q should be rejected", name)
+		}
+	}
+}
+
+// TestMigratorInvalidTableNameFailsClosed 验证非法表名使执行入口报错且不产生任何数据库操作.
+func TestMigratorInvalidTableNameFailsClosed(t *testing.T) {
+	db := openExecTestDB(t, "migrator_invalid_table")
+
+	noop := func(*gorm.DB) error { return nil }
+	registry := NewRegistry()
+	registry.Add("2026_03_24_120000_create_a_table", noop, noop)
+
+	m := NewMigrator(t.TempDir(), db, WithRegistry(registry), WithMigrationsTable("ledger AS l"))
+
+	if err := m.Up(t.Context()); err == nil {
+		t.Fatalf("Up should fail-closed on invalid table name")
+	}
+	if err := m.Fresh(t.Context()); err == nil {
+		t.Fatalf("Fresh should fail-closed on invalid table name")
+	}
+
+	var tables []string
+	if err := db.Raw("SELECT name FROM sqlite_master WHERE type='table'").Scan(&tables).Error; err != nil {
+		t.Fatalf("list tables: %v", err)
+	}
+	if len(tables) != 0 {
+		t.Fatalf("no table should be created under invalid config, got %v", tables)
+	}
+}
+
+// TestMigratorTableNameTrimmed 验证表名首尾空白被规整后正常使用.
+func TestMigratorTableNameTrimmed(t *testing.T) {
+	db := openExecTestDB(t, "migrator_table_trimmed")
+
+	noop := func(*gorm.DB) error { return nil }
+	registry := NewRegistry()
+	f := "2026_03_24_120000_create_a_table"
+	dir := t.TempDir()
+	writeMigrationFile(t, dir, f, "package migrations\n")
+	registry.Add(f, noop, noop)
+
+	m := NewMigrator(dir, db, WithRegistry(registry), WithMigrationsTable("  migrations_trim  "))
+	if err := m.Up(t.Context()); err != nil {
+		t.Fatalf("up with trimmed table name: %v", err)
+	}
+	if !db.Migrator().HasTable("migrations_trim") {
+		t.Fatalf("expected trimmed table name migrations_trim to be used")
+	}
+}
+
+// TestMigratorFreshRejectedWithCustomTable 验证自定义记录表名（共库信号）下 Fresh 拒绝执行且不删表.
+func TestMigratorFreshRejectedWithCustomTable(t *testing.T) {
+	db := openExecTestDB(t, "migrator_fresh_custom_table")
+
+	// 先造一张"其他项目"的表，验证 Fresh 被拦截后它安然无恙.
+	if err := db.Exec("CREATE TABLE other_project_data (id integer primary key)").Error; err != nil {
+		t.Fatalf("create other table: %v", err)
+	}
+
+	noop := func(*gorm.DB) error { return nil }
+	registry := NewRegistry()
+	f := "2026_03_24_120000_create_a_table"
+	dir := t.TempDir()
+	writeMigrationFile(t, dir, f, "package migrations\n")
+	registry.Add(f, noop, noop)
+
+	m := NewMigrator(dir, db, WithRegistry(registry), WithMigrationsTable("migrations_svc"))
+	if err := m.Fresh(t.Context()); err == nil {
+		t.Fatalf("Fresh must be rejected with a custom migrations table")
+	}
+	if !db.Migrator().HasTable("other_project_data") {
+		t.Fatalf("Fresh rejection must not drop any table")
+	}
+}

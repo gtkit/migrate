@@ -749,9 +749,14 @@ migrate.Setup(db,
 ```
 
 - `WithLockName`：不同 lock name 生成不同的 advisory lock key，各项目迁移互不阻塞。
-- `WithMigrationsTable`：各项目使用独立的迁移记录表（默认 `migrations`）。**必须配置**——若共用同一张记录表，项目 B 的漂移校验会把项目 A 的记录判为"已应用但未注册"而拒绝执行。
+- `WithMigrationsTable`：各项目使用独立的迁移记录表（默认 `migrations`）。**必须配置**——若共用同一张记录表，项目 B 的漂移校验会把项目 A 的记录判为"已应用但未注册"而拒绝执行。表名仅允许字母、数字与下划线（不支持 `schema.table`），非法表名 `Setup` 直接报错。
 
 编程式调用使用 `migration.WithMigrationsTable(...)` MigratorOption，效果相同。
+
+共库时的额外约束：
+
+- **`fresh` 被禁用**：配置了非默认记录表名后，`fresh` 直接拒绝执行——它会删除库内**全部**用户表（包括其他项目的表和账本），只允许在本项目独占的数据库上用默认表名执行。
+- **跨项目外键 / 共享表需要串行化**：独立锁名意味着两个项目可以并发执行各自的 DDL。若项目间存在跨项目外键或共享表，请给相关项目配置**相同的** `WithLockName`，用同一把锁把迁移串行化。
 
 ## 编程式调用
 

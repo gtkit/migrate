@@ -141,66 +141,60 @@ func TestMigratorLintDestructiveAndCleanMigration(t *testing.T) {
 	}
 }
 
-func TestMigratorLintOnlineDDLIgnoresComments(t *testing.T) {
-	db := openExecTestDB(t, t.Name())
-
-	dir := t.TempDir()
-	// 注释里有 ALGORITHM/LOCK 关键词，但真实 SQL 字符串没有 → 仍应报 missing_online_ddl。
-	commentOnly := "2026_03_24_120000_add_a_to_users_table"
-	writeMigrationFile(t, dir, commentOnly,
-		"package migrations\n\nfunc up() {\n\t// 建议标注 ALGORITHM=INPLACE, LOCK=NONE\n\t_ = \"ALTER TABLE `users` ADD COLUMN `a` INT\"\n}\n")
-	// SQL 字符串里同时含 ALGORITHM 与 LOCK → 不应报。
-	proper := "2026_03_24_120001_add_b_to_users_table"
-	writeMigrationFile(t, dir, proper,
-		"package migrations\n\nfunc up() { _ = \"ALTER TABLE `users` ADD COLUMN `b` INT, ALGORITHM=INPLACE, LOCK=NONE\" }\n")
-
-	registry := NewRegistry()
-	noop := func(*gorm.DB) error { return nil }
-	registry.Add(commentOnly, noop, noop)
-	registry.Add(proper, noop, noop)
-
-	report, err := newMySQLLintMigrator(dir, db, registry).Lint(t.Context(), LintOptions{SkipDatabase: true})
-	if err != nil {
-		t.Fatalf("lint: %v", err)
+// TestMigratorLintOnlineDDLDetection 验证在线 DDL 判定：Go/SQL 注释里的
+// ALGORITHM/LOCK 关键词不算已标注策略，只有真实 SQL 子句才算.
+func TestMigratorLintOnlineDDLDetection(t *testing.T) {
+	cases := []struct {
+		name        string
+		content     string
+		wantFlagged bool
+	}{
+		{
+			// Go 注释里有关键词，真实 SQL 字符串没有 → 仍应报.
+			name:        "go_comment_only",
+			content:     "package migrations\n\nfunc up() {\n\t// 建议标注 ALGORITHM=INPLACE, LOCK=NONE\n\t_ = \"ALTER TABLE `users` ADD COLUMN `a` INT\"\n}\n",
+			wantFlagged: true,
+		},
+		{
+			// 在线 DDL 策略写在 SQL 块注释里 → 仍应报.
+			name:        "sql_comment_only",
+			content:     "package migrations\n\nfunc up() { _ = \"ALTER TABLE users ADD COLUMN x INT /* ALGORITHM=INPLACE, LOCK=NONE */\" }\n",
+			wantFlagged: true,
+		},
+		{
+			// SQL 字符串里是真实的 ALGORITHM 与 LOCK 子句 → 不应报.
+			name:        "real_clause",
+			content:     "package migrations\n\nfunc up() { _ = \"ALTER TABLE `users` ADD COLUMN `b` INT, ALGORITHM=INPLACE, LOCK=NONE\" }\n",
+			wantFlagged: false,
+		},
 	}
 
-	assertLintHasIssue(t, report.Issues, "missing_online_ddl", commentOnly)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openExecTestDB(t, t.Name())
+			dir := t.TempDir()
+			file := "2026_03_24_120000_add_a_to_users_table"
+			writeMigrationFile(t, dir, file, tc.content)
 
-	for _, issue := range report.Issues {
-		if issue.Name == proper && issue.Code == "missing_online_ddl" {
-			t.Fatalf("SQL with real ALGORITHM+LOCK must not be flagged, got: %s", issue.Message)
-		}
-	}
-}
+			registry := NewRegistry()
+			noop := func(*gorm.DB) error { return nil }
+			registry.Add(file, noop, noop)
 
-func TestMigratorLintOnlineDDLIgnoresSQLComments(t *testing.T) {
-	db := openExecTestDB(t, t.Name())
+			report, err := newMySQLLintMigrator(dir, db, registry).Lint(t.Context(), LintOptions{SkipDatabase: true})
+			if err != nil {
+				t.Fatalf("lint: %v", err)
+			}
 
-	dir := t.TempDir()
-	// 在线 DDL 策略写在 SQL 块注释里 → 应仍报 missing_online_ddl.
-	commented := "2026_03_24_120000_add_a_to_users_table"
-	writeMigrationFile(t, dir, commented,
-		"package migrations\n\nfunc up() { _ = \"ALTER TABLE users ADD COLUMN x INT /* ALGORITHM=INPLACE, LOCK=NONE */\" }\n")
-	// 真实子句（非注释）→ 不应报.
-	real := "2026_03_24_120001_add_b_to_users_table"
-	writeMigrationFile(t, dir, real,
-		"package migrations\n\nfunc up() { _ = \"ALTER TABLE users ADD COLUMN y INT, ALGORITHM=INPLACE, LOCK=NONE\" }\n")
-
-	registry := NewRegistry()
-	noop := func(*gorm.DB) error { return nil }
-	registry.Add(commented, noop, noop)
-	registry.Add(real, noop, noop)
-
-	report, err := newMySQLLintMigrator(dir, db, registry).Lint(t.Context(), LintOptions{SkipDatabase: true})
-	if err != nil {
-		t.Fatalf("lint: %v", err)
-	}
-
-	assertLintHasIssue(t, report.Issues, "missing_online_ddl", commented)
-	for _, issue := range report.Issues {
-		if issue.Name == real && issue.Code == "missing_online_ddl" {
-			t.Fatalf("real ALGORITHM+LOCK clause must not be flagged, got: %s", issue.Message)
-		}
+			flagged := false
+			for _, issue := range report.Issues {
+				if issue.Name == file && issue.Code == "missing_online_ddl" {
+					flagged = true
+				}
+			}
+			if flagged != tc.wantFlagged {
+				t.Fatalf("missing_online_ddl flagged = %v, want %v; issues: %#v", flagged, tc.wantFlagged, report.Issues)
+			}
+		})
 	}
 }
 

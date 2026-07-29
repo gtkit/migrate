@@ -73,10 +73,14 @@ func (l *mysqlLock) Acquire(ctx context.Context) (func(), error) {
 
 	var result sql.NullInt64
 	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", l.lockName, timeoutSec).Scan(&result); err != nil {
+		// 查询出错（网络/取消）时服务端可能已授锁而客户端不知道：
+		// 标坏连接物理关闭、结束会话，未确认的锁随会话释放，绝不带锁归还连接池.
+		markBadConn(conn)
 		_ = conn.Close()
 		return nil, fmt.Errorf("acquire mysql lock %q: %w", l.lockName, err)
 	}
 	if !result.Valid || result.Int64 != 1 {
+		// 服务端明确拒绝（等待超时），连接状态确定，可正常归还.
 		_ = conn.Close()
 		return nil, fmt.Errorf("failed to acquire mysql advisory lock %q (timeout %ds)", l.lockName, timeoutSec)
 	}
@@ -119,13 +123,15 @@ func (l *postgresLock) Acquire(ctx context.Context) (func(), error) {
 	// pg_advisory_lock 不受 lock_timeout 约束，用 statement_timeout 给获取锁的语句加超时.
 	timeoutMS := max(int64(1), l.timeout.Milliseconds())
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET statement_timeout = %d", timeoutMS)); err != nil {
+		// SET 出错后会话状态不确定，物理关闭，不归还连接池.
+		markBadConn(conn)
 		_ = conn.Close()
 		return nil, fmt.Errorf("set postgres lock statement_timeout: %w", err)
 	}
 	if _, err := conn.ExecContext(ctx, "SELECT pg_advisory_lock($1)", l.lockKey); err != nil {
-		// 获取失败（常见为等锁超时）也必须先复位会话超时：Close 会把连接归还池，
-		// 带着 statement_timeout 回池会让复用它的业务查询被莫名取消.
-		resetStatementTimeout(conn)
+		// 出错时服务端可能已授锁（网络错误），且会话还带着 statement_timeout：
+		// 标坏连接物理关闭、结束会话——未确认的锁与超时设置随会话一并消失，绝不归还连接池.
+		markBadConn(conn)
 		_ = conn.Close()
 		return nil, fmt.Errorf("acquire postgres lock (key=%d, timeout %dms): %w", l.lockKey, timeoutMS, err)
 	}
@@ -148,14 +154,20 @@ func (l *postgresLock) Acquire(ctx context.Context) (func(), error) {
 	return release, nil
 }
 
-// resetStatementTimeout 将连接的会话级 statement_timeout 复位为 0.
+// markBadConn 将专属连接标记为坏连接：随后的 Close 会物理关闭并结束数据库会话，
+// 而非归还连接池.用于锁状态或会话状态不确定的场景（未确认的锁随会话结束而释放）.
+func markBadConn(conn *sql.Conn) {
+	_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+}
+
+// resetStatementTimeout 将连接的会话级 statement_timeout 复位为 0（锁释放正常路径使用）.
 // 使用独立超时上下文（不受业务 ctx 取消影响）；复位失败时标记坏连接，
 // 使随后的 Close 物理关闭而非归还连接池，绝不让带超时设置的连接被业务复用.
 func resetStatementTimeout(conn *sql.Conn) {
 	ctx, cancel := context.WithTimeout(context.Background(), lockReleaseTimeout)
 	defer cancel()
 	if _, err := conn.ExecContext(ctx, "SET statement_timeout = 0"); err != nil {
-		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		markBadConn(conn)
 	}
 }
 

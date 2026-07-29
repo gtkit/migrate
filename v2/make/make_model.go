@@ -4,6 +4,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// CmdMakeModel 生成 model 与 repository 脚手架（make model）.
 var CmdMakeModel = &cobra.Command{
 	Use:   "model",
 	Short: "Create model file, example: make model user",
