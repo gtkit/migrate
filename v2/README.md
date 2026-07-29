@@ -735,7 +735,9 @@ migrate.Setup(db, migrate.WithLogger(&migration.NopLogger{}))
 
 ## 多项目共用数据库
 
-当多个服务共享同一个数据库时，必须同时隔离**迁移锁**与**迁移记录表**：
+当多个服务共享同一个数据库时，规则分两条：**迁移记录表必须按项目隔离**；**迁移锁按实际 DDL 资源边界选择**——项目间无共享表/跨项目外键时用独立锁名（互不阻塞），存在共享 DDL 资源时给相关项目配相同锁名（串行化，见下文）。
+
+无共享资源的典型配置（独立锁）：
 
 ```go
 // user-service
@@ -751,7 +753,7 @@ migrate.Setup(db,
 )
 ```
 
-- `WithLockName`：不同 lock name 生成不同的 advisory lock key，各项目迁移互不阻塞。
+- `WithLockName`：不同 lock name 生成不同的 advisory lock key，各项目迁移互不阻塞；仅适用于项目间无共享 DDL 资源的场景。
 - `WithMigrationsTable`：各项目使用独立的迁移记录表（默认 `migrations`）。**必须配置**——若共用同一张记录表，项目 B 的漂移校验会把项目 A 的记录判为"已应用但未注册"而拒绝执行。表名仅允许字母、数字与下划线且不超过 63 字符（不支持 `schema.table`）；空白或非法表名 `Setup` 直接报错，绝不静默回退默认账本。
 
 编程式调用使用 `migration.WithMigrationsTable(...)` MigratorOption，效果相同。

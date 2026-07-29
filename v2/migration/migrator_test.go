@@ -880,3 +880,77 @@ func TestMigratorUpIgnoresDBFieldMutation(t *testing.T) {
 		t.Fatalf("mutating the exported DB field must not redirect execution")
 	}
 }
+
+// TestMigratorRefreshReRunsAllMigrations 验证 Refresh 全量回滚后重放：表重建、账本重置为单批次.
+func TestMigratorRefreshReRunsAllMigrations(t *testing.T) {
+	db := openExecTestDB(t, "migrator_refresh")
+
+	registry := NewRegistry()
+	f := "2026_03_24_120000_create_a_table"
+	dir := t.TempDir()
+	writeMigrationFile(t, dir, f, "package migrations\n")
+	registry.Add(f,
+		func(tx *gorm.DB) error { return tx.Exec("CREATE TABLE a (id integer primary key)").Error },
+		func(tx *gorm.DB) error { return tx.Exec("DROP TABLE a").Error },
+	)
+
+	m := NewMigrator(dir, db, WithRegistry(registry))
+	if err := m.Up(t.Context()); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+	if err := m.Refresh(t.Context()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if !db.Migrator().HasTable("a") {
+		t.Fatalf("table should be re-created after refresh")
+	}
+	var n int64
+	db.Model(&Migration{}).Count(&n)
+	if n != 1 {
+		t.Fatalf("ledger should hold exactly one record after refresh, got %d", n)
+	}
+}
+
+// TestMigratorRollbackEmptyLedger 验证空账本下 Rollback/Reset 直接成功且无副作用.
+func TestMigratorRollbackEmptyLedger(t *testing.T) {
+	db := openExecTestDB(t, "migrator_rollback_empty")
+
+	noop := func(*gorm.DB) error { return nil }
+	registry := NewRegistry()
+	registry.Add("2026_03_24_120000_create_a_table", noop, noop)
+
+	m := NewMigrator(t.TempDir(), db, WithRegistry(registry))
+	if err := m.Rollback(t.Context()); err != nil {
+		t.Fatalf("rollback on empty ledger should be a no-op: %v", err)
+	}
+	if err := m.Reset(t.Context()); err != nil {
+		t.Fatalf("reset on empty ledger should be a no-op: %v", err)
+	}
+}
+
+// TestMigratorRollbackRecoversFromDownPanic 验证 Down panic 被捕获为错误且记录保留.
+func TestMigratorRollbackRecoversFromDownPanic(t *testing.T) {
+	db := openExecTestDB(t, "migrator_down_panic")
+
+	registry := NewRegistry()
+	f := "2026_03_24_120000_create_p_table"
+	registry.Add(f,
+		func(tx *gorm.DB) error { return tx.Exec("CREATE TABLE p (id integer primary key)").Error },
+		func(*gorm.DB) error { panic("boom") },
+	)
+
+	m := NewMigrator(t.TempDir(), db, WithRegistry(registry))
+	if err := m.Up(t.Context()); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+
+	err := m.Rollback(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "panicked") {
+		t.Fatalf("down panic should surface as an error, got: %v", err)
+	}
+	var n int64
+	db.Model(&Migration{}).Count(&n)
+	if n != 1 {
+		t.Fatalf("migration record must be kept when down panics, got %d", n)
+	}
+}

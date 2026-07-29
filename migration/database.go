@@ -17,7 +17,7 @@ const (
 
 // DetectDBType 从 GORM Dialector 自动检测数据库类型.
 func DetectDBType(db *gorm.DB) DBType {
-	name := db.Dialector.Name()
+	name := db.Name()
 	switch name {
 	case "mysql":
 		return DBTypeMySQL
