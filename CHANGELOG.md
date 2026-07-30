@@ -46,6 +46,7 @@
 - `migrate fresh`：MySQL 删表时的 `SET foreign_key_checks=0` → 删表 → 恢复 `=1` 改为固定在同一专属连接上执行；恢复使用独立超时上下文（业务上下文取消后仍尝试复位），恢复失败、以及关闭外键检查本身因网络错误/取消而执行结果未知时，都将该连接标记坏连接并物理关闭结束会话——任何情况下都不会把外键检查状态不确定的连接归还连接池污染业务查询。此前经连接池分发可能使关闭态落不到删表连接，或将关闭态残留污染被业务复用的池内连接。
 - `migrate fresh`：清理范围补齐视图并限定 schema——MySQL 区分 BASE TABLE 与 VIEW 分别用 `DROP TABLE`/`DROP VIEW`（此前库中存在视图会因对视图执行 `DROP TABLE` 而失败）；PostgreSQL 的查询与 DROP 都显式限定 `public`，不再依赖 `search_path`，其他 schema 的同名表绝不受影响；SQLite 一并删除视图。残留视图导致重放 `CREATE VIEW` 冲突的问题一并消除。
 - `migration.CurrentDatabase` 与 `migration.DetectDBType` 传入 nil、零值或未初始化的 `*gorm.DB` 时返回空值，不再 panic（零值 `gorm.DB` 上访问经嵌入 `Config` 提升的 `Dialector` 字段此前会 nil 解引用）。
+- 空迁移账本不再触发 GORM `record not found` 误报日志：`Rollback` 与批次号查询改用 `Limit(1).Find` 替代 `First`——空账本是正常状态（如新库首次操作），`First` 产生的 `ErrRecordNotFound` 会被 GORM 默认 logger 打成错误日志、污染生产监控。
 - `migrate fresh`：修复上述同连接删表在真实 MySQL（非空库）上因 `db.Connection` 内调用 `Migrator().DropTable` 返回 `invalid db` 而失败的问题（`db.Connection` 提供的是 `*sql.Conn`，Migrator 需 `*sql.DB`），改为在该连接上直接执行 raw `DROP TABLE`。由新增的真实 MySQL 集成测试发现并覆盖。
 - `migrate lint`：修复在线 DDL 检查可被 SQL 注释绕过的问题——`ALTER TABLE ... /* ALGORITHM=INPLACE, LOCK=NONE */` 此前因注释含关键词被判为合规；现改为判定前先剥离 SQL 注释（`/* */` 与 `--`）。
 - `migrate lint`：进一步修复在线 DDL 误判——改为匹配真实子句 `ALGORITHM\s*=`/`LOCK\s*=`（不再把列名 `algorithm`/`lock`、字符串值或 `#` 注释里的关键词当作已标注策略），并剥离 MySQL `#` 行注释。

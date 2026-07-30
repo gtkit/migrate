@@ -245,14 +245,17 @@ func (m *Migrator) Rollback(ctx context.Context) error {
 	}
 	defer release()
 
-	// 获取最后一批次的迁移记录
-	lastMigration := Migration{}
-	if err := m.records(ctx).Order("id DESC").First(&lastMigration).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil // 没有迁移记录
-		}
+	// 获取最后一批次的迁移记录.
+	// 用 Limit(1).Find 而非 First：空账本是正常状态（如新库首次操作），
+	// First 会触发 gorm.ErrRecordNotFound，被 GORM 默认 logger 打成错误日志污染监控.
+	var lastMigrations []Migration
+	if err := m.records(ctx).Order("id DESC").Limit(1).Find(&lastMigrations).Error; err != nil {
 		return fmt.Errorf("get last migration: %w", err)
 	}
+	if len(lastMigrations) == 0 {
+		return nil // 没有迁移记录
+	}
+	lastMigration := lastMigrations[0]
 
 	var migrations []Migration
 	if err := m.records(ctx).
@@ -752,14 +755,16 @@ func (m *Migrator) runDownMigration(ctx context.Context, mfile MigrationFile, re
 
 // getBatch 获取下一个批次号.
 func (m *Migrator) getBatch(ctx context.Context) (int, error) {
-	var lastMigration Migration
-	err := m.records(ctx).Order("id DESC").First(&lastMigration).Error
+	// 同 Rollback：空账本正常，避免 First 触发 ErrRecordNotFound 误报日志.
+	var lastMigrations []Migration
+	err := m.records(ctx).Order("id DESC").Limit(1).Find(&lastMigrations).Error
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return 1, nil
-		}
 		return 0, fmt.Errorf("get last batch: %w", err)
 	}
+	if len(lastMigrations) == 0 {
+		return 1, nil
+	}
+	lastMigration := lastMigrations[0]
 	return lastMigration.Batch + 1, nil
 }
 
