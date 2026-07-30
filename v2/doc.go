@@ -18,8 +18,9 @@
 // `_ "yourapp/database/migrations"` 空导入）.
 //
 // 破坏性命令双层保护：down/reset/refresh/fresh 运行时必须加 --force；
-// fresh 会删除库内全部用户表，额外要求 Setup 时经 WithAllowFresh 显式授权
-// （仅限本项目独占的数据库），否则直接拒绝执行.
+// fresh 会删除库内全部用户表与视图（PostgreSQL 仅 public schema），
+// 额外要求 Setup 时经 WithAllowFresh 显式授权（仅限本项目独占的数据库），
+// 否则直接拒绝执行.
 //
 // 并发安全：多实例同时执行迁移时通过数据库 advisory lock 串行化
 // （MySQL GET_LOCK / PostgreSQL pg_advisory_lock；SQLite 无锁，仅限单进程）.

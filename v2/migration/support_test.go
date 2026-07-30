@@ -15,10 +15,14 @@ type fakeDialector struct{ gorm.Dialector }
 
 func (fakeDialector) Name() string { return "oracle" }
 
-// TestDetectDBTypeVariants 验证方言检测：nil 保护、MySQL/PostgreSQL 识别、未知方言透传.
+// TestDetectDBTypeVariants 验证方言检测：nil/零值保护、MySQL/PostgreSQL 识别、未知方言透传.
 func TestDetectDBTypeVariants(t *testing.T) {
 	if got := DetectDBType(nil); got != DBType("") {
 		t.Fatalf("nil db should yield empty DBType, got %q", got)
+	}
+	// 真零值：Config 为 nil，访问提升字段 Dialector 若不先判 Config 会 panic.
+	if got := DetectDBType(&gorm.DB{}); got != DBType("") {
+		t.Fatalf("zero-value db should yield empty DBType, got %q", got)
 	}
 	cases := map[DBType]gorm.Dialector{
 		DBTypeMySQL:      mysql.Dialector{},
@@ -101,4 +105,44 @@ func TestDefaultLoggerDoesNotPanic(t *testing.T) {
 	l.Info("info message", "key", "value")
 	l.Warn("warn message", "key", "value", "dangling")
 	l.Error("error message")
+}
+
+// TestCurrentDatabaseNilSafe 验证导出函数对 nil/零值/未初始化输入返回空串而非 panic.
+// 必须覆盖真零值 &gorm.DB{}：Dialector 是经嵌入指针 Config 提升的字段，
+// Config 为 nil 时守卫若直接访问 db.Dialector 本身就会 panic.
+func TestCurrentDatabaseNilSafe(t *testing.T) {
+	for name, db := range map[string]*gorm.DB{
+		"nil":           nil,
+		"zero_value":    {},
+		"nil_dialector": {Config: &gorm.Config{}},
+	} {
+		if got := CurrentDatabase(db); got != "" {
+			t.Fatalf("CurrentDatabase(%s) should be empty, got %q", name, got)
+		}
+	}
+}
+
+// TestDeleteAllTablesSQLiteDropsViews 验证 SQLite 的 fresh 清理包含视图：
+// 残留视图会使重放中的 CREATE VIEW 冲突.
+func TestDeleteAllTablesSQLiteDropsViews(t *testing.T) {
+	db := openExecTestDB(t, "sqlite_views")
+	if err := db.Exec("CREATE TABLE base_t (id integer primary key)").Error; err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if err := db.Exec("CREATE VIEW v_base AS SELECT id FROM base_t").Error; err != nil {
+		t.Fatalf("create view: %v", err)
+	}
+
+	if err := DeleteAllTables(db); err != nil {
+		t.Fatalf("delete all tables with a view present: %v", err)
+	}
+
+	var n int64
+	if err := db.Raw("SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table','view') AND name != 'sqlite_sequence'").
+		Scan(&n).Error; err != nil {
+		t.Fatalf("count objects: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected empty schema after DeleteAllTables, got %d objects", n)
+	}
 }

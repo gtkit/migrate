@@ -10,8 +10,8 @@
 
 - `migrate lint` 新增内容级门禁：残留 `TODO` 占位、使用 `AutoMigrate`、非自包含 import（业务/第三方包）判为 error；raw `ALTER TABLE` 缺 `ALGORITHM`/`LOCK` 在线 DDL 策略、raw 危险 DDL（`DROP TABLE`/`DROP DATABASE`/`TRUNCATE`）判为 warning（`--strict` 下升为失败）。
 - `migrate lint` 新增 `duplicate_registration`（error）：同名迁移被注册多次时报告（运行时仍先注册者赢），使"两个包注册同名迁移"可被发现。
-- 回滚（`down`/`down-to`/`reset`/`refresh`）在回滚任一迁移之前做全量预检：任一待回滚记录不在 registry 或缺 `Down` 则整体拒绝，杜绝"回滚一半才失败"的部分回滚。
-- 新增 `WithMigrationsTable`（顶层 Option 与 `migration.WithMigrationsTable` MigratorOption）：迁移记录表名可配置。多项目共用同一数据库时各用独立记录表 + 独立锁名，迁移账本与漂移校验互不干扰——此前文档宣称仅配 `WithLockName` 即可共库，实际第二个项目会把第一个项目的记录判为漂移而拒绝执行。
+- 回滚（`down`/`down-to`/`reset`/`refresh`）在回滚任一迁移之前做全量预检：任一待回滚记录不在 registry、缺 `Down`、或存在重复注册名（会静默使用先注册者的 `Down`）则整体拒绝，杜绝"回滚一半才失败"的部分回滚，与 `up` 的执行校验对称。
+- 新增 `WithMigrationsTable`（顶层 Option 与 `migration.WithMigrationsTable` MigratorOption）：迁移记录表名可配置。多项目共用同一数据库时各用独立记录表（锁名按 DDL 资源边界选择：无共享表/外键用独立锁名，存在共享资源配相同锁名串行化），迁移账本与漂移校验互不干扰——此前文档宣称仅配 `WithLockName` 即可共库，实际第二个项目会把第一个项目的记录判为漂移而拒绝执行。
 - 新增 `migration.ValidateMigrationsTable`：迁移记录表名合法性校验（仅允许字母、数字、下划线，长度不超过 63——MySQL 上限 64、PostgreSQL 63 字节且超长静默截断，取跨方言交集；不支持 schema 限定名）。
 - 新增 `WithAllowFresh`（顶层 Option 与 `migration.WithAllowFresh` MigratorOption）：显式授权 `fresh` 执行，仅当本项目独占该数据库时才应开启。
 
@@ -43,7 +43,9 @@
 ### Fixed
 
 - `migrate up`：注册表为空（通常是漏 import 迁移包），或数据库中存在「已应用但当前 binary 未注册」的迁移（结构可能已漂移）时，`up` 与 `IsUpToDate` 改为 fail-closed 返回错误，不再静默通过。
-- `migrate fresh`：MySQL 删表时的 `SET foreign_key_checks=0` → 删表 → 恢复 `=1` 改为固定在同一数据库连接上执行，并保证在连接归还连接池前恢复；此前经连接池分发可能使关闭态落不到删表连接，或将关闭态残留污染被业务复用的池内连接。
+- `migrate fresh`：MySQL 删表时的 `SET foreign_key_checks=0` → 删表 → 恢复 `=1` 改为固定在同一专属连接上执行；恢复使用独立超时上下文（业务上下文取消后仍尝试复位），恢复失败、以及关闭外键检查本身因网络错误/取消而执行结果未知时，都将该连接标记坏连接并物理关闭结束会话——任何情况下都不会把外键检查状态不确定的连接归还连接池污染业务查询。此前经连接池分发可能使关闭态落不到删表连接，或将关闭态残留污染被业务复用的池内连接。
+- `migrate fresh`：清理范围补齐视图并限定 schema——MySQL 区分 BASE TABLE 与 VIEW 分别用 `DROP TABLE`/`DROP VIEW`（此前库中存在视图会因对视图执行 `DROP TABLE` 而失败）；PostgreSQL 的查询与 DROP 都显式限定 `public`，不再依赖 `search_path`，其他 schema 的同名表绝不受影响；SQLite 一并删除视图。残留视图导致重放 `CREATE VIEW` 冲突的问题一并消除。
+- `migration.CurrentDatabase` 与 `migration.DetectDBType` 传入 nil、零值或未初始化的 `*gorm.DB` 时返回空值，不再 panic（零值 `gorm.DB` 上访问经嵌入 `Config` 提升的 `Dialector` 字段此前会 nil 解引用）。
 - `migrate fresh`：修复上述同连接删表在真实 MySQL（非空库）上因 `db.Connection` 内调用 `Migrator().DropTable` 返回 `invalid db` 而失败的问题（`db.Connection` 提供的是 `*sql.Conn`，Migrator 需 `*sql.DB`），改为在该连接上直接执行 raw `DROP TABLE`。由新增的真实 MySQL 集成测试发现并覆盖。
 - `migrate lint`：修复在线 DDL 检查可被 SQL 注释绕过的问题——`ALTER TABLE ... /* ALGORITHM=INPLACE, LOCK=NONE */` 此前因注释含关键词被判为合规；现改为判定前先剥离 SQL 注释（`/* */` 与 `--`）。
 - `migrate lint`：进一步修复在线 DDL 误判——改为匹配真实子句 `ALGORITHM\s*=`/`LOCK\s*=`（不再把列名 `algorithm`/`lock`、字符串值或 `#` 注释里的关键词当作已标注策略），并剥离 MySQL `#` 行注释。

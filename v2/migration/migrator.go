@@ -46,7 +46,8 @@ func WithLogger(l Logger) MigratorOption {
 }
 
 // WithLockName 设置迁移锁名称.
-// 当同一数据库被多个项目共用时，不同项目应使用不同的锁名称避免互相阻塞.
+// 多项目共库时按 DDL 资源边界选择：项目间无共享表/外键时用独立锁名避免互相阻塞；
+// 存在共享 DDL 资源时相关项目应配相同锁名，用同一把锁串行化迁移.
 func WithLockName(name string) MigratorOption {
 	return func(m *Migrator) {
 		if name != "" {
@@ -353,6 +354,7 @@ func (m *Migrator) Refresh(ctx context.Context) error {
 // ⚠️ 危险操作：会丢失所有数据.默认禁用：必须经 WithAllowFresh 显式授权，
 // 且仅当本项目独占该数据库时才应授权（fresh 会删除库内全部用户表，
 // 包括其他项目的业务表与迁移账本）.
+// 清理范围含表与视图；PostgreSQL 仅清理 public schema，其他 schema 的对象不受影响.
 func (m *Migrator) Fresh(ctx context.Context) error {
 	// Fresh 不经 Setup 且先删表，配置错误必须在此独立拦截.
 	if m.configErr != nil {
@@ -682,6 +684,15 @@ func (m *Migrator) runUpMigration(ctx context.Context, mfile MigrationFile, batc
 
 // rollbackMigrations 按倒序执行迁移的 Down 方法.
 func (m *Migrator) rollbackMigrations(ctx context.Context, migrations []Migration) error {
+	// 重复注册名意味着回滚会静默使用先注册者的 Down、另一份同名实现被吞掉，
+	// 与 Up 的执行校验对称，fail-closed 拒绝（所有回滚入口共同经过此处）.
+	if dupes := m.registry.Duplicates(); len(dupes) > 0 {
+		return fmt.Errorf(
+			"rollback aborted: migration names registered more than once: %s",
+			strings.Join(dupes, ", "),
+		)
+	}
+
 	if len(migrations) == 0 {
 		return nil
 	}

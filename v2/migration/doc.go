@@ -9,8 +9,8 @@
 //
 // 执行入口是 Migrator（NewMigrator 构造）.所有执行方法 fail-closed：
 // 空注册表、重复注册、缺 Up/Down、已应用记录未注册（漂移）、非法记录表名
-// 等状态一律报错.Fresh 删除库内全部用户表，默认禁用，
-// 必须经 WithAllowFresh 显式授权（仅限本项目独占的数据库）.
+// 等状态一律报错.Fresh 删除库内全部用户表与视图（PostgreSQL 仅 public schema），
+// 默认禁用，必须经 WithAllowFresh 显式授权（仅限本项目独占的数据库）.
 //
 // 并发安全：Registry 线程安全；Migrator 的执行方法通过数据库 advisory lock
 // 串行化多实例并发（SQLite 例外，无锁）；Migrator 本身按单 goroutine 使用设计.

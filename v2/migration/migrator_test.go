@@ -928,6 +928,44 @@ func TestMigratorRollbackEmptyLedger(t *testing.T) {
 	}
 }
 
+// TestMigratorRollbackFailsClosedOnDuplicateRegistration 验证重复注册名下回滚整体拒绝：
+// 否则会静默使用先注册者的 Down，与 Up 的执行校验不对称.
+func TestMigratorRollbackFailsClosedOnDuplicateRegistration(t *testing.T) {
+	db := openExecTestDB(t, "rollback_dup_reg")
+
+	f := "2026_03_24_120000_create_d_table"
+	clean := NewRegistry()
+	clean.Add(f,
+		func(tx *gorm.DB) error { return tx.Exec("CREATE TABLE d (id integer primary key)").Error },
+		func(tx *gorm.DB) error { return tx.Exec("DROP TABLE d").Error },
+	)
+	m := NewMigrator(t.TempDir(), db, WithRegistry(clean))
+	if err := m.Up(t.Context()); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+
+	noop := func(*gorm.DB) error { return nil }
+	dup := NewRegistry()
+	dup.Add(f, noop, noop)
+	dup.Add(f, noop, noop) // 同名重复注册
+	md := NewMigrator(t.TempDir(), db, WithRegistry(dup))
+
+	if err := md.Rollback(t.Context()); err == nil || !strings.Contains(err.Error(), "registered more than once") {
+		t.Fatalf("Rollback should fail-closed on duplicate registration, got: %v", err)
+	}
+	if err := md.Reset(t.Context()); err == nil {
+		t.Fatalf("Reset should fail-closed on duplicate registration")
+	}
+	if !db.Migrator().HasTable("d") {
+		t.Fatalf("no migration may be rolled back under duplicate registration")
+	}
+	var n int64
+	db.Model(&Migration{}).Count(&n)
+	if n != 1 {
+		t.Fatalf("ledger must stay intact, got %d records", n)
+	}
+}
+
 // TestMigratorRollbackRecoversFromDownPanic 验证 Down panic 被捕获为错误且记录保留.
 func TestMigratorRollbackRecoversFromDownPanic(t *testing.T) {
 	db := openExecTestDB(t, "migrator_down_panic")

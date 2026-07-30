@@ -40,7 +40,8 @@ type Config struct {
 	Timeout time.Duration
 
 	// LockName 迁移锁名称（默认 "migrate_lock"）.
-	// 当同一数据库被多个项目共用时，不同项目应使用不同的锁名称.
+	// 多项目共库时按 DDL 资源边界选择：无共享表/外键时各项目用独立锁名；
+	// 存在共享 DDL 资源时相关项目配相同锁名串行化.
 	LockName string
 
 	// LockTimeout 获取迁移锁的最长等待时间（默认 10 秒）.
@@ -123,7 +124,8 @@ func WithTimeout(d time.Duration) Option {
 }
 
 // WithLockName 设置迁移锁名称.
-// 当同一数据库被多个项目共用时，不同项目应使用不同的锁名称避免互相阻塞.
+// 多项目共库时按 DDL 资源边界选择：项目间无共享表/外键时用独立锁名避免互相阻塞；
+// 存在共享 DDL 资源时相关项目应配相同锁名，用同一把锁串行化迁移.
 func WithLockName(name string) Option {
 	return func(c *Config) {
 		if name != "" {

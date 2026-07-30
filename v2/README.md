@@ -343,6 +343,8 @@ myapp migrate fresh --force
 >
 > `fresh` 有双层保护：`--force` 只防误触命令；它还会删除库内**全部**用户表（含其他项目的表），默认禁用，必须在 `Setup` 时用 `WithAllowFresh()` 显式授权（仅限本项目独占的数据库），否则直接报错拒绝。
 >
+> `fresh` 的清理范围包含表与视图；**PostgreSQL 仅清理 `public` schema**，其他 schema 的对象不受影响（多 schema 项目需自行清理其余 schema）。
+>
 > `down-to <version>` 的目标必须是真实已应用的版本；`mark-applied --to <version>` 的目标必须是已注册的迁移名；`RollbackSteps` 的步数必须为正数——否则直接报错，不会误回滚全部或标记错误范围。
 
 各命令语义：
@@ -354,7 +356,7 @@ myapp migrate fresh --force
 | `down` | 回滚最后一个 batch | 测试 / 谨慎用于生产 |
 | `reset` | 从后往前回滚所有 migration | 测试环境 |
 | `refresh` | `reset` 后重新 `up` | 测试环境 |
-| `fresh` | 删除库里所有表再跑 migration（需 `WithAllowFresh` 授权） | 仅临时测试库 |
+| `fresh` | 删除库里所有表与视图再跑 migration（需 `WithAllowFresh` 授权；PostgreSQL 仅清理 `public`） | 仅临时测试库 |
 | `status` | 查看 migration 是否执行及 batch | 所有环境 |
 | `lint` | 检查漂移、回滚风险、registry/file 不一致 | 所有环境，推荐 CI |
 

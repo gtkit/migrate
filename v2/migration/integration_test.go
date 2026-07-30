@@ -369,3 +369,89 @@ func TestMigratorPostgresLockTimeoutDoesNotPoisonPool(t *testing.T) {
 		}
 	}
 }
+
+// TestMigratorMySQLFreshDropsViews 在真实 MySQL 上验证库中存在视图时 fresh 清理成功：
+// 视图必须用 DROP VIEW 删除，混入 DROP TABLE 会直接报错.
+func TestMigratorMySQLFreshDropsViews(t *testing.T) {
+	db := openMySQLTestDB(t)
+
+	if err := DeleteAllTables(db); err != nil {
+		t.Fatalf("initial cleanup: %v", err)
+	}
+	if err := db.Exec("CREATE TABLE vt_base (id INT PRIMARY KEY)").Error; err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if err := db.Exec("CREATE VIEW vt_view AS SELECT id FROM vt_base").Error; err != nil {
+		t.Fatalf("create view: %v", err)
+	}
+
+	if err := DeleteAllTables(db); err != nil {
+		t.Fatalf("delete all tables with a view present: %v", err)
+	}
+
+	var remaining int64
+	if err := db.Raw("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ?", CurrentDatabase(db)).
+		Scan(&remaining).Error; err != nil {
+		t.Fatalf("count objects: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("expected all tables and views dropped, got %d remaining", remaining)
+	}
+}
+
+// TestMigratorPostgresFreshScopedToPublic 在真实 PostgreSQL 上验证 fresh 只清 public：
+// public 的表与视图被删除，其他 schema 的同名表不受影响（DROP 显式限定 schema，不依赖 search_path）.
+func TestMigratorPostgresFreshScopedToPublic(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("MIGRATE_TEST_POSTGRES_DSN"))
+	if dsn == "" {
+		t.Skip("postgres integration test skipped: MIGRATE_TEST_POSTGRES_DSN is not set")
+	}
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open postgres: %v", err)
+	}
+	if name := strings.ToLower(CurrentDatabase(db)); !strings.Contains(name, "test") && os.Getenv("MIGRATE_TEST_ALLOW_ANY_DB") != "1" {
+		t.Skipf("postgres integration test skipped: database %q does not look like a test database", name)
+	}
+	t.Cleanup(func() {
+		_ = db.Exec("DROP SCHEMA IF EXISTS mig_other CASCADE").Error
+		if sqlDB, err := db.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+
+	if err := DeleteAllTables(db); err != nil {
+		t.Fatalf("initial cleanup: %v", err)
+	}
+	if err := db.Exec("DROP SCHEMA IF EXISTS mig_other CASCADE").Error; err != nil {
+		t.Fatalf("drop other schema: %v", err)
+	}
+	if err := db.Exec("CREATE SCHEMA mig_other").Error; err != nil {
+		t.Fatalf("create other schema: %v", err)
+	}
+	if err := db.Exec("CREATE TABLE pv_base (id INT PRIMARY KEY)").Error; err != nil {
+		t.Fatalf("create public table: %v", err)
+	}
+	if err := db.Exec("CREATE VIEW pv_view AS SELECT id FROM pv_base").Error; err != nil {
+		t.Fatalf("create public view: %v", err)
+	}
+	if err := db.Exec("CREATE TABLE mig_other.pv_base (id INT PRIMARY KEY)").Error; err != nil {
+		t.Fatalf("create other-schema table: %v", err)
+	}
+
+	if err := DeleteAllTables(db); err != nil {
+		t.Fatalf("delete all tables: %v", err)
+	}
+
+	var n int64
+	if err := db.Raw("SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public'").Scan(&n).Error; err != nil || n != 0 {
+		t.Fatalf("public tables should be gone, count=%d err=%v", n, err)
+	}
+	if err := db.Raw("SELECT COUNT(*) FROM pg_views WHERE schemaname = 'public'").Scan(&n).Error; err != nil || n != 0 {
+		t.Fatalf("public views should be gone, count=%d err=%v", n, err)
+	}
+	if err := db.Raw("SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'mig_other' AND tablename = 'pv_base'").
+		Scan(&n).Error; err != nil || n != 1 {
+		t.Fatalf("same-named table in another schema must survive, count=%d err=%v", n, err)
+	}
+}
