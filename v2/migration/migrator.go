@@ -805,7 +805,7 @@ func (m *Migrator) checkRegistryConsistency(migrated map[string]Migration) error
 
 // validateRegistryForExecution 校验 registry 适合执行，供执行/破坏性命令在动手前调用：
 // registry 为空（通常漏 import 迁移包）、存在重复注册名（两个包注册同名）、
-// 或任一迁移缺 Up 函数，均返回错误、fail-closed.
+// 任一迁移缺 Up 函数、或迁移名不符合时间戳命名格式，均返回错误、fail-closed.
 func (m *Migrator) validateRegistryForExecution() error {
 	if m.registry.Len() == 0 {
 		return errors.New("no migrations registered; did you forget to import the migrations package?")
@@ -816,6 +816,15 @@ func (m *Migrator) validateRegistryForExecution() error {
 	for _, mfile := range m.registry.All() {
 		if mfile.Up == nil {
 			return fmt.Errorf("migration %s has no up function", mfile.FileName)
+		}
+		// 迁移执行顺序依赖文件名的时间戳前缀，乱名会破坏顺序且绕过磁盘/lint 体系，
+		// 与 lint 用同一白名单在运行时 fail-closed（不能指望调用方记得跑 lint）.
+		// 回滚路径故意不查：历史误入账本的坏名仍可通过 down/reset 清理.
+		if !migrationNamePattern.MatchString(mfile.FileName) {
+			return fmt.Errorf(
+				"invalid migration name %q: must match YYYY_MM_DD_HHMMSS_<description>",
+				mfile.FileName,
+			)
 		}
 	}
 	return nil

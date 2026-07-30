@@ -20,6 +20,8 @@ var (
 	// ErrLintFailed 表示 lint 发现了至少一个错误级问题。
 	ErrLintFailed = errors.New("migration lint failed")
 
+	// migrationNamePattern 迁移文件名白名单（时间戳前缀 + 描述）.
+	// lint 与运行时执行校验（validateRegistryForExecution）共用.
 	migrationNamePattern = regexp.MustCompile(`^\d{4}_\d{2}_\d{2}_\d{6}_.+$`)
 )
 

@@ -50,6 +50,10 @@ func CurrentDatabase(db *gorm.DB) string {
 
 // DeleteAllTables 删除当前库默认 schema 内的全部用户表与视图.
 // PostgreSQL 仅清理 public schema，其他 schema 的对象不受影响.
+//
+// ⚠️ 低层清库工具：不经 WithAllowFresh 授权、不加迁移锁、没有 --force 保护，
+// 调用即删、数据不可恢复.仅限在自己完全掌控的测试库上使用（如集成测试清场）；
+// 常规"清库重放"请使用 Migrator.Fresh——它带显式授权、advisory lock 与迁移重放.
 func DeleteAllTables(db *gorm.DB) error {
 	dbType := DetectDBType(db)
 	switch dbType {

@@ -928,6 +928,62 @@ func TestMigratorRollbackEmptyLedger(t *testing.T) {
 	}
 }
 
+// TestMigratorUpFailsClosedOnInvalidName 验证不符合时间戳命名格式的迁移在执行前被拒绝：
+// 执行顺序依赖文件名时间戳前缀，运行时必须 fail-closed，不能只靠 lint.
+func TestMigratorUpFailsClosedOnInvalidName(t *testing.T) {
+	db := openExecTestDB(t, "up_invalid_name")
+
+	registry := NewRegistry()
+	registry.Add("bad_name",
+		func(tx *gorm.DB) error { return tx.Exec("CREATE TABLE bn (id integer primary key)").Error },
+		func(tx *gorm.DB) error { return tx.Exec("DROP TABLE bn").Error },
+	)
+	m := NewMigrator(t.TempDir(), db, WithRegistry(registry))
+
+	err := m.Up(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "invalid migration name") {
+		t.Fatalf("Up should fail-closed on invalid migration name, got: %v", err)
+	}
+	if db.Migrator().HasTable("bn") {
+		t.Fatalf("misnamed migration must not execute")
+	}
+	var n int64
+	db.Model(&Migration{}).Count(&n)
+	if n != 0 {
+		t.Fatalf("misnamed migration must not be recorded, got %d", n)
+	}
+}
+
+// TestMigratorRollbackAllowsMisnamedAppliedRecord 验证回滚路径故意不查名称格式：
+// 历史误入账本的坏名迁移仍可通过回滚清理，否则会被永久锁死.
+func TestMigratorRollbackAllowsMisnamedAppliedRecord(t *testing.T) {
+	db := openExecTestDB(t, "rollback_misnamed")
+
+	// 直接构造"坏名已应用"的历史状态：建表 + 手工写账本记录.
+	if err := db.Exec("CREATE TABLE bn (id integer primary key)").Error; err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	registry := NewRegistry()
+	registry.Add("bad_name",
+		func(*gorm.DB) error { return nil },
+		func(tx *gorm.DB) error { return tx.Exec("DROP TABLE bn").Error },
+	)
+	m := NewMigrator(t.TempDir(), db, WithRegistry(registry))
+	if err := m.Setup(t.Context()); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	if err := db.Create(&Migration{Migration: "bad_name", Batch: 1}).Error; err != nil {
+		t.Fatalf("seed record: %v", err)
+	}
+
+	if err := m.Rollback(t.Context()); err != nil {
+		t.Fatalf("rollback should clean up misnamed applied migration: %v", err)
+	}
+	if db.Migrator().HasTable("bn") {
+		t.Fatalf("misnamed migration should have been rolled back")
+	}
+}
+
 // TestMigratorRollbackFailsClosedOnDuplicateRegistration 验证重复注册名下回滚整体拒绝：
 // 否则会静默使用先注册者的 Down，与 Up 的执行校验不对称.
 func TestMigratorRollbackFailsClosedOnDuplicateRegistration(t *testing.T) {
