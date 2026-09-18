@@ -10,7 +10,7 @@
 - Advisory Lock 防止多实例并发迁移冲突（MySQL `GET_LOCK`、PostgreSQL `pg_advisory_lock`）
 - `pending` 命令预览待执行迁移（dry-run）
 - `lint` 命令检查 migration 文件、registry 和已执行记录漂移
-- 结构化日志接口，可注入 zap / zerolog / slog 等
+- 结构化日志接口，可注入 zap / zerolog 等
 - Lock name 可配置，同一数据库多项目共存不冲突
 - `make migration` 自动生成迁移文件和 model 脚手架
 - `make ddl diff` 可对比当前模型生成的 strict DDL 与已提交 SQL 文件
@@ -148,6 +148,7 @@ func setupMigrate(db *gorm.DB) {
 | `WithLockTimeout` | `10s` | 获取迁移锁的最长等待时间 |
 | `WithMigrationsTable` | `migrations` | 迁移记录表名（多项目共库时各用独立表；仅字母/数字/下划线、≤63 字符，空白或非法值 `Setup` 直接报错） |
 | `WithAllowFresh` | 禁用 | 显式授权 `fresh`（删库内全部表）；仅本项目独占数据库时才应开启 |
+| `WithAllowUnknownApplied` | 禁用 | 显式授权 `up`/`status`/`pending` 容忍"已应用但当前 binary 未注册"的迁移记录（逐条 Warn 后继续）；用于应用回滚窗口，`mark-applied` 与回滚命令不受影响 |
 | `WithLogger` | stdout logger | 自定义结构化日志 |
 
 注意：
@@ -186,16 +187,16 @@ myapp make model user
 internal/models/model.go                        # BaseID、BaseTimeField（仅首次生成）
 internal/models/doc.go                          # 包注释（仅首次生成）
 internal/models/user.go                         # GORM model 骨架
-internal/repository/user/user_i.go              # Repository 结构体 + New 构造函数
-internal/repository/user/user_util.go           # Get / GetBy / All / IsExist / Paginate
+internal/repository/user/repository.go          # Repository 结构体 + New 构造函数
+internal/repository/user/repository_util.go     # Get / GetBy / All / IsExist / Paginate
 ```
 
 其中：
 
 - `model.go` / `doc.go` 只会在不存在时补齐，不会反复覆盖
 - `user.go` 是 GORM model 骨架，包含 `ListPaging` 分页结构体、`Create` / `Save` / `Delete` / `CreateOrUpdate` / `MarshalBinary` / `UnmarshalBinary` 等常用方法
-- `user_i.go` 定义 `Repository` 结构体、`New(db *gorm.DB)` 构造函数、`mdbCtx` context 注入
-- `user_util.go` 包含 `Get` / `GetBy` / `All` / `IsExist` / `Paginate` 基础 CRUD 方法
+- `repository.go` 定义 `Repository` 结构体、`New(db *gorm.DB)` 构造函数、`mdbCtx` context 注入
+- `repository_util.go` 包含 `Get` / `GetBy` / `All` / `IsExist` / `Paginate` 基础 CRUD 方法
 - 时间字段默认使用 `datetime` 类型（而非 `timestamp`），兼容阿里云 RDS 严格模式
 
 如果你已经有自定义 model/repository 实现，建议只在新实体创建初期使用此命令，之后按项目规范手工演化。
@@ -243,31 +244,47 @@ myapp make migration drop_index_email_from_users_table
 
 | action | up 行为 | down 行为 |
 |--------|---------|-----------|
-| `create` | 快照 struct `CreateTable` | `DropTable` |
+| `create` | 快照 struct `CreateTable`（带存在性检查） | `DropTable` |
 | `update` | raw `ALTER TABLE`（TODO 待补全） | raw 反向 `ALTER`（TODO 待补全） |
 | `add` | raw `ALTER TABLE ADD COLUMN`（TODO 列定义，带存在性检查） | raw `DROP COLUMN`（带存在性检查） |
 | `drop`（表） | `DropTable`（带存在性检查） | 标记为不可逆，需人工补全 |
 | `drop_column` / `drop_index` | raw `DROP COLUMN` / `DROP INDEX`（带存在性检查） | 标记为不可逆，需人工补全 |
 
-示例（`create`）：
+示例（`create`）——迁移文件**自包含表结构快照，有意不引用业务 model**：业务 model 会随需求演进，而迁移必须锁定「创建当时」的结构；引用业务 model 的迁移会被 `migrate lint` 以 `non_self_contained` 判为 error：
 
 ```go
 package migrations
 
 import (
-    "myproject/internal/models"
+    "time"
+
     "gorm.io/gorm"
 
     "github.com/gtkit/migrate/v2/migration"
 )
 
+// userV20260317120000 是本迁移建表时的结构快照，锁定创建当时的表结构。
+type userV20260317120000 struct {
+    ID        int64          `gorm:"column:id;primaryKey;autoIncrement"`
+    CreatedAt time.Time      `gorm:"column:created_at;type:datetime;index"`
+    UpdatedAt time.Time      `gorm:"column:updated_at;type:datetime;index"`
+    DeletedAt gorm.DeletedAt `gorm:"column:deleted_at;type:datetime;index"`
+    // 在此补全建表字段（不要 import 业务 model）。
+}
+
+func (userV20260317120000) TableName() string { return "users" }
+
 func init() {
     up := func(db *gorm.DB) error {
-        return db.Migrator().CreateTable(&models.User{})
+        // 幂等：表已存在则跳过（MySQL 半失败后重跑 up 可自愈）。
+        if db.Migrator().HasTable("users") {
+            return nil
+        }
+        return db.Migrator().CreateTable(&userV20260317120000{})
     }
 
     down := func(db *gorm.DB) error {
-        return db.Migrator().DropTable(&models.User{})
+        return db.Migrator().DropTable("users")
     }
 
     migration.Add("2026_03_17_120000_create_users_table", up, down)
@@ -360,7 +377,7 @@ myapp migrate fresh --force
 | `status` | 查看 migration 是否执行及 batch | 所有环境 |
 | `lint` | 检查漂移、回滚风险、registry/file 不一致 | 所有环境，推荐 CI |
 
-`up`、`down`、`reset`、`refresh`、`fresh` 都受 `WithTimeout(...)` 控制。
+`up`、`down`、`reset`、`refresh`、`fresh` 都受 `WithTimeout(...)` 控制：这个超时覆盖**整条命令**——等锁、每一个迁移的 DDL 执行与账本写入共用同一预算（默认 5 分钟）。超时触发时驱动会关闭连接中断正在执行的 DDL，MySQL 服务端会终止该语句，但客户端拿不到确定结果，需按下文「生产注意事项」人工核对。生产环境请按最长一次迁移的实际耗时设置 `WithTimeout`（大表 ALTER 建议放到 30 分钟以上，或拆成单独的迁移批次执行）。
 
 #### 4.1 `migrate lint`
 
@@ -624,7 +641,9 @@ Summary: 0 error(s), 1 warning(s)
 MySQL 的 `CREATE TABLE`/`ALTER TABLE` 等 DDL 会**隐式提交、无法回滚**（PostgreSQL、SQLite 支持事务型 DDL，本工具会把 DDL 与迁移记录放同一事务、失败整体回滚；MySQL 属其固有限制）。这带来两点必须知晓的行为，本工具**不会也无法**替 MySQL 消除：
 
 - **迁移不是原子的**：一个迁移里若有多条 DDL，执行到中途失败时，前面的 DDL 已经提交、留下「半张表」；DDL 提交后、写迁移记录前若进程崩溃或超时，也会出现「结构已变更但记录未写」。
-- **故障需人工恢复**：出现上述情况时，请**先人工核对真实表结构**，再决定：把该迁移手工补完（并用 `mark-applied` 将其记入），或把已生效的 DDL 手工回退后重跑。工具不会自动修复半成品。
+- **故障需人工恢复**：出现上述情况时，请**先人工核对真实表结构**，再决定：把该迁移手工补完（并用 `mark-applied` 将其记入），或把已生效的 DDL 手工回退后重跑。工具不会自动修复半成品。生成模板的 up 都带存在性检查（`create` 查 `HasTable`，`add` 查 `HasColumn`，`drop_*` 查目标是否存在），单条 DDL 的迁移在「DDL 已提交、记录未写」后直接重跑 `up` 即可自愈。
+
+- **应用回滚窗口**：`up`/`status`/`pending` 默认对"已应用但当前 binary 未注册"的迁移记录 fail-closed 报错——新版本已写入账本后回滚到旧版本 binary，旧 binary 的 `up` 会失败。若服务在启动期调用 `Up`，请在 `Setup` 时加 `WithAllowUnknownApplied()`：旧 binary 对每条未知记录记 Warn 后继续执行自己已注册的迁移；`mark-applied` 与所有回滚命令不受该选项影响，仍严格拒绝。
 
 降低风险的实践：
 
@@ -670,7 +689,7 @@ type Logger interface {
 }
 ```
 
-签名兼容 `zap.SugaredLogger`、`slog` 的 key-value 风格。
+签名兼容 `zap.SugaredLogger` 的 key-value 风格。
 
 ### 接入 zap
 
@@ -712,21 +731,6 @@ func kvToMap(kv []any) map[string]any {
     }
     return m
 }
-```
-
-### 接入 slog（Go 1.21+）
-
-```go
-type slogLogger struct {
-    l *slog.Logger
-}
-
-func (s *slogLogger) Info(msg string, kv ...any)  { s.l.Info(msg, kv...) }
-func (s *slogLogger) Warn(msg string, kv ...any)  { s.l.Warn(msg, kv...) }
-func (s *slogLogger) Error(msg string, kv ...any) { s.l.Error(msg, kv...) }
-
-// slog 的签名天然匹配，直接包一层即可
-migrate.Setup(db, migrate.WithLogger(&slogLogger{l: slog.Default()}))
 ```
 
 ### 静默日志（测试场景）

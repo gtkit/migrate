@@ -62,6 +62,11 @@ type Config struct {
 	// fresh 会删除库内全部用户表，仅当本项目独占该数据库时才应授权.
 	AllowFresh bool
 
+	// AllowUnknownApplied 显式授权 up/status/pending 容忍"已应用但当前 binary 未注册"的
+	// 迁移记录（默认 false，遇到即报错）.用于应用回滚窗口：旧版本 binary 面对新版本
+	// 已写入的账本时记 Warn 后继续.mark-applied 与回滚命令不受影响，始终严格.
+	AllowUnknownApplied bool
+
 	// DDLModels 用于 make ddl 的模型注册表。
 	DDLModels []any
 }
@@ -175,6 +180,15 @@ func WithAllowFresh() Option {
 	}
 }
 
+// WithAllowUnknownApplied 显式授权 up/status/pending 容忍"已应用但当前 binary 未注册"的迁移记录.
+// 默认 fail-closed 报错；开启后逐条记 Warn 并继续，只处理已注册且未应用的迁移.
+// 仅用于应用回滚窗口（旧 binary 面对新账本）；mark-applied 与回滚命令不受影响.
+func WithAllowUnknownApplied() Option {
+	return func(c *Config) {
+		c.AllowUnknownApplied = true
+	}
+}
+
 // WithDDLModels 注册可用于 make ddl 的 GORM 模型。
 func WithDDLModels(models ...any) Option {
 	return func(c *Config) {
@@ -259,6 +273,9 @@ func commandEnv(cmd *cobra.Command) (*migration.Migrator, context.Context, conte
 	opts = append(opts, migration.WithMigrationsTable(cfg.MigrationsTable))
 	if cfg.AllowFresh {
 		opts = append(opts, migration.WithAllowFresh())
+	}
+	if cfg.AllowUnknownApplied {
+		opts = append(opts, migration.WithAllowUnknownApplied())
 	}
 
 	parent := context.Background()

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -160,9 +161,9 @@ func diffLines(existing, generated []string) []diffOp {
 		dp[i] = make([]int, len(generated)+1)
 	}
 
-	for i := len(existing) - 1; i >= 0; i-- {
+	for i, e := range slices.Backward(existing) {
 		for j := len(generated) - 1; j >= 0; j-- {
-			if existing[i] == generated[j] {
+			if e == generated[j] {
 				dp[i][j] = dp[i+1][j+1] + 1
 				continue
 			}

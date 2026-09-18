@@ -6,6 +6,21 @@
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-09-18
+
+### Added
+
+- 新增 `WithAllowUnknownApplied`（顶层 Option 与 `migration.WithAllowUnknownApplied` MigratorOption）：显式授权 `up`/`IsUpToDate`/`status`/`pending` 容忍"已应用但当前 binary 未注册"的迁移记录——逐条记 Warn 后继续，只处理已注册且未应用的迁移。用于应用回滚窗口（新版本已写账本后回滚到旧 binary，启动期调用 `Up` 不再失败）。默认关闭、行为不变；`mark-applied` 与所有回滚入口不受该选项影响，始终 fail-closed。
+
+### Changed
+
+- `make migration create_*` 模板的 up 增加 `HasTable` 存在性检查，与 `add`/`drop_*` 模板一致：MySQL 上 DDL 已提交但账本记录未写的半失败状态，重跑 `up` 直接自愈，不再报 `Table already exists`。仅影响新生成的迁移文件。
+
+### Fixed
+
+- README：`create` 示例改为与生成模板一致的自包含快照形态（原示例 import 业务 model，会被 `migrate lint` 以 `non_self_contained` 判为 error）；`make model` 生成文件名更正为 `repository.go` / `repository_util.go`；补充 `WithTimeout` 覆盖整条命令含 DDL 执行的后果与生产建议；补充应用回滚窗口的处理方式。
+- `make ddl diff` 的 LCS 循环改用 `slices.Backward`（`go fix` 建议，行为不变）。
+
 ## [2.1.0] - 2026-07-30
 
 ### Added

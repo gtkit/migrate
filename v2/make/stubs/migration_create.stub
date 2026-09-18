@@ -29,6 +29,10 @@ func ({{SnapshotStruct}}) TableName() string {
 
 func init() {
 	up := func(db *gorm.DB) error {
+		// 幂等：表已存在则跳过（MySQL DDL 已提交但记录未写的半失败状态下，重跑 up 可自愈）。
+		if db.Migrator().HasTable("{{TableName}}") {
+			return nil
+		}
 		return db.Migrator().CreateTable(&{{SnapshotStruct}}{})
 	}
 

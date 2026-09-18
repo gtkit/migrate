@@ -27,10 +27,12 @@ type Migrator struct {
 	lockName    string
 	lockTimeout time.Duration
 	tableName   string
-	allowFresh  bool  // Fresh 删全库表，必须经 WithAllowFresh 显式授权
-	configErr   error // 构造期配置错误（如非法表名），所有执行入口 fail-closed 返回
-	registry    *Registry
-	logger      Logger
+	allowFresh  bool // Fresh 删全库表，必须经 WithAllowFresh 显式授权
+	// 容忍"已应用但当前 binary 未注册"的记录（应用回滚窗口），必须经 WithAllowUnknownApplied 显式授权
+	allowUnknownApplied bool
+	configErr           error // 构造期配置错误（如非法表名），所有执行入口 fail-closed 返回
+	registry            *Registry
+	logger              Logger
 }
 
 // MigratorOption 配置 Migrator 的选项函数.
@@ -95,6 +97,16 @@ func WithMigrationsTable(name string) MigratorOption {
 func WithAllowFresh() MigratorOption {
 	return func(m *Migrator) {
 		m.allowFresh = true
+	}
+}
+
+// WithAllowUnknownApplied 显式授权 Up/IsUpToDate/Status/Pending 容忍
+// "已应用但当前 binary 未注册"的迁移记录：逐条记 Warn 后继续，只处理已注册且未应用的迁移.
+// 用于应用回滚窗口——旧版本 binary 面对新版本已写入的账本时不再启动失败.
+// 默认关闭（fail-closed）；MarkApplied 与所有回滚入口不受影响，始终严格.
+func WithAllowUnknownApplied() MigratorOption {
+	return func(m *Migrator) {
+		m.allowUnknownApplied = true
 	}
 }
 
@@ -494,8 +506,12 @@ func (m *Migrator) MarkApplied(ctx context.Context, toFile string) ([]string, er
 		return nil, fmt.Errorf("get migrated records: %w", err)
 	}
 	// 完整一致性校验（空/重复/nil Up + 漂移）：不在漂移状态下写新 baseline.
+	// baseline 是破坏性写入，WithAllowUnknownApplied 对此不生效，未知记录始终拒绝.
 	if err := m.checkRegistryConsistency(migrated); err != nil {
 		return nil, err
+	}
+	if unknown := m.unknownApplied(migrated); len(unknown) > 0 {
+		return nil, fmt.Errorf("mark-applied aborted: applied migrations not registered in the current binary: %s", strings.Join(unknown, ", "))
 	}
 
 	migrateFiles := m.registeredFiles()
@@ -796,16 +812,34 @@ func (m *Migrator) registeredFiles() []MigrationFile {
 // checkRegistryConsistency 在执行前校验 registry 与已应用记录的一致性，fail-closed.
 // registry 为空（通常是漏 import 迁移包），或存在"已应用但当前 binary 未注册"的
 // 迁移（结构可能已漂移）时返回错误，禁止在这两种状态下继续执行.
+// 经 WithAllowUnknownApplied 授权时，未注册的已应用记录改为逐条 Warn 后放行.
 func (m *Migrator) checkRegistryConsistency(migrated map[string]Migration) error {
 	if err := m.validateRegistryForExecution(); err != nil {
 		return err
 	}
-	for name := range migrated {
-		if _, ok := m.registry.Get(name); !ok {
-			return fmt.Errorf("applied migration %q is not registered in the current binary; schema may have drifted", name)
-		}
+	unknown := m.unknownApplied(migrated)
+	if len(unknown) == 0 {
+		return nil
+	}
+	if !m.allowUnknownApplied {
+		return fmt.Errorf("applied migration %q is not registered in the current binary; schema may have drifted", unknown[0])
+	}
+	for _, name := range unknown {
+		m.logger.Warn("applied migration not registered in current binary; tolerated by WithAllowUnknownApplied", "file", name)
 	}
 	return nil
+}
+
+// unknownApplied 返回账本中当前 binary 未注册的迁移名，升序.
+func (m *Migrator) unknownApplied(migrated map[string]Migration) []string {
+	var unknown []string
+	for name := range migrated {
+		if _, ok := m.registry.Get(name); !ok {
+			unknown = append(unknown, name)
+		}
+	}
+	slices.Sort(unknown)
+	return unknown
 }
 
 // validateRegistryForExecution 校验 registry 适合执行，供执行/破坏性命令在动手前调用：
