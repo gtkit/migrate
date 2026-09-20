@@ -6,6 +6,12 @@
 
 ## [Unreleased]
 
+## [2.2.1] - 2026-09-20
+
+### Fixed
+
+- README 方言说明补充使用约束：每个迁移的 Up/Down 与账本记录在同一事务内执行，迁移函数里只能使用允许在事务块内运行的语句（PostgreSQL 的 `CREATE INDEX CONCURRENTLY` 等会因此报错）。
+
 ## [2.2.0] - 2026-09-18
 
 ### Added

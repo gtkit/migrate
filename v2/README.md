@@ -2,7 +2,7 @@
 
 基于 GORM + Cobra 的 Go 数据库迁移工具，支持 MySQL、PostgreSQL、SQLite。
 
-> **方言说明**：迁移执行引擎（up/down/锁/记录表）完整支持三种数据库；`make migration` 生成的模板 SQL 当前为 **MySQL 语法**（反引号、`AFTER` 子句、`ALGORITHM`/`LOCK` 在线 DDL 子句），PostgreSQL/SQLite 项目生成后需按方言调整。`migrate lint` 的在线 DDL 规则仅对 MySQL 数据库生效。
+> **方言说明**：迁移执行引擎（up/down/锁/记录表）完整支持三种数据库；`make migration` 生成的模板 SQL 当前为 **MySQL 语法**（反引号、`AFTER` 子句、`ALGORITHM`/`LOCK` 在线 DDL 子句），PostgreSQL/SQLite 项目生成后需按方言调整。`migrate lint` 的在线 DDL 规则仅对 MySQL 数据库生效。每个迁移的 Up/Down 与其账本记录在**同一事务**内执行，迁移函数里只能使用允许在事务块内运行的语句（PostgreSQL 的 `CREATE INDEX CONCURRENTLY` 等语句会因此报错）。
 
 ## 特性
 
