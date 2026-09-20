@@ -455,3 +455,60 @@ func TestMigratorPostgresFreshScopedToPublic(t *testing.T) {
 		t.Fatalf("same-named table in another schema must survive, count=%d err=%v", n, err)
 	}
 }
+
+// TestMigratorMySQLGuardedCreateSelfHeals 在真实 MySQL 上验证 create 模板的 HasTable 守卫：
+// MySQL DDL 隐式提交，Up 在 CreateTable 之后失败会留下"表已建、记录未写"；
+// 带守卫的 up 重跑时跳过建表、正常写记录，无守卫则报 Table already exists.
+func TestMigratorMySQLGuardedCreateSelfHeals(t *testing.T) {
+	db := openMySQLTestDB(t)
+	if err := DeleteAllTables(db); err != nil {
+		t.Fatalf("initial cleanup: %v", err)
+	}
+
+	type healSnapshot struct {
+		ID int64 `gorm:"column:id;primaryKey;autoIncrement"`
+	}
+	const table = "heal_users"
+	calls := 0
+	registry := NewRegistry()
+	registry.Add("2026_03_24_120000_create_heal_users_table", func(tx *gorm.DB) error {
+		calls++
+		if tx.Migrator().HasTable(table) {
+			return nil
+		}
+		if err := tx.Table(table).Migrator().CreateTable(&healSnapshot{}); err != nil {
+			return err
+		}
+		if calls == 1 {
+			return fmt.Errorf("simulated crash after DDL commit")
+		}
+		return nil
+	}, func(tx *gorm.DB) error {
+		return tx.Migrator().DropTable(table)
+	})
+
+	m := NewMigrator(t.TempDir(), db, WithRegistry(registry),
+		WithLockName(fmt.Sprintf("migrate_heal_%d", time.Now().UnixNano())), WithLogger(&NopLogger{}))
+
+	if err := m.Up(t.Context()); err == nil {
+		t.Fatalf("first Up should fail after the DDL was committed")
+	}
+	if !db.Migrator().HasTable(table) {
+		t.Fatalf("MySQL should have committed the CREATE TABLE despite the failure")
+	}
+	statuses, err := m.Status(t.Context())
+	if err != nil || len(statuses) != 1 || statuses[0].Ran {
+		t.Fatalf("migration must not be recorded after failure, got %+v err=%v", statuses, err)
+	}
+
+	if err := m.Up(t.Context()); err != nil {
+		t.Fatalf("second Up should self-heal through the HasTable guard, got %v", err)
+	}
+	upToDate, err := m.IsUpToDate(t.Context())
+	if err != nil || !upToDate {
+		t.Fatalf("IsUpToDate after self-heal = (%v, %v), want (true, nil)", upToDate, err)
+	}
+	if calls != 2 {
+		t.Fatalf("up should have run exactly twice, got %d", calls)
+	}
+}

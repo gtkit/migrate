@@ -42,6 +42,7 @@ func TestOptionsApply(t *testing.T) {
 		WithDDLModels(struct{}{}),
 		WithMigrationsTable("  ledger_svc  "),
 		WithAllowFresh(),
+		WithAllowUnknownApplied(),
 	} {
 		o(cfg)
 	}
@@ -61,6 +62,9 @@ func TestOptionsApply(t *testing.T) {
 	}
 	if !cfg.AllowFresh {
 		t.Fatalf("WithAllowFresh should set AllowFresh")
+	}
+	if !cfg.AllowUnknownApplied {
+		t.Fatalf("WithAllowUnknownApplied should set AllowUnknownApplied")
 	}
 
 	// 空/零值应被忽略（覆盖 if 分支的另一半）。
@@ -281,5 +285,60 @@ func TestDestructiveRunFuncsRequireForce(t *testing.T) {
 				t.Fatalf("%s error should mention --force, got: %v", name, err)
 			}
 		})
+	}
+}
+
+// TestMigrateHandlersAllowUnknownApplied 验证顶层 WithAllowUnknownApplied 经 commandEnv 透传到 CLI：
+// 账本含当前 binary 未注册的记录时，未授权的 pending/up 报错；授权后记 Warn 并继续.
+func TestMigrateHandlersAllowUnknownApplied(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, handlerMigrationName+".go"), []byte("package migrations\n"), 0o644); err != nil {
+		t.Fatalf("write migration file: %v", err)
+	}
+
+	db := newHandlerTestDB(t, "migrate_handlers_unknown_applied")
+	if err := Setup(db, WithMigrationDir(dir), WithLogger(&migration.NopLogger{})); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	if _, err := execMigrate(t, "up"); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+	// 模拟新版本写入账本后回滚到旧 binary：注入一条当前未注册的已应用记录.
+	const ghost = "2026_03_24_999999_ghost_from_newer_binary"
+	if err := db.Table("migrations").Create(&migration.Migration{Migration: ghost, Batch: 2}).Error; err != nil {
+		t.Fatalf("seed ghost: %v", err)
+	}
+
+	if _, err := execMigrate(t, "pending"); err == nil || !strings.Contains(err.Error(), ghost) {
+		t.Fatalf("pending without WithAllowUnknownApplied should fail naming the ghost, got %v", err)
+	}
+	if _, err := execMigrate(t, "up"); err == nil {
+		t.Fatalf("up without WithAllowUnknownApplied should fail")
+	}
+
+	if err := Setup(db, WithMigrationDir(dir), WithLogger(&migration.NopLogger{}), WithAllowUnknownApplied()); err != nil {
+		t.Fatalf("re-setup with WithAllowUnknownApplied: %v", err)
+	}
+	out, err := execMigrate(t, "pending")
+	if err != nil {
+		t.Fatalf("pending with WithAllowUnknownApplied: %v", err)
+	}
+	if !strings.Contains(out, "up to date") {
+		t.Fatalf("pending should report up to date, got:\n%s", out)
+	}
+	if _, err := execMigrate(t, "up"); err != nil {
+		t.Fatalf("up with WithAllowUnknownApplied: %v", err)
+	}
+	out, err = execMigrate(t, "status")
+	if err != nil {
+		t.Fatalf("status with WithAllowUnknownApplied: %v", err)
+	}
+	if !strings.Contains(out, handlerMigrationName) || strings.Contains(out, ghost) {
+		t.Fatalf("status should list registered migrations only, got:\n%s", out)
+	}
+
+	// 授权不放宽 baseline：mark-applied 仍拒绝.
+	if _, err := execMigrate(t, "mark-applied", "--force"); err == nil || !strings.Contains(err.Error(), ghost) {
+		t.Fatalf("mark-applied must stay fail-closed, got %v", err)
 	}
 }

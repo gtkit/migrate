@@ -100,6 +100,11 @@ func TestMakeMigrationSupportsCustomDirectories(t *testing.T) {
 	if !strings.Contains(migrationContent, "CreateTable(") {
 		t.Fatalf("create migration should call CreateTable on the snapshot struct, got:\n%s", migrationContent)
 	}
+	// 幂等守卫必须在 CreateTable 之前：MySQL DDL 已提交但记录未写时重跑 up 才能自愈.
+	guard := strings.Index(migrationContent, `HasTable("users")`)
+	if guard < 0 || guard > strings.Index(migrationContent, "CreateTable(") {
+		t.Fatalf("create migration should check HasTable before CreateTable, got:\n%s", migrationContent)
+	}
 }
 
 func TestMakeMigrationDropColumnMarksIrreversibleDown(t *testing.T) {

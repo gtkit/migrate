@@ -1048,3 +1048,135 @@ func TestMigratorRollbackRecoversFromDownPanic(t *testing.T) {
 		t.Fatalf("migration record must be kept when down panics, got %d", n)
 	}
 }
+
+// warnCaptureLogger 记录 Warn 调用，用于断言容忍未知记录时有可观测输出.
+type warnCaptureLogger struct {
+	NopLogger
+	warns []string
+}
+
+func (l *warnCaptureLogger) Warn(msg string, keysAndValues ...any) {
+	l.warns = append(l.warns, msg+" "+formatKV(keysAndValues))
+}
+
+// TestMigratorAllowUnknownAppliedTolerates 验证 WithAllowUnknownApplied 的作用边界：
+// 授权后 Pending/Up/IsUpToDate/Status 对"已应用但未注册"的记录记 Warn 后继续，
+// 只处理已注册未应用的迁移且不动未知记录；MarkApplied 与回滚入口仍 fail-closed.
+func TestMigratorAllowUnknownAppliedTolerates(t *testing.T) {
+	db := openExecTestDB(t, "allow_unknown_applied")
+	const (
+		ghost   = "2026_03_24_120001_ghost"
+		known   = "2026_03_24_120000_known"
+		pending = "2026_03_24_120002_pending"
+	)
+
+	registry := NewRegistry()
+	registry.Add(known, func(*gorm.DB) error { return nil }, func(*gorm.DB) error { return nil })
+	registry.Add(pending, func(tx *gorm.DB) error {
+		return tx.Migrator().CreateTable(&execTestUser{})
+	}, func(tx *gorm.DB) error {
+		return tx.Migrator().DropTable(&execTestUser{})
+	})
+
+	strict := NewMigrator(t.TempDir(), db, WithRegistry(registry), WithLogger(&NopLogger{}))
+	if err := strict.Setup(t.Context()); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	// 账本：known 已应用，ghost 已应用但当前 registry 未注册（模拟新版本写入后回滚到旧 binary）.
+	for _, name := range []string{known, ghost} {
+		if err := db.Create(&Migration{Migration: name, Batch: 1}).Error; err != nil {
+			t.Fatalf("seed %s: %v", name, err)
+		}
+	}
+
+	// 默认 fail-closed：四个入口都报错，且不执行 pending.
+	if _, err := strict.Pending(t.Context()); err == nil {
+		t.Fatalf("Pending should fail-closed without WithAllowUnknownApplied")
+	}
+	if _, err := strict.Status(t.Context()); err == nil {
+		t.Fatalf("Status should fail-closed without WithAllowUnknownApplied")
+	}
+	if _, err := strict.IsUpToDate(t.Context()); err == nil {
+		t.Fatalf("IsUpToDate should fail-closed without WithAllowUnknownApplied")
+	}
+	if err := strict.Up(t.Context()); err == nil {
+		t.Fatalf("Up should fail-closed without WithAllowUnknownApplied")
+	}
+	if db.Migrator().HasTable(&execTestUser{}) {
+		t.Fatalf("strict Up must not execute pending migration")
+	}
+
+	logger := &warnCaptureLogger{}
+	tolerant := NewMigrator(t.TempDir(), db, WithRegistry(registry), WithLogger(logger), WithAllowUnknownApplied())
+
+	got, err := tolerant.Pending(t.Context())
+	if err != nil {
+		t.Fatalf("tolerant Pending: %v", err)
+	}
+	if len(got) != 1 || got[0] != pending {
+		t.Fatalf("tolerant Pending should list only the registered unapplied migration, got %v", got)
+	}
+	upToDate, err := tolerant.IsUpToDate(t.Context())
+	if err != nil || upToDate {
+		t.Fatalf("tolerant IsUpToDate before Up = (%v, %v), want (false, nil)", upToDate, err)
+	}
+
+	if err := tolerant.Up(t.Context()); err != nil {
+		t.Fatalf("tolerant Up: %v", err)
+	}
+	if !db.Migrator().HasTable(&execTestUser{}) {
+		t.Fatalf("tolerant Up should execute the registered pending migration")
+	}
+	upToDate, err = tolerant.IsUpToDate(t.Context())
+	if err != nil || !upToDate {
+		t.Fatalf("tolerant IsUpToDate after Up = (%v, %v), want (true, nil)", upToDate, err)
+	}
+
+	statuses, err := tolerant.Status(t.Context())
+	if err != nil {
+		t.Fatalf("tolerant Status: %v", err)
+	}
+	if len(statuses) != 2 || !statuses[0].Ran || !statuses[1].Ran {
+		t.Fatalf("tolerant Status should list the two registered migrations as ran, got %+v", statuses)
+	}
+
+	// 未知记录原样保留：账本共 3 条，ghost 仍在.
+	var count int64
+	if err := db.Model(&Migration{}).Count(&count).Error; err != nil {
+		t.Fatalf("count records: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("expected 3 ledger rows (known, ghost, pending), got %d", count)
+	}
+	if err := db.Model(&Migration{}).Where("migration = ?", ghost).Count(&count).Error; err != nil || count != 1 {
+		t.Fatalf("ghost record must be untouched, count=%d err=%v", count, err)
+	}
+
+	// 容忍必须可观测：每个入口对 ghost 都记了 Warn.
+	if len(logger.warns) == 0 {
+		t.Fatalf("tolerating unknown applied migration must log a warning")
+	}
+	for _, w := range logger.warns {
+		if !strings.Contains(w, ghost) {
+			t.Fatalf("warning should name the unknown migration, got %q", w)
+		}
+	}
+
+	// MarkApplied 不受该选项影响：漂移状态下拒绝写 baseline.
+	extra := "2026_03_24_120003_extra"
+	registry.Add(extra, func(*gorm.DB) error { return nil }, func(*gorm.DB) error { return nil })
+	if _, err := tolerant.MarkApplied(t.Context(), ""); err == nil || !strings.Contains(err.Error(), ghost) {
+		t.Fatalf("MarkApplied must stay fail-closed on unknown applied migration, got %v", err)
+	}
+	if err := db.Model(&Migration{}).Where("migration = ?", extra).Count(&count).Error; err != nil || count != 0 {
+		t.Fatalf("MarkApplied must not write any record, count=%d err=%v", count, err)
+	}
+
+	// 回滚入口不受该选项影响：待回滚集合含 ghost 时整体拒绝，什么都不回滚.
+	if err := tolerant.Reset(t.Context()); err == nil || !strings.Contains(err.Error(), ghost) {
+		t.Fatalf("Reset must stay fail-closed on unknown applied migration, got %v", err)
+	}
+	if !db.Migrator().HasTable(&execTestUser{}) {
+		t.Fatalf("rejected Reset must not roll back anything")
+	}
+}

@@ -6,6 +6,12 @@
 
 ## [Unreleased]
 
+## [2.2.2] - 2026-09-20
+
+### Added
+
+- 回归测试：`WithAllowUnknownApplied` 的作用边界（migration 包单测 + CLI 端到端，覆盖默认 fail-closed、授权后 `pending`/`up`/`status`/`IsUpToDate` 放行并记 Warn、未知记录原样保留、`mark-applied` 与回滚仍拒绝）；`create` 模板的 `HasTable` 守卫（`make` 生成内容断言 + 真实 MySQL 集成测试验证 DDL 已提交但记录未写时重跑 `up` 自愈）。
+
 ## [2.2.1] - 2026-09-20
 
 ### Fixed
