@@ -1,11 +1,15 @@
 package make
 
 import (
+	"errors"
+	"go/format"
 	"go/parser"
 	"go/token"
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -51,6 +55,38 @@ func TestMakeModelGeneratesReferenceLayoutByDefault(t *testing.T) {
 	repositoryContent := readFile(t, filepath.Join(tmpDir, "internal/repository/user/repository_util.go"))
 	if !strings.Contains(repositoryContent, `"example.com/testapp/internal/models"`) {
 		t.Fatalf("repository should import configured models path, got:\n%s", repositoryContent)
+	}
+	// 脚手架只依赖标准库与 gorm：不得 import 旧项目私有包或额外 JSON 库.
+	for _, filePath := range expectedFiles {
+		content := readFile(t, filePath)
+		for _, forbidden := range []string{"internal/pkg/paginator", "github.com/gtkit/json"} {
+			if strings.Contains(content, forbidden) {
+				t.Fatalf("%s must not import %s:\n%s", filePath, forbidden, content)
+			}
+		}
+	}
+	for _, method := range []string{
+		"func (r *Repository) Get(ctx context.Context, id int64) (user models.User, found bool, err error)",
+		"func (r *Repository) ExistsByID(ctx context.Context, id int64) (bool, error)",
+		"func (r *Repository) All(ctx context.Context) (users []models.User, err error)",
+		"func (r *Repository) CreateOrUpdate(",
+		"gorm.ErrRecordNotFound",
+	} {
+		if !strings.Contains(repositoryContent, method) {
+			t.Fatalf("repository should provide %q, got:\n%s", method, repositoryContent)
+		}
+	}
+	for _, removed := range []string{"GetBy(", "IsExist(", "Paginate(", "ListPaging", "fmt.Sprintf(\"%s = ?\""} {
+		if strings.Contains(repositoryContent, removed) {
+			t.Fatalf("repository must not keep %q (swallowed errors / dynamic column names), got:\n%s", removed, repositoryContent)
+		}
+	}
+	if !strings.Contains(modelContent, "strconv.FormatInt(user.ID, 10)") || !strings.Contains(modelContent, `"encoding/json"`) {
+		t.Fatalf("model should use FormatInt and encoding/json, got:\n%s", modelContent)
+	}
+	docContent := readFile(t, filepath.Join(tmpDir, "internal/models/doc.go"))
+	if !strings.HasPrefix(docContent, "// Package models ") {
+		t.Fatalf("doc.go package comment must precede the package clause, got:\n%s", docContent)
 	}
 }
 
@@ -209,6 +245,16 @@ func TestMakeCmdGeneratesCommandFile(t *testing.T) {
 		t.Fatalf("expected exactly one generated command file, got %d", len(files))
 	}
 	assertGoFileParses(t, files[0])
+	content := readFile(t, files[0])
+	if !strings.Contains(content, "var CmdBackupDatabase = &cobra.Command{") || !strings.Contains(content, "RunE:  runBackupDatabase") {
+		t.Fatalf("command stub should declare an exported RunE command, got:\n%s", content)
+	}
+	// 不自动注册（不假设调用方存在 rootCmd）、不依赖 console.
+	for _, forbidden := range []string{"rootCmd", "console.", "func init()"} {
+		if strings.Contains(content, forbidden) {
+			t.Fatalf("command stub must not contain %q, got:\n%s", forbidden, content)
+		}
+	}
 }
 
 func TestMakeDDLGeneratesSQLFile(t *testing.T) {
@@ -388,5 +434,261 @@ func TestSetProjectNameOverridesConfig(t *testing.T) {
 	SetProjectName("") // 空值忽略
 	if got := CurrentConfig().ProjectName; got != "example.com/new" {
 		t.Fatalf("empty SetProjectName should be ignored, got %q", got)
+	}
+}
+
+type snapshotTestBase struct {
+	ID int64 `gorm:"column:id;primaryKey;autoIncrement"`
+}
+
+type snapshotTestStatus int8
+
+type snapshotTestUser struct {
+	snapshotTestBase
+	Name      string             `gorm:"column:name;size:64;not null"`
+	Nick      *string            `gorm:"column:nick;size:32"`
+	Status    snapshotTestStatus `gorm:"column:status;default:0"`
+	Payload   []byte             `gorm:"column:payload;type:json"`
+	secret    string             //nolint:unused // 故意保留：验证快照生成跳过未导出字段
+	Ignored   string             `gorm:"-"`
+	CreatedAt time.Time          `gorm:"column:created_at;type:datetime;index"`
+	DeletedAt gorm.DeletedAt     `gorm:"column:deleted_at;index"`
+}
+
+func (snapshotTestUser) TableName() string { return "snapshot_users" }
+
+// TestMakeMigrationCreateFromModel 验证 --from-model：字段来自注册 model（嵌入展平、跳过未导出与 gorm:"-"、
+// []byte 渲染、tag 原样、无 TODO）、不生成脚手架、产物经 gofmt；表名不匹配时报错且不落盘.
+func TestMakeMigrationCreateFromModel(t *testing.T) {
+	resetMakeTestState(t)
+	tmpDir := t.TempDir()
+	chdirForTest(t, tmpDir)
+	SetConfig(Config{DDLModels: []any{&snapshotTestUser{}}})
+
+	executeMakeCommand(t, "migration", "--from-model", "create_snapshot_users_table")
+
+	migrations, err := filepath.Glob(filepath.Join(tmpDir, "database/migrations/*_create_snapshot_users_table.go"))
+	if err != nil || len(migrations) != 1 {
+		t.Fatalf("expected exactly one generated migration, got %v (%v)", migrations, err)
+	}
+	assertGoFileParses(t, migrations[0])
+	content := readFile(t, migrations[0])
+
+	formatted, err := format.Source([]byte(content))
+	if err != nil || string(formatted) != content {
+		t.Fatalf("generated file must be gofmt-clean (err=%v):\n%s", err, content)
+	}
+	// 字段行用正则匹配：gofmt 的列对齐宽度取决于最长字段名与类型名，不在此固化空格数.
+	for _, want := range []string{
+		`ID\s+int64\s+` + "`gorm:\"column:id;primaryKey;autoIncrement\"`",
+		`Nick\s+\*string\s+` + "`gorm:\"column:nick;size:32\"`",
+		`Status\s+make\.snapshotTestStatus\s+` + "`gorm:\"column:status;default:0\"`",
+		`Payload\s+\[\]byte\s+` + "`gorm:\"column:payload;type:json\"`",
+		`DeletedAt\s+gorm\.DeletedAt\s+` + "`gorm:\"column:deleted_at;index\"`",
+		`return "snapshot_users"`,
+		"\n\t\"time\"\n",
+		"\n\t\"github.com/gtkit/migrate/v2/make\"\n",
+		`HasTable\("snapshot_users"\)`,
+	} {
+		if !regexp.MustCompile(want).MatchString(content) {
+			t.Errorf("generated snapshot missing %q:\n%s", want, content)
+		}
+	}
+	for _, unwanted := range []string{"secret", "Ignored", "TODO", "snapshotTestBase"} {
+		if strings.Contains(content, unwanted) {
+			t.Errorf("generated snapshot must not contain %q:\n%s", unwanted, content)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, "internal")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("--from-model must not scaffold model/repository, stat err=%v", err)
+	}
+
+	// 表名与注册 model 不一致：报错列出已注册表名，且不写任何迁移文件.
+	resetMakeTestState(t)
+	SetConfig(Config{DDLModels: []any{&snapshotTestUser{}}})
+	CmdMake.SetArgs([]string{"migration", "--from-model", "create_orders_table"})
+	err = CmdMake.Execute()
+	if err == nil || !strings.Contains(err.Error(), "snapshot_users") || !strings.Contains(err.Error(), `"orders"`) {
+		t.Fatalf("mismatched table should fail naming registered tables, got %v", err)
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(tmpDir, "database/migrations/*orders*")); len(leftovers) != 0 {
+		t.Fatalf("failed --from-model must not write files, got %v", leftovers)
+	}
+
+	// 未注册任何 model 时同样报错.
+	resetMakeTestState(t)
+	SetConfig(Config{})
+	CmdMake.SetArgs([]string{"migration", "--from-model", "create_snapshot_users_table"})
+	if err := CmdMake.Execute(); err == nil {
+		t.Fatalf("--from-model without registered models should error")
+	}
+}
+
+// TestMakeMigrationAddWithColumnDefinition 验证 --type/--not-null/--default/--comment（可与 --after 组合）
+// 生成完整 SQL、无 TODO，且 COMMENT 中的单引号被转义.
+func TestMakeMigrationAddWithColumnDefinition(t *testing.T) {
+	resetMakeTestState(t)
+	tmpDir := t.TempDir()
+	chdirForTest(t, tmpDir)
+
+	executeMakeCommand(t, "migration", "add_email_to_users_table",
+		"--type", "VARCHAR(128)", "--not-null", "--default", "''", "--comment", "用户'邮箱", "--after", "name")
+
+	migrations, err := filepath.Glob(filepath.Join(tmpDir, "database/migrations/*_add_email_to_users_table.go"))
+	if err != nil || len(migrations) != 1 {
+		t.Fatalf("expected exactly one generated migration, got %v (%v)", migrations, err)
+	}
+	assertGoFileParses(t, migrations[0])
+	content := readFile(t, migrations[0])
+	want := "ALTER TABLE `users` ADD COLUMN `email` VARCHAR(128) NOT NULL DEFAULT '' COMMENT '用户''邮箱' AFTER `name`"
+	if !strings.Contains(content, want) {
+		t.Fatalf("expected complete ADD COLUMN %q, got:\n%s", want, content)
+	}
+	if strings.Contains(content, "TODO") {
+		t.Fatalf("complete column definition must not leave a TODO:\n%s", content)
+	}
+
+	// 只给 --type，不带修饰：无 NOT NULL/DEFAULT/COMMENT.
+	resetMakeTestState(t)
+	executeMakeCommand(t, "migration", "add_age_to_users_table", "--type", "INT")
+	migrations, _ = filepath.Glob(filepath.Join(tmpDir, "database/migrations/*_add_age_to_users_table.go"))
+	content = readFile(t, migrations[0])
+	if !strings.Contains(content, "ADD COLUMN `age` INT\"") || strings.Contains(content, "NOT NULL") {
+		t.Fatalf("--type alone should emit the bare type, got:\n%s", content)
+	}
+}
+
+// TestMakeMigrationAddModifiersRequireType 验证 --not-null/--default/--comment 缺 --type 时报错且不落盘.
+func TestMakeMigrationAddModifiersRequireType(t *testing.T) {
+	for _, args := range [][]string{
+		{"--not-null"},
+		{"--default", "0"},
+		{"--comment", "x"},
+	} {
+		t.Run(args[0], func(t *testing.T) {
+			resetMakeTestState(t)
+			tmpDir := t.TempDir()
+			chdirForTest(t, tmpDir)
+			CmdMake.SetArgs(append([]string{"migration", "add_phone_to_users_table"}, args...))
+			err := CmdMake.Execute()
+			if err == nil || !strings.Contains(err.Error(), "--type") {
+				t.Fatalf("%v without --type should error mentioning --type, got %v", args, err)
+			}
+			if files, _ := filepath.Glob(filepath.Join(tmpDir, "database/migrations/*_add_phone_to_users_table.go")); len(files) != 0 {
+				t.Fatalf("failed validation must not write files, got %v", files)
+			}
+		})
+	}
+}
+
+// TestMakeModelResolvesProjectNameFromGoMod 验证未配置项目名时从执行目录向上查找 go.mod 解析 module path.
+func TestMakeModelResolvesProjectNameFromGoMod(t *testing.T) {
+	resetMakeTestState(t)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/fromgomod\n\ngo 1.26\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	nested := filepath.Join(root, "cmd", "app")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	chdirForTest(t, nested)
+	SetConfig(Config{})
+
+	executeMakeCommand(t, "model", "user")
+
+	repository := readFile(t, filepath.Join(nested, "internal/repository/user/repository_util.go"))
+	if !strings.Contains(repository, `"example.com/fromgomod/internal/models"`) {
+		t.Fatalf("import prefix should come from go.mod, got:\n%s", repository)
+	}
+}
+
+// TestMakeModelFailsWithoutProjectNameOrGoMod 验证既未配置项目名又找不到 go.mod 时 fail-closed 且不落盘.
+func TestMakeModelFailsWithoutProjectNameOrGoMod(t *testing.T) {
+	resetMakeTestState(t)
+	tmpDir := t.TempDir()
+	chdirForTest(t, tmpDir)
+	SetConfig(Config{})
+
+	for _, args := range [][]string{
+		{"model", "order"},
+		{"migration", "create_orders_table"},
+	} {
+		CmdMake.SetArgs(args)
+		err := CmdMake.Execute()
+		if err == nil || !strings.Contains(err.Error(), "go.mod") {
+			t.Fatalf("%v without project name or go.mod should error mentioning go.mod, got %v", args, err)
+		}
+	}
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("failed generation must not write files, got %d entries", len(entries))
+	}
+}
+
+// TestReadModulePath 验证 go.mod module 指令解析：带引号、无 module 行、文件不存在.
+func TestReadModulePath(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		return p
+	}
+	if got, ok := readModulePath(write("a.mod", "// comment\nmodule   example.com/a  \n")); !ok || got != "example.com/a" {
+		t.Fatalf("plain module line: got %q %v", got, ok)
+	}
+	if got, ok := readModulePath(write("b.mod", "module \"example.com/b\"\n")); !ok || got != "example.com/b" {
+		t.Fatalf("quoted module line: got %q %v", got, ok)
+	}
+	if _, ok := readModulePath(write("c.mod", "go 1.26\n")); ok {
+		t.Fatalf("file without module line must report not found")
+	}
+	if _, ok := readModulePath(filepath.Join(dir, "missing.mod")); ok {
+		t.Fatalf("missing file must report not found")
+	}
+}
+
+// TestSnapshotRenderingHelpers 验证快照渲染的边界：[]byte 还原、指针/切片/映射穿透收集 import、含反引号的 tag.
+func TestSnapshotRenderingHelpers(t *testing.T) {
+	if got := typeString(reflect.TypeFor[[]byte]()); got != "[]byte" {
+		t.Fatalf("[]byte should render as []byte, got %q", got)
+	}
+	if got := typeString(reflect.TypeFor[[]uint16]()); got != "[]uint16" {
+		t.Fatalf("other slices keep reflect rendering, got %q", got)
+	}
+
+	imports := map[string]string{}
+	collectImports(reflect.TypeFor[map[string]*[]time.Time](), imports)
+	collectImports(reflect.TypeFor[gorm.DeletedAt](), imports)
+	collectImports(reflect.TypeFor[string](), imports)
+	if len(imports) != 2 || imports["time"] != "" || imports["gorm.io/gorm"] != "" {
+		t.Fatalf("expected time and gorm imports without alias, got %v", imports)
+	}
+
+	if got := tagLiteral(`gorm:"column:a"`); got != "`gorm:\"column:a\"`" {
+		t.Fatalf("plain tag should use raw string, got %s", got)
+	}
+	if got := tagLiteral("gorm:\"comment:a`b\""); got != `"gorm:\"comment:a`+"`"+`b\""` {
+		t.Fatalf("tag containing a backtick must fall back to an interpreted literal, got %s", got)
+	}
+
+	// 匿名嵌入实现 driver.Valuer 的 struct 视为单列不展平.
+	src, err := renderSnapshot(reflect.TypeOf(struct {
+		gorm.DeletedAt
+		Name string
+	}{}))
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !strings.Contains(src.fields, "DeletedAt gorm.DeletedAt") {
+		t.Fatalf("Valuer embed must stay a single column, got:\n%s", src.fields)
+	}
+	if _, err := renderSnapshot(reflect.TypeOf(struct{ secret string }{})); err == nil {
+		t.Fatalf("struct without exported fields must error")
 	}
 }

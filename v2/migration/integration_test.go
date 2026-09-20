@@ -4,6 +4,7 @@ package migration
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -510,5 +511,47 @@ func TestMigratorMySQLGuardedCreateSelfHeals(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("up should have run exactly twice, got %d", calls)
+	}
+}
+
+// TestMigratorMySQLDerivedLockName 在真实 MySQL 上验证默认锁名派生：
+// 锁名为 migrate:<库名>:<账本表名> 且确实被持有；不同账本表拿到不同锁互不阻塞；
+// 同账本表等待超时返回 ErrLockNotAcquired；释放后锁消失.
+func TestMigratorMySQLDerivedLockName(t *testing.T) {
+	db := openMySQLTestDB(t)
+	expected := deriveMySQLLockName(CurrentDatabase(db), defaultTableName)
+
+	m := NewMigrator(t.TempDir(), db, WithRegistry(NewRegistry()), WithLogger(&NopLogger{}))
+	release, err := m.lock.Acquire(t.Context())
+	if err != nil {
+		t.Fatalf("acquire derived lock: %v", err)
+	}
+	var holder *int64
+	if err := db.Raw("SELECT IS_USED_LOCK(?)", expected).Scan(&holder).Error; err != nil {
+		t.Fatalf("query IS_USED_LOCK: %v", err)
+	}
+	if holder == nil {
+		t.Fatalf("derived lock %q should be held", expected)
+	}
+
+	other := NewMigrator(t.TempDir(), db, WithRegistry(NewRegistry()), WithLogger(&NopLogger{}),
+		WithMigrationsTable("svc2_migrations"), WithLockTimeout(2*time.Second))
+	releaseOther, err := other.lock.Acquire(t.Context())
+	if err != nil {
+		t.Fatalf("a different ledger table must derive a different lock and not block: %v", err)
+	}
+	releaseOther()
+
+	same := NewMigrator(t.TempDir(), db, WithRegistry(NewRegistry()), WithLogger(&NopLogger{}), WithLockTimeout(time.Second))
+	if _, err := same.lock.Acquire(t.Context()); !errors.Is(err, ErrLockNotAcquired) {
+		t.Fatalf("same ledger table must wait and fail with ErrLockNotAcquired, got %v", err)
+	}
+
+	release()
+	if err := db.Raw("SELECT IS_USED_LOCK(?)", expected).Scan(&holder).Error; err != nil {
+		t.Fatalf("query IS_USED_LOCK after release: %v", err)
+	}
+	if holder != nil {
+		t.Fatalf("derived lock %q should be released", expected)
 	}
 }

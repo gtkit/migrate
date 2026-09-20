@@ -3,14 +3,17 @@ package make
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gtkit/stringx"
 	"github.com/spf13/cobra"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
+	"gorm.io/gorm/schema"
 )
 
 // CmdMakeDDL 为已注册的 GORM 模型生成 strict 建表 DDL（make ddl）.
@@ -148,6 +151,7 @@ type ddlTarget struct {
 	Aliases    []string
 	StructName string
 	TableName  string
+	Type       reflect.Type // model 的 struct 类型，供 --from-model 反射快照
 	Value      any
 }
 
@@ -193,31 +197,34 @@ func resolveDDLTargets(db *gorm.DB, models []any, names []string, all bool) ([]d
 	return selected, nil
 }
 
+// buildDDLTargets 解析已注册 model 的 schema；db 为 nil 时用 GORM 默认命名策略
+// （make migration --from-model 不要求数据库连接）.别名重复由查找表天然去重.
 func buildDDLTargets(db *gorm.DB, models []any) ([]ddlTarget, error) {
+	var namer schema.Namer = schema.NamingStrategy{}
+	if db != nil && db.Config != nil && db.NamingStrategy != nil {
+		namer = db.NamingStrategy
+	}
+	cache := &sync.Map{}
+
 	targets := make([]ddlTarget, 0, len(models))
 	for _, model := range models {
 		if model == nil {
 			continue
 		}
-
-		stmt := &gorm.Statement{DB: db}
-		if err := stmt.Parse(model); err != nil {
+		sc, err := schema.Parse(model, cache, namer)
+		if err != nil {
 			return nil, fmt.Errorf("parse ddl model: %w", err)
 		}
-
-		structName := stmt.Schema.Name
-		tableName := stmt.Schema.Table
-		aliases := []string{
-			normalizeDDLName(structName),
-			normalizeDDLName(stringx.ToSnake(structName)),
-			normalizeDDLName(tableName),
-			normalizeDDLName(stringx.Singular(tableName)),
-		}
-
 		targets = append(targets, ddlTarget{
-			Aliases:    compactStrings(aliases),
-			StructName: structName,
-			TableName:  tableName,
+			Aliases: []string{
+				normalizeDDLName(sc.Name),
+				normalizeDDLName(stringx.ToSnake(sc.Name)),
+				normalizeDDLName(sc.Table),
+				normalizeDDLName(stringx.Singular(sc.Table)),
+			},
+			StructName: sc.Name,
+			TableName:  sc.Table,
+			Type:       sc.ModelType,
 			Value:      model,
 		})
 	}
@@ -230,27 +237,7 @@ func buildDDLTargets(db *gorm.DB, models []any) ([]ddlTarget, error) {
 
 func normalizeDDLName(name string) string {
 	name = strings.TrimSpace(name)
-	if name == "" {
-		return ""
-	}
 	name = strings.ReplaceAll(name, "-", "_")
 	name = strings.ReplaceAll(name, " ", "_")
 	return strings.ToLower(name)
-}
-
-func compactStrings(values []string) []string {
-	result := make([]string, 0, len(values))
-	seen := make(map[string]struct{}, len(values))
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value == "" {
-			continue
-		}
-		if _, ok := seen[value]; ok {
-			continue
-		}
-		seen[value] = struct{}{}
-		result = append(result, value)
-	}
-	return result
 }

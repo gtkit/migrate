@@ -1,4 +1,4 @@
-// Package {{PackageName}} 模型
+// Package {{PackageName}} 是 {{StructName}} 的数据访问层。
 package {{PackageName}}
 
 import (
@@ -7,16 +7,17 @@ import (
 	"gorm.io/gorm"
 )
 
+// Repository 封装 {{StructName}} 的数据库读写。
 type Repository struct {
 	db *gorm.DB
 }
 
+// New 构造 Repository。
 func New(db *gorm.DB) *Repository {
-	return &Repository{
-		db: db,
-	}
+	return &Repository{db: db}
 }
 
+// mdbCtx 返回绑定 ctx 的查询入口，所有方法统一经此访问数据库。
 func (r *Repository) mdbCtx(ctx context.Context) *gorm.DB {
 	return r.db.WithContext(ctx)
 }

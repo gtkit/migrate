@@ -6,6 +6,40 @@
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-09-20
+
+### Added
+
+- `make migration create_<table>_table --from-model`：从 `WithDDLModels` 中表名匹配的 GORM model 反射生成快照 struct 的全部导出字段、tag 与 import（匿名嵌入展平、`gorm:"-"` 跳过、`[]byte` 按惯例渲染），不含 `TODO`，不生成 model/repository 脚手架；找不到匹配 model 或表名不一致时报错且不落盘。
+- `make migration add_<col>_to_<table>_table` 新增 `--type` / `--not-null` / `--default` / `--comment`：给出 `--type` 时生成完整可执行的 `ADD COLUMN`（可与 `--after` 组合），不含 `TODO`；三个修饰参数在无 `--type` 时报错。
+- CLI `migrate down --step N`：回滚最新 N 条而非最后一批，N 必须为正整数。
+- `migrate status` 显示已应用迁移的应用时间；`MigrationStatus` 新增 `AppliedAt` 字段。
+- `up` / 回滚日志的 `migrated` / `rolled back` 带每条迁移的 `duration`。
+- 新增 sentinel 错误 `migration.ErrNoMigrations`、`ErrDuplicateRegistration`、`ErrRegistryDrift`、`ErrLockNotAcquired`，对应失败路径以 `%w` 包装，可 `errors.Is` 判定。
+- 生成的 `.go` 文件统一经 gofmt 格式化，格式化失败视为生成失败。
+- 回归测试：默认锁名派生（单测 + 真实 MySQL 集成）、MySQL 显式锁名长度 fail-closed（离线方言构造，不连库）、只读诊断不建表、耗时日志字段、四个 sentinel 的 `errors.Is`、CLI `down --step` 与 `status` 时间输出、`--from-model` 反射规则与不落盘、`add` 列定义参数与校验、`go.mod` 项目名解析与缺失 fail-closed。
+- README 新增「详细使用指南」：从注册 model、`create --from-model`、`add --type`、其他结构变更、发布到生产、回滚与排障、多实例与多项目的完整流程与生成物示例。
+
+### Changed
+
+- **⚠ 破坏性变更（默认值）** MySQL 默认迁移锁名由固定的 `migrate_lock` 改为按 `migrate:<数据库名>:<账本表名>` 派生（超 64 字符截断并追加 FNV-64a 哈希后缀）。`GET_LOCK` 的命名空间是整个 MySQL 实例全局的，固定锁名会让同实例不同数据库、不同账本表的迁移互相等锁并在默认 10 秒后报错。迁移说明：滚动升级窗口内新旧 binary 锁名不同、互斥失效，需要跨版本互斥的用户请在升级前后显式配置相同的 `WithLockName`。PostgreSQL 默认锁名不变。
+- **⚠ 破坏性变更** MySQL 上显式 `WithLockName` 超过 64 字符时所有迁移入口 fail-closed 报错（此前直到 `GET_LOCK` 执行才由 MySQL 报错）。
+- **⚠ 破坏性变更（默认值）** `WithProjectName` 缺省值由字面量 `project_name` 改为"从执行目录向上查找 `go.mod` 解析 module path"；找不到 `go.mod` 时 `make model` 与 `make migration create_*`（非 `--from-model`）报错且不落盘，不再生成带错误 import 的脚手架。
+- `Status` / `Pending` / `IsUpToDate` 改为只读：不获取锁、不创建账本表，账本表不存在时视为无已应用记录（可在只读账号或新库上运行）。`up` 等写命令仍按原样创建账本表。
+- **⚠ 脚手架形态变更** `make model`（及 `make migration create_*` 附带的脚手架）生成物只依赖标准库与 `gorm`：去掉对 `<module>/internal/pkg/paginator` 与 `github.com/gtkit/json` 的 import（此前在新项目里编译不过），JSON 改用 `encoding/json`；仓储方法改为 `Get(ctx, id) (model, found, err)`、`ExistsByID`、`All(ctx) ([]model, error)`、`CreateOrUpdate`，删除吞错误的 `Get`/`All` 旧签名与按调用方传入字段名拼接 SQL 的 `GetBy`/`IsExist`，以及依赖 paginator 的 `ListPaging`/`Paginate`；`GetStringID` 改用 `strconv.FormatInt`。已存在的文件不会被覆盖。
+- **⚠ 脚手架形态变更** `make cmd` 模板改为最小可编译形态：`RunE` 签名、无演示输出、不再在 `init` 里假设存在 `rootCmd` 自动注册，生成后由用户显式 `rootCmd.AddCommand`。
+- `make` 包精简：删除无模板引用的 `Model` 字段与对应替换项、只为去重而存在的辅助函数、不可达分支与单调用点的包装函数；`make ddl` 与 `--from-model` 共用同一套 model 解析（`db` 为 nil 时用 GORM 默认命名策略）。行为不变。
+
+### Fixed
+
+- 修复 model 包与 migrations 包 `doc.go` 模板的包注释位置（此前写在 `package` 子句之后，不是有效的包文档）。
+
+### Migration Notes
+
+- MySQL 用户升级后默认锁名改变：滚动升级窗口内新旧版本互斥失效。需要跨版本互斥的，在升级前后给新旧 binary 显式配置相同的 `WithLockName`；无此需求的无需改动，各库各账本表自动获得独立锁。
+- 依赖 `WithProjectName` 默认值 `project_name` 的生成流程会开始报错，属预期修正：在项目根目录（含 `go.mod`）执行生成命令，或显式传 `WithProjectName`。
+- 已生成的 model / repository / cmd 文件不会被覆盖，升级不影响存量代码；新生成的脚手架方法集与旧版不同，混用时按新签名调用。
+
 ## [2.2.2] - 2026-09-20
 
 ### Added

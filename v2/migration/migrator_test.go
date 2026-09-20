@@ -2,10 +2,12 @@ package migration
 
 import (
 	"errors"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
+	"gorm.io/driver/mysql"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -1049,13 +1051,18 @@ func TestMigratorRollbackRecoversFromDownPanic(t *testing.T) {
 	}
 }
 
-// warnCaptureLogger 记录 Warn 调用，用于断言容忍未知记录时有可观测输出.
-type warnCaptureLogger struct {
+// captureLogger 记录 Info/Warn 调用，用于断言日志可观测性（容忍未知记录的 Warn、迁移耗时字段）.
+type captureLogger struct {
 	NopLogger
+	infos []string
 	warns []string
 }
 
-func (l *warnCaptureLogger) Warn(msg string, keysAndValues ...any) {
+func (l *captureLogger) Info(msg string, keysAndValues ...any) {
+	l.infos = append(l.infos, msg+" "+formatKV(keysAndValues))
+}
+
+func (l *captureLogger) Warn(msg string, keysAndValues ...any) {
 	l.warns = append(l.warns, msg+" "+formatKV(keysAndValues))
 }
 
@@ -1106,7 +1113,7 @@ func TestMigratorAllowUnknownAppliedTolerates(t *testing.T) {
 		t.Fatalf("strict Up must not execute pending migration")
 	}
 
-	logger := &warnCaptureLogger{}
+	logger := &captureLogger{}
 	tolerant := NewMigrator(t.TempDir(), db, WithRegistry(registry), WithLogger(logger), WithAllowUnknownApplied())
 
 	got, err := tolerant.Pending(t.Context())
@@ -1178,5 +1185,188 @@ func TestMigratorAllowUnknownAppliedTolerates(t *testing.T) {
 	}
 	if !db.Migrator().HasTable(&execTestUser{}) {
 		t.Fatalf("rejected Reset must not roll back anything")
+	}
+}
+
+// TestMigratorDiagnosticsAreReadOnly 验证 Pending/Status/IsUpToDate 只读：
+// 账本表不存在时按"无已应用记录"返回且不创建表；Up 之后 Status 带应用时间.
+func TestMigratorDiagnosticsAreReadOnly(t *testing.T) {
+	db := openExecTestDB(t, "diagnostics_readonly")
+	registry := NewRegistry()
+	registry.Add("2026_03_24_120000_a", func(*gorm.DB) error { return nil }, func(*gorm.DB) error { return nil })
+	m := NewMigrator(t.TempDir(), db, WithRegistry(registry), WithLogger(&NopLogger{}))
+
+	pending, err := m.Pending(t.Context())
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("Pending on a fresh database = (%v, %v), want 1 pending", pending, err)
+	}
+	statuses, err := m.Status(t.Context())
+	if err != nil || len(statuses) != 1 || statuses[0].Ran || !statuses[0].AppliedAt.IsZero() {
+		t.Fatalf("Status on a fresh database = (%+v, %v), want 1 not-ran", statuses, err)
+	}
+	upToDate, err := m.IsUpToDate(t.Context())
+	if err != nil || upToDate {
+		t.Fatalf("IsUpToDate on a fresh database = (%v, %v), want (false, nil)", upToDate, err)
+	}
+	if db.Migrator().HasTable("migrations") {
+		t.Fatalf("read-only diagnostics must not create the migrations table")
+	}
+
+	before := time.Now().Add(-time.Second)
+	if err := m.Up(t.Context()); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+	statuses, err = m.Status(t.Context())
+	if err != nil || !statuses[0].Ran || statuses[0].Batch != 1 {
+		t.Fatalf("Status after Up = (%+v, %v)", statuses, err)
+	}
+	if statuses[0].AppliedAt.Before(before) {
+		t.Fatalf("AppliedAt %v should be set from the ledger record", statuses[0].AppliedAt)
+	}
+}
+
+// TestMigratorLogsDuration 验证 up 与回滚日志带每条迁移的耗时字段.
+func TestMigratorLogsDuration(t *testing.T) {
+	db := openExecTestDB(t, "logs_duration")
+	registry := NewRegistry()
+	registry.Add("2026_03_24_120000_a", func(*gorm.DB) error { return nil }, func(*gorm.DB) error { return nil })
+	logger := &captureLogger{}
+	m := NewMigrator(t.TempDir(), db, WithRegistry(registry), WithLogger(logger))
+
+	if err := m.Up(t.Context()); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+	if err := m.Rollback(t.Context()); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	durationLine := regexp.MustCompile(`^(migrated|rolled back) file=2026_03_24_120000_a duration=\d+(\.\d+)?[a-zµ]+$`)
+	matched := 0
+	for _, line := range logger.infos {
+		if durationLine.MatchString(line) {
+			matched++
+		}
+	}
+	if matched != 2 {
+		t.Fatalf("expected migrated and rolled back lines with duration, got %q", logger.infos)
+	}
+}
+
+// TestMigratorSentinelErrors 验证四类失败路径可用 errors.Is 判定.
+func TestMigratorSentinelErrors(t *testing.T) {
+	db := openExecTestDB(t, "sentinel_errors")
+	noop := func(*gorm.DB) error { return nil }
+
+	empty := NewMigrator(t.TempDir(), db, WithRegistry(NewRegistry()), WithLogger(&NopLogger{}))
+	if _, err := empty.Pending(t.Context()); !errors.Is(err, ErrNoMigrations) {
+		t.Fatalf("empty registry: want ErrNoMigrations, got %v", err)
+	}
+	if err := empty.Up(t.Context()); !errors.Is(err, ErrNoMigrations) {
+		t.Fatalf("empty registry Up: want ErrNoMigrations, got %v", err)
+	}
+
+	dup := NewRegistry()
+	dup.Add("2026_03_24_120000_a", noop, noop)
+	dup.Add("2026_03_24_120000_a", noop, noop)
+	dm := NewMigrator(t.TempDir(), db, WithRegistry(dup), WithLogger(&NopLogger{}))
+	if err := dm.Up(t.Context()); !errors.Is(err, ErrDuplicateRegistration) {
+		t.Fatalf("duplicate Up: want ErrDuplicateRegistration, got %v", err)
+	}
+
+	applied := NewRegistry()
+	applied.Add("2026_03_24_120000_a", noop, noop)
+	am := NewMigrator(t.TempDir(), db, WithRegistry(applied), WithLogger(&NopLogger{}))
+	if err := am.Up(t.Context()); err != nil {
+		t.Fatalf("seed applied migration: %v", err)
+	}
+	if err := dm.Reset(t.Context()); !errors.Is(err, ErrDuplicateRegistration) {
+		t.Fatalf("duplicate Reset: want ErrDuplicateRegistration, got %v", err)
+	}
+
+	other := NewRegistry()
+	other.Add("2026_03_24_120001_b", noop, noop)
+	om := NewMigrator(t.TempDir(), db, WithRegistry(other), WithLogger(&NopLogger{}))
+	if err := om.Up(t.Context()); !errors.Is(err, ErrRegistryDrift) {
+		t.Fatalf("drift Up: want ErrRegistryDrift, got %v", err)
+	}
+	if _, err := om.MarkApplied(t.Context(), ""); !errors.Is(err, ErrRegistryDrift) {
+		t.Fatalf("drift MarkApplied: want ErrRegistryDrift, got %v", err)
+	}
+	if err := om.Reset(t.Context()); !errors.Is(err, ErrRegistryDrift) {
+		t.Fatalf("drift Reset: want ErrRegistryDrift, got %v", err)
+	}
+	tolerant := NewMigrator(t.TempDir(), db, WithRegistry(other), WithLogger(&NopLogger{}), WithAllowUnknownApplied())
+	if _, err := tolerant.MarkApplied(t.Context(), ""); !errors.Is(err, ErrRegistryDrift) {
+		t.Fatalf("tolerant MarkApplied must still return ErrRegistryDrift, got %v", err)
+	}
+}
+
+// TestDeriveMySQLLockName 验证锁名派生：可读前缀、64 字符上限、稳定且不同输入不碰撞.
+func TestDeriveMySQLLockName(t *testing.T) {
+	if got := deriveMySQLLockName("shop", "migrations"); got != "migrate:shop:migrations" {
+		t.Fatalf("short name should be readable, got %q", got)
+	}
+	long := strings.Repeat("t", 63)
+	a := deriveMySQLLockName("shop", long)
+	if len(a) != mysqlLockNameMax || !strings.HasPrefix(a, "migrate:shop:") {
+		t.Fatalf("long name should be truncated to %d with prefix kept, got %q (%d)", mysqlLockNameMax, a, len(a))
+	}
+	if a != deriveMySQLLockName("shop", long) {
+		t.Fatalf("derivation must be deterministic")
+	}
+	b := deriveMySQLLockName("shop", strings.Repeat("t", 62)+"u")
+	if a == b {
+		t.Fatalf("different inputs sharing a 64-char prefix must not collide: %q", a)
+	}
+	// 数据库名相同、账本表不同 → 不同锁；账本表相同、数据库不同 → 不同锁.
+	if deriveMySQLLockName("shop", "migrations") == deriveMySQLLockName("shop", "svc2_migrations") ||
+		deriveMySQLLockName("shop", "migrations") == deriveMySQLLockName("crm", "migrations") {
+		t.Fatalf("lock name must isolate by database and ledger table")
+	}
+}
+
+// openOfflineMySQLDialect 构造 MySQL 方言的 *gorm.DB 但不建立连接，用于配置期 fail-closed 断言.
+func openOfflineMySQLDialect(t *testing.T) *gorm.DB {
+	t.Helper()
+	db, err := gorm.Open(mysql.New(mysql.Config{
+		DSN:                       "offline:@tcp(127.0.0.1:1)/offline",
+		SkipInitializeWithVersion: true,
+	}), &gorm.Config{DisableAutomaticPing: true})
+	if err != nil {
+		t.Fatalf("open offline mysql dialect: %v", err)
+	}
+	return db
+}
+
+// TestMigratorRejectsLongMySQLLockName 验证 MySQL 上显式锁名超 64 字符在配置期 fail-closed：
+// 不连数据库即报错；恰好 64 字符不报此错.
+func TestMigratorRejectsLongMySQLLockName(t *testing.T) {
+	db := openOfflineMySQLDialect(t)
+	registry := NewRegistry()
+	registry.Add("2026_03_24_120000_a", func(*gorm.DB) error { return nil }, nil)
+
+	tooLong := NewMigrator(t.TempDir(), db, WithRegistry(registry), WithLockName(strings.Repeat("x", mysqlLockNameMax+1)))
+	err := tooLong.Up(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "64") || !strings.Contains(err.Error(), "lock name") {
+		t.Fatalf("65-char lock name should fail closed with a length error, got %v", err)
+	}
+	if _, err := tooLong.Pending(t.Context()); err == nil || !strings.Contains(err.Error(), "lock name") {
+		t.Fatalf("read-only diagnostics must also surface the config error, got %v", err)
+	}
+	if _, err := tooLong.Lint(t.Context(), LintOptions{SkipDatabase: true}); err == nil || !strings.Contains(err.Error(), "lock name") {
+		t.Fatalf("Lint must surface the config error, got %v", err)
+	}
+
+	// 64 字符合法：configErr 为空（后续会因离线连接失败，但不是长度错误）.
+	exact := NewMigrator(t.TempDir(), db, WithRegistry(registry), WithLockName(strings.Repeat("x", mysqlLockNameMax)))
+	if exact.configErr != nil {
+		t.Fatalf("64-char lock name must be accepted, got %v", exact.configErr)
+	}
+	// 未配锁名 → 派生模式（lockName 为空），且非 MySQL 方言不校验长度.
+	if NewMigrator(t.TempDir(), db, WithRegistry(registry)).lockName != "" {
+		t.Fatalf("unset lock name must stay empty for derivation")
+	}
+	sqlite := openExecTestDB(t, "long_lock_sqlite")
+	if m := NewMigrator(t.TempDir(), sqlite, WithRegistry(registry), WithLockName(strings.Repeat("x", 100))); m.configErr != nil {
+		t.Fatalf("lock name length limit is MySQL-only, got %v", m.configErr)
 	}
 }

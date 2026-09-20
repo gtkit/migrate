@@ -12,7 +12,7 @@
 - `lint` 命令检查 migration 文件、registry 和已执行记录漂移
 - 结构化日志接口，可注入 zap / zerolog 等
 - Lock name 可配置，同一数据库多项目共存不冲突
-- `make migration` 自动生成迁移文件和 model 脚手架
+- `make migration` 自动生成迁移文件和 model 脚手架；`create --from-model` 从已注册的 GORM model 生成结构快照，`add --type ...` 直接生成完整的加列 SQL
 - `make ddl diff` 可对比当前模型生成的 strict DDL 与已提交 SQL 文件
 - 所有操作返回 `error`，不在库内调用 `os.Exit`
 
@@ -43,7 +43,7 @@ go get github.com/gtkit/migrate/v2@latest
 | `make ddl diff <model>` | 比较当前模型 DDL 与已提交 SQL | CI 检查 schema 漂移 |
 | `migrate pending` | 查看待执行 migration | 上线前确认 |
 | `migrate up` | 执行未运行 migration | 发布时执行 |
-| `migrate down --force` | 回滚最后一批 migration（需 `--force`） | 紧急回滚 |
+| `migrate down --force [--step N]` | 回滚最后一批 migration，`--step N` 改为回滚最新 N 条（需 `--force`） | 紧急回滚 |
 | `migrate down-to <version> --force` | 回滚到指定版本（需 `--force`，目标须已应用） | 回退到某版本 |
 | `migrate reset --force` | 回滚全部 migration（需 `--force`） | 测试环境重置 |
 | `migrate refresh --force` | 回滚全部再重放（需 `--force`） | 测试环境验证 |
@@ -137,14 +137,14 @@ func setupMigrate(db *gorm.DB) {
 
 | 配置 | 默认值 | 说明 |
 |------|--------|------|
-| `WithProjectName` | `project_name` | 生成代码里的 module import 前缀 |
+| `WithProjectName` | 从 `go.mod` 解析 | 生成代码里的 module import 前缀；缺省时生成命令从执行目录向上查找 `go.mod` 读取 module path，找不到则报错不落盘 |
 | `WithMigrationDir` | `database/migrations` | migration 文件目录 |
 | `WithModelDir` | `internal/models` | model 生成目录 |
 | `WithRepositoryDir` | `internal/repository` | repository 生成目录 |
 | `WithDDLDir` | `database/ddl` | DDL SQL 输出目录 |
 | `WithDDLModels` | 空 | 注册可用于 `make ddl` / `make ddl diff` 的模型 |
 | `WithTimeout` | `5m` | `migrate` 命令执行超时 |
-| `WithLockName` | `migrate_lock` | 分布式 advisory lock 名称 |
+| `WithLockName` | MySQL 派生 / PostgreSQL `migrate_lock` | 分布式 advisory lock 名称。MySQL 缺省按 `migrate:<数据库名>:<账本表名>` 派生（超 64 字符截断并追加哈希），同一实例上不同库、不同账本表互不阻塞；显式锁名在 MySQL 上不得超过 64 字符，超长时迁移命令直接报错 |
 | `WithLockTimeout` | `10s` | 获取迁移锁的最长等待时间 |
 | `WithMigrationsTable` | `migrations` | 迁移记录表名（多项目共库时各用独立表；仅字母/数字/下划线、≤63 字符，空白或非法值 `Setup` 直接报错） |
 | `WithAllowFresh` | 禁用 | 显式授权 `fresh`（删库内全部表）；仅本项目独占数据库时才应开启 |
@@ -193,10 +193,12 @@ internal/repository/user/repository_util.go     # Get / GetBy / All / IsExist / 
 
 其中：
 
-- `model.go` / `doc.go` 只会在不存在时补齐，不会反复覆盖
-- `user.go` 是 GORM model 骨架，包含 `ListPaging` 分页结构体、`Create` / `Save` / `Delete` / `CreateOrUpdate` / `MarshalBinary` / `UnmarshalBinary` 等常用方法
-- `repository.go` 定义 `Repository` 结构体、`New(db *gorm.DB)` 构造函数、`mdbCtx` context 注入
-- `repository_util.go` 包含 `Get` / `GetBy` / `All` / `IsExist` / `Paginate` 基础 CRUD 方法
+- 所有文件都 `writeSkipIfExists`：已存在则跳过、不覆盖，可以在已有实体上重复执行补齐缺失文件
+- `model.go` 提供 `BaseID`（主键）与 `BaseTimeField`（创建/更新/软删除时间），`doc.go` 是包注释
+- `user.go` 是 GORM model 骨架：嵌入 `BaseID` 与 `BaseTimeField`，含 `TableName`、`GetStringID`、基于标准库 `encoding/json` 的 `MarshalBinary` / `UnmarshalBinary`
+- `repository.go` 定义 `Repository` 结构体、`New(db *gorm.DB)` 构造函数与 `mdbCtx` context 注入
+- `repository_util.go` 提供 `Get(ctx, id) (model, found, err)`（未找到与库故障分开表达，不吞错）、`ExistsByID`、`All(ctx) ([]model, error)`、`CreateOrUpdate(ctx, entity, primaryKey, updateColumns)`
+- 生成物只依赖标准库与 `gorm`，在只含 `gorm` 依赖的新项目里可直接 `go build`；分页等业务查询按项目需要自行添加
 - 时间字段默认使用 `datetime` 类型（而非 `timestamp`），兼容阿里云 RDS 严格模式
 
 如果你已经有自定义 model/repository 实现，建议只在新实体创建初期使用此命令，之后按项目规范手工演化。
@@ -213,8 +215,14 @@ myapp make migration update_users_table
 # 添加字段到表
 myapp make migration add_email_to_users_table
 
-# 添加字段并指定位置（MySQL AFTER）——生成 raw SQL 模板，列类型需手工补全
+# 添加字段并给出完整列定义：生成可直接执行的 ADD COLUMN，不留 TODO
+myapp make migration add_email_to_users_table --type 'VARCHAR(128)' --not-null --default "''" --comment '邮箱'
+
+# 添加字段并指定位置（MySQL AFTER）；不给 --type 时列定义以 TODO 占位待补全
 myapp make migration add_email_to_users_table --after phone
+
+# 从 WithDDLModels 注册的、表名为 users 的 GORM model 生成结构快照（不生成 model/repository 脚手架）
+myapp make migration create_users_table --from-model
 
 # 删除字段
 myapp make migration drop_column_avatar_from_users_table
@@ -227,16 +235,20 @@ myapp make migration drop_index_email_from_users_table
 
 | 模式 | 示例 | 生成行为 |
 |------|------|----------|
-| `create_<table>_table` | `create_users_table` | 生成建表 migration（自包含快照 struct），并自动生成 model/repository |
+| `create_<table>_table` | `create_users_table` | 生成建表 migration（自包含快照 struct，基础字段 + `TODO`），并自动生成 model/repository |
+| `create_<table>_table --from-model` | `create_users_table --from-model` | 从 `WithDDLModels` 中表名为 `users` 的 model 反射生成快照 struct 的全部导出字段与 tag（匿名嵌入展平、`gorm:"-"` 跳过），不含 `TODO`，不生成脚手架；找不到匹配 model 时报错不落盘 |
 | `update_<table>_table` | `update_users_table` | 生成 up/down 各一段 raw `ALTER TABLE` 骨架，`TODO` 待补全 |
 | `add_<column>_to_<table>_table` | `add_email_to_users_table` | 生成 **raw SQL** 加列 migration，列类型/约束以 `TODO` 占位待补全 |
-| `add_<column>_to_<table>_table --after <col>` | `add_email_to_users_table --after phone` | 同上，并在 `ADD COLUMN` 后追加 `AFTER <col>` 子句（MySQL 列定位） |
+| `add_<column>_to_<table>_table --type <T> [--not-null] [--default <expr>] [--comment <c>]` | `add_email_to_users_table --type 'VARCHAR(128)' --not-null --default "''" --comment '邮箱'` | 生成完整可执行的 `ADD COLUMN`，不含 `TODO`；`--not-null`/`--default`/`--comment` 必须与 `--type` 同时给出，否则报错 |
+| `add_<column>_to_<table>_table --after <col>` | `add_email_to_users_table --after phone` | 在 `ADD COLUMN` 后追加 `AFTER <col>` 子句（MySQL 列定位），可与 `--type` 组合 |
 | `drop_column_<column>_from_<table>_table` | `drop_column_email_from_users_table` | 生成 raw `DROP COLUMN` migration，`down` 标记为人工补全 |
 | `drop_index_<name>_from_<table>_table` | `drop_index_email_from_users_table` | 生成 raw `DROP INDEX` migration（索引名以 `TODO` 待确认），`down` 标记为人工补全 |
 
 > **迁移模板均自包含、显式、可审查**：都不 import 业务 model、不使用 `AutoMigrate`（避免随 model 演进漂移）。带 `TODO` 占位的模板需补全（大表建议标注 `ALGORITHM`/`LOCK` 在线 DDL 策略）后才能通过 `migrate lint`。
 >
 > `--after` 仅对 `add_*` 模式生效，通过在 raw `ALTER TABLE ... ADD COLUMN` 后追加 `AFTER <col>` 实现。注意列的物理顺序在 MySQL 中仅影响展示，不影响功能。
+>
+> `--from-model` 只在生成时读取 model：生成后的迁移文件是唯一事实来源，之后 model 再变化也不会回写它。model 字段若使用了业务包内的自定义类型（如枚举 `models.Status`），快照会原样 import 该包并被 `migrate lint` 判为非自包含，此时把该字段改为基础类型（如 `int8`）即可。所有生成的 `.go` 文件都经过 gofmt。
 
 执行后会在 `database/migrations/` 下生成形如 `2026_03_17_120000_create_users_table.go` 的文件。
 
@@ -343,6 +355,9 @@ myapp migrate lint --strict
 # 回滚最后一批迁移（破坏性，需 --force）
 myapp migrate down --force
 
+# 回滚最新 2 条迁移（不按批次；N 必须为正整数）
+myapp migrate down --step 2 --force
+
 # 回滚到指定版本（回滚所有比它新的迁移，需 --force）
 myapp migrate down-to 2026_03_17_120000_create_users_table --force
 
@@ -368,13 +383,13 @@ myapp migrate fresh --force
 
 | 命令 | 说明 | 适合环境 |
 |------|------|----------|
-| `pending` | 仅列出将要执行的 migration，不实际执行 | 所有环境 |
+| `pending` | 仅列出将要执行的 migration，不实际执行；只读，不加锁、不建账本表 | 所有环境 |
 | `up` | 执行尚未运行的 migration | 测试 / 预发 / 生产 |
-| `down` | 回滚最后一个 batch | 测试 / 谨慎用于生产 |
+| `down` | 回滚最后一个 batch；`--step N` 改为回滚最新 N 条 | 测试 / 谨慎用于生产 |
 | `reset` | 从后往前回滚所有 migration | 测试环境 |
 | `refresh` | `reset` 后重新 `up` | 测试环境 |
 | `fresh` | 删除库里所有表与视图再跑 migration（需 `WithAllowFresh` 授权；PostgreSQL 仅清理 `public`） | 仅临时测试库 |
-| `status` | 查看 migration 是否执行及 batch | 所有环境 |
+| `status` | 查看 migration 是否执行、batch 与应用时间；只读，不加锁、不建账本表 | 所有环境 |
 | `lint` | 检查漂移、回滚风险、registry/file 不一致 | 所有环境，推荐 CI |
 
 `up`、`down`、`reset`、`refresh`、`fresh` 都受 `WithTimeout(...)` 控制：这个超时覆盖**整条命令**——等锁、每一个迁移的 DDL 执行与账本写入共用同一预算（默认 5 分钟）。超时触发时驱动会关闭连接中断正在执行的 DDL，MySQL 服务端会终止该语句，但客户端拿不到确定结果，需按下文「生产注意事项」人工核对。生产环境请按最长一次迁移的实际耗时设置 `WithTimeout`（大表 ALTER 建议放到 30 分钟以上，或拆成单独的迁移批次执行）。
@@ -562,27 +577,244 @@ ddl-diff:               ## 对比 DDL 漂移: make ddl-diff user / make ddl-diff
 | `make ddl user` | `make ddl user` | 生成建表 DDL SQL |
 | `make ddl-diff --all` | `make ddl diff --all` | 对比 schema 漂移 |
 
-### 7. 推荐工作流
+### 7. 详细使用指南：用结构体定义表的完整流程
 
-#### 7.1 新增一张表
+这一节把从零接入到生产回滚的每一步串起来。所有命令在应用模块根目录执行，`myapp` 代指你的二进制。
+
+#### 7.1 接入：注册 model，让生成器认识你的表
+
+结构体是表结构的事实来源。先写 GORM model，再把它交给 `WithDDLModels`，`create --from-model` 与 `make ddl` 都从这里读取：
+
+```go
+// internal/models/user.go
+package models
+
+import (
+    "time"
+
+    "gorm.io/gorm"
+)
+
+type User struct {
+    ID        int64          `gorm:"column:id;primaryKey;autoIncrement;comment:主键"`
+    Name      string         `gorm:"column:name;type:varchar(64);not null;default:'';comment:姓名"`
+    Email     string         `gorm:"column:email;type:varchar(128);not null;default:'';uniqueIndex;comment:邮箱"`
+    Status    int8           `gorm:"column:status;not null;default:0;comment:状态"`
+    CreatedAt time.Time      `gorm:"column:created_at;type:datetime;not null;index;comment:创建时间"`
+    UpdatedAt time.Time      `gorm:"column:updated_at;type:datetime;not null;comment:更新时间"`
+    DeletedAt gorm.DeletedAt `gorm:"column:deleted_at;type:datetime;index;comment:删除时间"`
+}
+
+func (User) TableName() string { return "users" }
+```
+
+```go
+// cmd/myapp/main.go
+package main
+
+import (
+    "context"
+    "log"
+    "os"
+    "os/signal"
+    "syscall"
+
+    "github.com/gtkit/migrate/v2"
+    "github.com/gtkit/migrate/v2/command"
+    "github.com/spf13/cobra"
+    "gorm.io/driver/mysql"
+    "gorm.io/gorm"
+
+    "myproject/internal/models"
+    _ "myproject/database/migrations" // 副作用导入：迁移文件在 init() 里注册进 registry
+)
+
+func main() {
+    db, err := gorm.Open(mysql.Open(os.Getenv("APP_MYSQL_DSN")), &gorm.Config{})
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    if err := migrate.Setup(db,
+        migrate.WithDDLModels(&models.User{}), // create --from-model 与 make ddl 的 model 来源
+        migrate.WithTimeout(30*time.Minute),    // 覆盖整条命令：等锁 + 每条迁移的 DDL + 账本写入
+        migrate.WithLockTimeout(60*time.Second),
+    ); err != nil {
+        log.Fatal(err)
+    }
+
+    root := &cobra.Command{Use: "myapp"}
+    root.AddCommand(command.Commands()...)
+
+    // Ctrl-C / SIGTERM 经 ExecuteContext 贯通到迁移执行，正在等锁或执行的命令会被中止.
+    ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+    defer stop()
+    if err := root.ExecuteContext(ctx); err != nil {
+        os.Exit(1)
+    }
+}
+```
+
+`WithProjectName` 可以省略：生成命令会从执行目录向上查找 `go.mod` 读取 module path 作为 import 前缀。项目根目录没有 `go.mod` 又没配 `WithProjectName` 时，`make model` 与 `make migration create_*` 直接报错，不会写出带错误 import 的文件。
+
+#### 7.2 新建一张表：`create --from-model`
 
 ```bash
-myapp make migration create_users_table
-myapp make ddl users
-myapp migrate lint
+myapp make migration create_users_table --from-model
+```
+
+生成器在 `WithDDLModels` 里找表名为 `users` 的 model，反射它的字段生成快照 struct，写出 `database/migrations/2026_09_20_120000_create_users_table.go`：
+
+```go
+package migrations
+
+import (
+	"time"
+
+	"gorm.io/gorm"
+
+	"github.com/gtkit/migrate/v2/migration"
+)
+
+// UserV20260920120000 是本迁移建表时的表结构快照。
+//
+// 有意不引用 internal/models 下的业务 model：业务 model 会随需求不断演进，
+// 而迁移必须锁定它「创建当时」的结构，才能保证任何环境、任何时间执行本迁移
+// 都得到完全一致的表。后续字段/索引变更请新建 add_/update_ 迁移，切勿修改本文件。
+type UserV20260920120000 struct {
+	ID        int64          `gorm:"column:id;primaryKey;autoIncrement;comment:主键"`
+	Name      string         `gorm:"column:name;type:varchar(64);not null;default:'';comment:姓名"`
+	Email     string         `gorm:"column:email;type:varchar(128);not null;default:'';uniqueIndex;comment:邮箱"`
+	Status    int8           `gorm:"column:status;not null;default:0;comment:状态"`
+	CreatedAt time.Time      `gorm:"column:created_at;type:datetime;not null;index;comment:创建时间"`
+	UpdatedAt time.Time      `gorm:"column:updated_at;type:datetime;not null;comment:更新时间"`
+	DeletedAt gorm.DeletedAt `gorm:"column:deleted_at;type:datetime;index;comment:删除时间"`
+}
+
+// TableName 锁定本迁移操作的表名。
+func (UserV20260920120000) TableName() string {
+	return "users"
+}
+
+func init() {
+	up := func(db *gorm.DB) error {
+		// 幂等：表已存在则跳过（MySQL DDL 已提交但记录未写的半失败状态下，重跑 up 可自愈）。
+		if db.Migrator().HasTable("users") {
+			return nil
+		}
+		return db.Migrator().CreateTable(&UserV20260920120000{})
+	}
+
+	down := func(db *gorm.DB) error {
+		return db.Migrator().DropTable("users")
+	}
+
+	migration.Add("2026_09_20_120000_create_users_table", up, down)
+}
+```
+
+要点：
+
+- 快照 struct 是 model **此刻**的复制品，之后 model 再改也不会回写这个文件。表结构变更一律新建迁移。
+- 反射规则：只取导出字段；匿名嵌入的 struct（如自定义 `BaseModel`、`gorm.Model`）展平成一级字段；`gorm:"-"` 跳过；tag 原样保留；`[]byte` 按惯例渲染。实现了 `driver.Valuer` 的匿名嵌入（如 `gorm.DeletedAt`）视为单列不展平。
+- 迁移名里的 `<table>` 必须与 model 的实际表名一致（`TableName()` 或命名策略得出的），否则报错并列出已注册的表名，不落盘。
+- model 字段若用了业务包内的自定义类型（如 `models.Status` 枚举），快照会 import 该包，`migrate lint` 会以 `non_self_contained` 报 error。把该字段改为底层基础类型（如 `int8`）即可。
+- 不带 `--from-model` 时生成基础字段 + `TODO` 占位，并同时生成 model/repository 脚手架，适合从零开始一个新实体。
+
+生成后按顺序执行：
+
+```bash
+myapp make ddl users          # 可选：落盘 database/ddl/create_users_table.sql 供审查
+myapp migrate lint --strict   # 文件、registry、账本三方一致，无 TODO、无 AutoMigrate、自包含
+myapp migrate pending         # 只读预览：本次 up 会执行哪些迁移
 myapp migrate up
+myapp migrate status
 ```
 
-#### 7.2 修改现有表结构
+#### 7.3 给已有表加字段：`add --type`
 
 ```bash
-myapp make migration add_email_to_users_table
-myapp make ddl users
-myapp make ddl diff users
-myapp migrate lint --strict
+myapp make migration add_phone_to_users_table \
+    --type 'VARCHAR(32)' --not-null --default "''" --comment '手机号' --after email
 ```
 
-#### 7.3 CI 建议
+生成的 up/down 是一对显式 raw SQL，不留 `TODO`：
+
+```go
+func init() {
+	up := func(db *gorm.DB) error {
+		// 幂等：列已存在则跳过，重复执行无副作用。
+		if db.Migrator().HasColumn("users", "phone") {
+			return nil
+		}
+		return db.Exec("ALTER TABLE `users` ADD COLUMN `phone` VARCHAR(32) NOT NULL DEFAULT '' COMMENT '手机号' AFTER `email`").Error
+	}
+
+	down := func(db *gorm.DB) error {
+		if !db.Migrator().HasColumn("users", "phone") {
+			return nil
+		}
+		return db.Exec("ALTER TABLE `users` DROP COLUMN `phone`").Error
+	}
+
+	migration.Add("2026_09_20_130000_add_phone_to_users_table", up, down)
+}
+```
+
+- `--not-null`、`--default`、`--comment` 必须与 `--type` 同时给出，否则报错不落盘。`--default` 原样拼入 SQL，字符串默认值自己带引号（`"''"`、`"'active'"`），数值与表达式直接写（`0`、`CURRENT_TIMESTAMP`）。`--comment` 里的单引号会自动转义。
+- 不给 `--type` 时列定义以 `/* TODO: 列定义 */` 占位，`migrate lint` 会以 `unfilled_placeholder` 拦住，补全前 `up` 不会通过 lint。
+- 大表加列请在 SQL 末尾补 `, ALGORITHM=INPLACE, LOCK=NONE`（MySQL 8.0 加列多数场景可用 `ALGORITHM=INSTANT`）。`migrate lint` 对缺在线 DDL 策略的 `ALTER TABLE` 报 warning，`--strict` 下视为失败。
+- 同步更新业务 model 加上 `Phone` 字段，再 `myapp make ddl users` 与 `myapp make ddl diff users` 确认 model 与落盘 DDL 一致。
+
+#### 7.4 其他结构变更
+
+| 需求 | 命令 | 生成物 |
+|------|------|--------|
+| 改列类型、加索引等 | `make migration update_users_table` | up/down 各一段 raw `ALTER TABLE` 骨架，`TODO` 待补全 |
+| 删列 | `make migration drop_column_avatar_from_users_table` | up 为带存在性检查的 `DROP COLUMN`，down 标记 `Irreversible` |
+| 删索引 | `make migration drop_index_email_from_users_table` | up 为带存在性检查的 `DROP INDEX`，索引名 `TODO` 待确认 |
+| 删表 | `make migration drop_users_table` | up 为带存在性检查的 `DropTable`，down 标记 `Irreversible` |
+
+标记 `Irreversible` 的迁移无法自动回滚：`down` 到它时会报错并停在它之前。需要可回滚就在 down 里手写重建逻辑。
+
+#### 7.5 发布到生产
+
+1. 合并前跑 `myapp migrate lint --strict`，确认新迁移的时间戳前缀大于主干已有的最大值。
+2. 对目标库做可恢复备份，在预发库按同一份代码执行 `myapp migrate up`。
+3. 以**单独的迁移 Job** 执行 `myapp migrate up`，成功后再滚动业务实例。不要让每个实例启动时各跑一次：锁能挡住并发，但其余实例会在 `WithLockTimeout` 后报错退出。
+4. Job 结束后 `myapp migrate status` 确认没有 Pending。`status` 与 `pending` 是只读命令，不加锁、不建账本表，可以随时对生产库执行。
+5. 需要新旧版本共存的变更走 expand-contract：先加可空列或新表并发布兼容代码，回填数据，最后在后续版本删旧结构。
+
+如果服务确实要在启动期调用 `Up`，加 `WithAllowUnknownApplied()`：应用回滚到旧版本时，旧 binary 对账本里"新版本写入、自己未注册"的记录记 Warn 后继续，不会启动失败。`mark-applied` 与所有回滚命令不受该选项影响。
+
+#### 7.6 回滚与排障
+
+```bash
+# 回滚最后一批（同一次 up 执行的所有迁移）
+myapp migrate down --force
+
+# 只回滚最新 2 条，不按批次
+myapp migrate down --step 2 --force
+
+# 回滚到某个版本之后（不含该版本）
+myapp migrate down-to 2026_09_20_120000_create_users_table --force
+
+# 把存量库的历史表结构纳入账本而不执行 SQL
+myapp migrate mark-applied --to 2026_09_20_120000_create_users_table --force
+```
+
+- 回滚前先 `status` 看清批次与应用时间。回滚遇到 `Irreversible`、registry 里找不到的记录、重复注册名时整体拒绝，不会回滚一半。
+- MySQL 的 DDL 隐式提交：迁移中途失败留下"结构已变、记录未写"时，先人工核对真实表结构。生成模板的 up 都带存在性检查，单条 DDL 的迁移直接重跑 `up` 即可自愈；多条 DDL 的迁移手工补齐或回退后再重跑。
+- `up` 日志的 `migrated ... duration=` 字段是大表 DDL 耗时的第一手数据，`WithTimeout` 按它来定。
+- 程序化调用时用 `errors.Is` 区分 `migration.ErrLockNotAcquired`（另一实例在迁移，可重试）、`ErrRegistryDrift`（账本与 binary 不一致，需人工介入）、`ErrNoMigrations`（漏 import 迁移包）、`ErrDuplicateRegistration`（两个包注册了同名迁移）。
+
+#### 7.7 多实例与多项目
+
+- MySQL 默认锁名 `migrate:<数据库名>:<账本表名>`：同一实例上不同数据库、不同账本表的迁移互不阻塞。只有多个项目共用同一批表、需要串行化 DDL 时，才显式给它们配相同的 `WithLockName`。
+- 多项目共库时各配独立的 `WithMigrationsTable`，账本与漂移校验互不干扰。细节见下文「多项目共用数据库」。
+- 显式锁名在 MySQL 上不得超过 64 字符，超长时所有迁移命令直接报错。
+
+#### 7.8 CI 建议
 
 最常见的 CI 检查顺序：
 
@@ -614,9 +846,9 @@ Run 'migrate up' to execute these migrations.
 $ myapp migrate up
 Running 2 migration(s)...
 [INFO]  migrating                                          file=2026_03_17_120000_create_users_table batch=1
-[INFO]  migrated                                           file=2026_03_17_120000_create_users_table
+[INFO]  migrated                                           file=2026_03_17_120000_create_users_table duration=42ms
 [INFO]  migrating                                          file=2026_03_17_120100_create_orders_table batch=1
-[INFO]  migrated                                           file=2026_03_17_120100_create_orders_table
+[INFO]  migrated                                           file=2026_03_17_120100_create_orders_table duration=37ms
 Migrations completed.
 ```
 
@@ -624,8 +856,8 @@ Migrations completed.
 $ myapp migrate status
 Migration Status:
 --------------------------------------------------
-  2026_03_17_120000_create_users_table              Ran (batch 1)
-  2026_03_17_120100_create_orders_table              Ran (batch 1)
+  2026_03_17_120000_create_users_table              Ran (batch 1, 2026-03-17 12:00:03)
+  2026_03_17_120100_create_orders_table              Ran (batch 1, 2026-03-17 12:00:03)
   2026_03_18_090000_add_email_to_users_table         Pending
 ```
 
@@ -743,6 +975,8 @@ migrate.Setup(db, migrate.WithLogger(&migration.NopLogger{}))
 
 当多个服务共享同一个数据库时，规则分两条：**迁移记录表必须按项目隔离**；**迁移锁按实际 DDL 资源边界选择**——项目间无共享表/跨项目外键时用独立锁名（互不阻塞），存在共享 DDL 资源时给相关项目配相同锁名（串行化，见下文）。
 
+MySQL 的默认锁名已经按 `migrate:<数据库名>:<账本表名>` 派生：各项目只要配了独立的 `WithMigrationsTable`，默认就拿到独立的锁；同一 MySQL 实例上不同数据库的迁移也天然互不阻塞（`GET_LOCK` 的命名空间是整个实例全局的，固定锁名会让它们互相等待）。只有"存在共享 DDL 资源、需要串行化"的场景才需要显式 `WithLockName` 配同一个名字。
+
 无共享资源的典型配置（独立锁）：
 
 ```go
@@ -799,6 +1033,17 @@ statuses, err := m.Status(ctx)
 // lint
 report, err := m.Lint(ctx, migration.LintOptions{})
 ```
+
+失败路径可用 `errors.Is` 判定，便于调用方区分处置：
+
+| sentinel | 含义 |
+|----------|------|
+| `migration.ErrNoMigrations` | registry 为空（通常漏 import 迁移包） |
+| `migration.ErrDuplicateRegistration` | 同名迁移被注册多次 |
+| `migration.ErrRegistryDrift` | 账本中存在当前 binary 未注册的已应用迁移（含 `mark-applied` 与回滚遇到未注册记录） |
+| `migration.ErrLockNotAcquired` | 等待时间内未获得迁移锁，另一实例可能正在迁移 |
+| `migration.ErrLintFailed` | lint 存在 error 级问题 |
+| `migration.ErrIrreversible` | 迁移声明不可回滚 |
 
 如果你是库调用方，推荐把 `Lint(...)` 用在：
 

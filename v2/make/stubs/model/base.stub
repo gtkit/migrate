@@ -6,6 +6,7 @@ import (
 	"gorm.io/gorm"
 )
 
+// BaseID 通用主键字段。
 type BaseID struct {
 	ID int64 `gorm:"column:id;primaryKey;autoIncrement;comment:主键编码" json:"id"`
 }

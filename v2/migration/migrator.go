@@ -47,9 +47,12 @@ func WithLogger(l Logger) MigratorOption {
 	}
 }
 
-// WithLockName 设置迁移锁名称.
+// WithLockName 设置迁移锁名称，覆盖默认派生规则.
+// 默认：MySQL 按 "migrate:<数据库名>:<账本表名>" 派生（超 64 字符截断并追加哈希），
+// 同一实例上不同库、不同账本表天然互不阻塞；PostgreSQL 默认 "migrate_lock"（advisory lock 按库隔离）.
 // 多项目共库时按 DDL 资源边界选择：项目间无共享表/外键时用独立锁名避免互相阻塞；
 // 存在共享 DDL 资源时相关项目应配相同锁名，用同一把锁串行化迁移.
+// MySQL 上显式锁名不得超过 64 字符（GET_LOCK 硬限制），超长时所有执行入口 fail-closed 报错.
 func WithLockName(name string) MigratorOption {
 	return func(m *Migrator) {
 		if name != "" {
@@ -154,7 +157,6 @@ func NewMigrator(folder string, db *gorm.DB, opts ...MigratorOption) *Migrator {
 		folder:      folder,
 		db:          db,
 		dbType:      dbType,
-		lockName:    defaultLockName,
 		lockTimeout: defaultLockTimeout,
 		tableName:   defaultTableName,
 		registry:    defaultRegistry,
@@ -168,9 +170,12 @@ func NewMigrator(folder string, db *gorm.DB, opts ...MigratorOption) *Migrator {
 	// 选项无法返回错误：非法表名记入 configErr，由 Setup/Fresh 等入口 fail-closed 返回，
 	// 绝不静默回退默认表名（多项目共库下写错账本比报错危险得多）.
 	m.configErr = ValidateMigrationsTable(m.tableName)
+	if m.configErr == nil && dbType == DBTypeMySQL && len(m.lockName) > mysqlLockNameMax {
+		m.configErr = fmt.Errorf("invalid lock name %q: %d chars exceeds the MySQL GET_LOCK limit of %d", m.lockName, len(m.lockName), mysqlLockNameMax)
+	}
 
 	// 所有选项应用完成后再构建锁，避免 WithLockName 与 WithLockTimeout 的顺序依赖.
-	m.lock = newLock(db, dbType, m.lockName, m.lockTimeout)
+	m.lock = newLock(db, dbType, m.lockName, m.tableName, m.lockTimeout)
 
 	return m
 }
@@ -182,7 +187,7 @@ func (m *Migrator) Setup(ctx context.Context) error {
 		return m.configErr
 	}
 	if m.db == nil {
-		return errors.New("migrate: database connection is required")
+		return errDBRequired
 	}
 	db := m.db.WithContext(ctx)
 	if db.Migrator().HasTable(m.tableName) {
@@ -222,11 +227,7 @@ func (m *Migrator) Up(ctx context.Context) error {
 
 // IsUpToDate 检查数据库是否已是最新.
 func (m *Migrator) IsUpToDate(ctx context.Context) (bool, error) {
-	if err := m.Setup(ctx); err != nil {
-		return false, err
-	}
-
-	migrated, err := m.getMigratedMap(ctx)
+	migrated, err := m.readMigratedMap(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -411,12 +412,9 @@ func (m *Migrator) Fresh(ctx context.Context) error {
 }
 
 // Status 返回所有迁移的执行状态.
+// 只读：不获取锁、不创建账本表，账本表不存在时全部为未执行.
 func (m *Migrator) Status(ctx context.Context) ([]MigrationStatus, error) {
-	if err := m.Setup(ctx); err != nil {
-		return nil, err
-	}
-
-	migrated, err := m.getMigratedMap(ctx)
+	migrated, err := m.readMigratedMap(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -436,6 +434,7 @@ func (m *Migrator) Status(ctx context.Context) ([]MigrationStatus, error) {
 		if record, ok := migrated[mfile.FileName]; ok {
 			status.Ran = true
 			status.Batch = record.Batch
+			status.AppliedAt = record.CreatedAt
 		}
 		result = append(result, status)
 	}
@@ -445,19 +444,16 @@ func (m *Migrator) Status(ctx context.Context) ([]MigrationStatus, error) {
 
 // MigrationStatus 迁移文件状态.
 type MigrationStatus struct {
-	Name  string
-	Ran   bool
-	Batch int
+	Name      string
+	Ran       bool
+	Batch     int
+	AppliedAt time.Time // 账本记录写入时间，未执行时为零值
 }
 
 // Pending 返回所有待执行的迁移文件列表（dry-run 模式）.
-// 不执行任何迁移操作，仅展示下次 Up 会执行哪些文件.
+// 只读：不执行任何迁移、不获取锁、不创建账本表，仅展示下次 Up 会执行哪些文件.
 func (m *Migrator) Pending(ctx context.Context) ([]string, error) {
-	if err := m.Setup(ctx); err != nil {
-		return nil, err
-	}
-
-	migrated, err := m.getMigratedMap(ctx)
+	migrated, err := m.readMigratedMap(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -511,7 +507,7 @@ func (m *Migrator) MarkApplied(ctx context.Context, toFile string) ([]string, er
 		return nil, err
 	}
 	if unknown := m.unknownApplied(migrated); len(unknown) > 0 {
-		return nil, fmt.Errorf("mark-applied aborted: applied migrations not registered in the current binary: %s", strings.Join(unknown, ", "))
+		return nil, fmt.Errorf("%w: mark-applied aborted, applied migrations not registered in the current binary: %s", ErrRegistryDrift, strings.Join(unknown, ", "))
 	}
 
 	migrateFiles := m.registeredFiles()
@@ -614,7 +610,7 @@ func (m *Migrator) acquireLock(ctx context.Context) (func(), error) {
 // SQLite 使用 noopLock（不占用连接），无此约束.
 func (m *Migrator) ensureConcurrentConns() error {
 	if m.db == nil {
-		return errors.New("migrate: database connection is required")
+		return errDBRequired
 	}
 	if m.dbType == DBTypeSQLite {
 		return nil
@@ -657,11 +653,12 @@ func (m *Migrator) upWithoutLock(ctx context.Context) error {
 		}
 
 		m.logger.Info("migrating", "file", mfile.FileName, "batch", batch)
+		start := time.Now()
 		if err := m.runUpMigration(ctx, mfile, batch); err != nil {
 			m.logger.Error("migration failed", "file", mfile.FileName, "error", err)
 			return fmt.Errorf("migration %s failed: %w", mfile.FileName, err)
 		}
-		m.logger.Info("migrated", "file", mfile.FileName)
+		m.logger.Info("migrated", "file", mfile.FileName, "duration", time.Since(start).Round(time.Millisecond))
 		ran = true
 	}
 
@@ -706,10 +703,7 @@ func (m *Migrator) rollbackMigrations(ctx context.Context, migrations []Migratio
 	// 重复注册名意味着回滚会静默使用先注册者的 Down、另一份同名实现被吞掉，
 	// 与 Up 的执行校验对称，fail-closed 拒绝（所有回滚入口共同经过此处）.
 	if dupes := m.registry.Duplicates(); len(dupes) > 0 {
-		return fmt.Errorf(
-			"rollback aborted: migration names registered more than once: %s",
-			strings.Join(dupes, ", "),
-		)
+		return fmt.Errorf("%w: rollback aborted, migration names registered more than once: %s", ErrDuplicateRegistration, strings.Join(dupes, ", "))
 	}
 
 	if len(migrations) == 0 {
@@ -721,7 +715,7 @@ func (m *Migrator) rollbackMigrations(ctx context.Context, migrations []Migratio
 	for _, record := range migrations {
 		mfile, ok := m.registry.Get(record.Migration)
 		if !ok {
-			return fmt.Errorf("rollback aborted: migration %q not found in registry", record.Migration)
+			return fmt.Errorf("%w: rollback aborted, migration %q not found in registry", ErrRegistryDrift, record.Migration)
 		}
 		if mfile.Down == nil {
 			return fmt.Errorf("rollback aborted: migration %q has no down function", record.Migration)
@@ -732,13 +726,12 @@ func (m *Migrator) rollbackMigrations(ctx context.Context, migrations []Migratio
 		mfile, _ := m.registry.Get(record.Migration)
 
 		m.logger.Info("rolling back", "file", record.Migration, "batch", record.Batch)
-
+		start := time.Now()
 		if err := m.runDownMigration(ctx, mfile, record); err != nil {
 			m.logger.Error("rollback failed", "file", record.Migration, "error", err)
 			return err
 		}
-
-		m.logger.Info("rolled back", "file", record.Migration)
+		m.logger.Info("rolled back", "file", record.Migration, "duration", time.Since(start).Round(time.Millisecond))
 	}
 
 	return nil
@@ -798,6 +791,21 @@ func (m *Migrator) getMigratedMap(ctx context.Context) (map[string]Migration, er
 	return result, nil
 }
 
+// readMigratedMap 只读地获取已执行记录：不创建账本表，表不存在时返回空映射.
+// 供 Status/Pending/IsUpToDate 等诊断入口使用，使它们能在只读账号或新库上运行.
+func (m *Migrator) readMigratedMap(ctx context.Context) (map[string]Migration, error) {
+	if m.configErr != nil {
+		return nil, m.configErr
+	}
+	if m.db == nil {
+		return nil, errDBRequired
+	}
+	if !m.db.WithContext(ctx).Migrator().HasTable(m.tableName) {
+		return map[string]Migration{}, nil
+	}
+	return m.getMigratedMap(ctx)
+}
+
 // registeredFiles 返回编译期 registry 中的全部迁移，按文件名（时间戳前缀）升序.
 // 迁移执行以 registry 为唯一真实来源，不依赖运行时的 .go 源目录，
 // 避免部署环境缺少源目录时静默漏执行.
@@ -822,7 +830,7 @@ func (m *Migrator) checkRegistryConsistency(migrated map[string]Migration) error
 		return nil
 	}
 	if !m.allowUnknownApplied {
-		return fmt.Errorf("applied migration %q is not registered in the current binary; schema may have drifted", unknown[0])
+		return fmt.Errorf("%w: applied migration %q is not registered in the current binary; schema may have drifted", ErrRegistryDrift, unknown[0])
 	}
 	for _, name := range unknown {
 		m.logger.Warn("applied migration not registered in current binary; tolerated by WithAllowUnknownApplied", "file", name)
@@ -847,10 +855,10 @@ func (m *Migrator) unknownApplied(migrated map[string]Migration) []string {
 // 任一迁移缺 Up 函数、或迁移名不符合时间戳命名格式，均返回错误、fail-closed.
 func (m *Migrator) validateRegistryForExecution() error {
 	if m.registry.Len() == 0 {
-		return errors.New("no migrations registered; did you forget to import the migrations package?")
+		return fmt.Errorf("%w; did you forget to import the migrations package?", ErrNoMigrations)
 	}
 	if dups := m.registry.Duplicates(); len(dups) > 0 {
-		return fmt.Errorf("duplicate migration registrations: %s", strings.Join(dups, ", "))
+		return fmt.Errorf("%w: %s", ErrDuplicateRegistration, strings.Join(dups, ", "))
 	}
 	for _, mfile := range m.registry.All() {
 		if mfile.Up == nil {

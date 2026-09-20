@@ -2,58 +2,45 @@ package {{PackageName}}
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
-	"{{ModelsImportPath}}"
-	"{{ProjectName}}/internal/pkg/paginator"
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+
+	"{{ModelsImportPath}}"
 )
 
-func (r *Repository) Get(ctx context.Context, idstr string) ({{VariableName}} {{ModelPackageName}}.{{StructName}}) {
-	r.mdbCtx(ctx).Where("id", idstr).First(&{{VariableName}})
-	return
-}
-
-func (r *Repository) GetBy(ctx context.Context, field, value string) ({{VariableName}} {{ModelPackageName}}.{{StructName}}) {
-	r.mdbCtx(ctx).Where(fmt.Sprintf("%s = ?", field), value).First(&{{VariableName}})
-	return
-}
-
-func (r *Repository) All(ctx context.Context) ({{VariableNamePlural}} []{{ModelPackageName}}.{{StructName}}) {
-	r.mdbCtx(ctx).Find(&{{VariableNamePlural}})
-	return
-}
-
-func (r *Repository) IsExist(ctx context.Context, field, value string) bool {
-	var count int64
-	r.mdbCtx(ctx).Model({{ModelPackageName}}.{{StructName}}{}).Where(fmt.Sprintf("%s = ?", field), value).Count(&count)
-	return count > 0
-}
-
-func (r *Repository) Paginate(ctx context.Context, baseURL string, pagination paginator.Pagination, args ...paginator.Option) (*{{ModelPackageName}}.{{StructName}}ListPaging, error) {
-	var (
-		{{VariableNamePlural}} []*{{ModelPackageName}}.{{StructName}}
-		paging               paginator.Paging
-		err                  error
-	)
-
-	db := r.mdbCtx(ctx).Model({{ModelPackageName}}.{{StructName}}{})
-	paging, err = paginator.Paginate(db, &{{VariableNamePlural}}, baseURL, paginator.Pagination{
-		Page:     pagination.Page,
-		PageSize: pagination.PageSize,
-		Order:    "desc",
-	}, args...)
-	if err != nil {
-		return nil, fmt.Errorf("paginate {{VariableNamePlural}}: %w", err)
+// Get 按主键查询；记录不存在时 found 为 false 且 err 为 nil，其余数据库错误原样上抛。
+func (r *Repository) Get(ctx context.Context, id int64) ({{VariableName}} {{ModelPackageName}}.{{StructName}}, found bool, err error) {
+	err = r.mdbCtx(ctx).First(&{{VariableName}}, id).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return {{VariableName}}, false, nil
 	}
-
-	return &{{ModelPackageName}}.{{StructName}}ListPaging{
-		List:   {{VariableNamePlural}},
-		Paging: paging,
-	}, nil
+	if err != nil {
+		return {{VariableName}}, false, fmt.Errorf("get {{VariableName}} %d: %w", id, err)
+	}
+	return {{VariableName}}, true, nil
 }
 
-// CreateOrUpdate 创建或更新.
+// ExistsByID 判断主键是否存在。
+func (r *Repository) ExistsByID(ctx context.Context, id int64) (bool, error) {
+	var count int64
+	if err := r.mdbCtx(ctx).Model(&{{ModelPackageName}}.{{StructName}}{}).Where("id = ?", id).Count(&count).Error; err != nil {
+		return false, fmt.Errorf("count {{VariableName}} %d: %w", id, err)
+	}
+	return count > 0, nil
+}
+
+// All 返回全部记录。
+func (r *Repository) All(ctx context.Context) ({{VariableNamePlural}} []{{ModelPackageName}}.{{StructName}}, err error) {
+	if err = r.mdbCtx(ctx).Find(&{{VariableNamePlural}}).Error; err != nil {
+		return nil, fmt.Errorf("list {{VariableNamePlural}}: %w", err)
+	}
+	return {{VariableNamePlural}}, nil
+}
+
+// CreateOrUpdate 按 primaryKey 冲突时更新 updateColumns，否则插入。
 func (r *Repository) CreateOrUpdate(ctx context.Context, entity *{{ModelPackageName}}.{{StructName}}, primaryKey string, updateColumns []string) error {
 	return r.mdbCtx(ctx).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: primaryKey}},

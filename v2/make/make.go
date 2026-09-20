@@ -5,7 +5,9 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"go/format"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,38 +18,15 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// Model 参数解释
-//
-// 单个词，以 User 模型为例：
-//
-//	{
-//	    "TableName": "users",
-//	    "StructName": "User",
-//	    "StructNamePlural": "Users",
-//	    "VariableName": "user",
-//	    "VariableNamePlural": "users",
-//	    "PackageName": "user"
-//	}
-//
-// 两个词以上，以 TopicComment 模型为例：
-//
-//	{
-//	    "TableName": "topic_comments",
-//	    "StructName": "TopicComment",
-//	    "StructNamePlural": "TopicComments",
-//	    "VariableName": "topicComment",
-//	    "VariableNamePlural": "topicComments",
-//	    "PackageName": "topic_comment"
-//	}
+// Model 是模板渲染变量，由用户输入的名称推导.
+// 以 topic_comment 为例：TableName=topic_comments、StructName=TopicComment、
+// VariableName=topicComment、VariableNamePlural=topicComments、PackageName=topic_comment.
 type Model struct {
 	TableName          string
 	StructName         string
-	StructNamePlural   string
-	StructFieldName    string
 	VariableName       string
 	VariableNamePlural string
 	PackageName        string
-	ActionName         string
 	ProjectName        string
 	ColumnName         string
 	ModelPackageName   string
@@ -77,67 +56,56 @@ func init() {
 	)
 }
 
-// makeModelFromString 格式化用户输入的内容.
-func makeModelFromString(project, action, name, column string) Model {
-	model := Model{}
-	model.StructName = stringx.Singular(stringx.ToCamel(name))
-	model.StructNamePlural = stringx.Plural(model.StructName)
-	model.TableName = stringx.ToSnake(model.StructNamePlural)
-	model.VariableName = stringx.ToLowerCamel(model.StructName)
-	model.PackageName = stringx.ToSnake(model.StructName)
-	model.VariableNamePlural = stringx.ToLowerCamel(model.StructNamePlural)
-	model.ActionName = action
-	model.ProjectName = project
-	model.ColumnName = column
-	model.StructFieldName = stringx.ToCamel(column)
-
-	return model
-}
-
-func enrichModel(cfg Config, model Model) Model {
-	model.ProjectName = cfg.ProjectName
-	model.ModelPackageName = modelPackageName(cfg.ModelDir)
-	model.ModelsImportPath = moduleImportPath(cfg.ProjectName, cfg.ModelDir)
-	return model
-}
-
-// createFileFromStub 读取 stub 文件并进行变量替换.
-// 最后一个选项可选，如若传参，应传 map[string]string 类型作为附加的变量替换.
-func createFileFromStub(filePath, stubName string, model Model, mode fileWriteMode, variables ...any) error {
-	replaces := make(map[string]string)
-	if len(variables) > 0 {
-		if m, ok := variables[0].(map[string]string); ok {
-			replaces = m
-		}
+// newModel 由用户输入的名称与列名推导模板变量，并补齐目录相关的包名与 import 路径.
+func newModel(cfg Config, name, column string) Model {
+	structName := stringx.Singular(stringx.ToCamel(name))
+	plural := stringx.Plural(structName)
+	return Model{
+		TableName:          stringx.ToSnake(plural),
+		StructName:         structName,
+		VariableName:       stringx.ToLowerCamel(structName),
+		VariableNamePlural: stringx.ToLowerCamel(plural),
+		PackageName:        stringx.ToSnake(structName),
+		ProjectName:        cfg.ProjectName,
+		ColumnName:         column,
+		ModelPackageName:   modelPackageName(cfg.ModelDir),
+		ModelsImportPath:   moduleImportPath(cfg.ProjectName, cfg.ModelDir),
 	}
+}
 
-	// 读取 stub 模板文件
-	modelData, err := stubsFS.ReadFile("stubs/" + stubName + ".stub")
+// createFileFromStub 读取 stub 模板、替换 Model 变量与 extra 中的附加变量后写入；
+// .go 产物统一 gofmt，格式化失败视为生成失败.
+func createFileFromStub(filePath, stubName string, model Model, mode fileWriteMode, extra map[string]string) error {
+	stub, err := stubsFS.ReadFile("stubs/" + stubName + ".stub")
 	if err != nil {
 		return fmt.Errorf("read stub %s: %w", stubName, err)
 	}
 
-	modelStub := string(modelData)
+	replaces := map[string]string{
+		"{{VariableName}}":       model.VariableName,
+		"{{VariableNamePlural}}": model.VariableNamePlural,
+		"{{StructName}}":         model.StructName,
+		"{{PackageName}}":        model.PackageName,
+		"{{TableName}}":          model.TableName,
+		"{{ProjectName}}":        model.ProjectName,
+		"{{ColumnName}}":         model.ColumnName,
+		"{{ModelPackageName}}":   model.ModelPackageName,
+		"{{ModelsImportPath}}":   model.ModelsImportPath,
+	}
+	maps.Copy(replaces, extra)
 
-	// 默认替换变量
-	replaces["{{VariableName}}"] = model.VariableName
-	replaces["{{VariableNamePlural}}"] = model.VariableNamePlural
-	replaces["{{StructName}}"] = model.StructName
-	replaces["{{StructNamePlural}}"] = model.StructNamePlural
-	replaces["{{PackageName}}"] = model.PackageName
-	replaces["{{TableName}}"] = model.TableName
-	replaces["{{ActionName}}"] = model.ActionName
-	replaces["{{ProjectName}}"] = model.ProjectName
-	replaces["{{ColumnName}}"] = model.ColumnName
-	replaces["{{StructFieldName}}"] = model.StructFieldName
-	replaces["{{ModelPackageName}}"] = model.ModelPackageName
-	replaces["{{ModelsImportPath}}"] = model.ModelsImportPath
-
+	modelStub := string(stub)
 	for search, replace := range replaces {
 		modelStub = strings.ReplaceAll(modelStub, search, replace)
 	}
 
-	return writeGeneratedFile(filePath, []byte(modelStub), mode)
+	data := []byte(modelStub)
+	if strings.HasSuffix(filePath, ".go") {
+		if data, err = format.Source(data); err != nil {
+			return fmt.Errorf("format generated %s: %w", filePath, err)
+		}
+	}
+	return writeGeneratedFile(filePath, data, mode)
 }
 
 type fileWriteMode int

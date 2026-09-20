@@ -2,10 +2,12 @@ package make
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gtkit/migrate/v2/console"
+	"github.com/gtkit/stringx"
 	"github.com/spf13/cobra"
 )
 
@@ -20,6 +22,11 @@ var CmdMakeMigration = &cobra.Command{
 func init() {
 	// --after 仅对 add 操作生效：在生成的 raw SQL 中追加 AFTER 子句，把新列放在该列之后（MySQL AFTER 语义）。
 	CmdMakeMigration.Flags().String("after", "", "For `add_*` migrations: place the new column AFTER this column (MySQL AFTER clause)")
+	CmdMakeMigration.Flags().String("type", "", "For `add_*` migrations: column type, e.g. 'VARCHAR(128)'; generates a complete ADD COLUMN instead of a TODO placeholder")
+	CmdMakeMigration.Flags().Bool("not-null", false, "For `add_*` migrations with --type: add NOT NULL")
+	CmdMakeMigration.Flags().String("default", "", "For `add_*` migrations with --type: DEFAULT expression, e.g. \"''\" or 0")
+	CmdMakeMigration.Flags().String("comment", "", "For `add_*` migrations with --type: column COMMENT")
+	CmdMakeMigration.Flags().Bool("from-model", false, "For `create_*` migrations: build the snapshot struct from the registered DDL model with the same table name (skips model/repository scaffolding)")
 }
 
 func runMakeMigration(cmd *cobra.Command, args []string) error {
@@ -28,39 +35,49 @@ func runMakeMigration(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	fromModel, err := cmd.Flags().GetBool("from-model")
+	if err != nil {
+		return err
+	}
 
 	timeStr := time.Now().UTC().Format("2006_01_02_150405")
-	model := enrichModel(cfg, makeModelFromString(cfg.ProjectName, action, tableName, columnName))
+	fileName := timeStr + "_" + args[0]
+	extra := map[string]string{"{{FileName}}": fileName}
 
-	if action == "create" {
+	// 所有校验与源码生成先于任何落盘，失败不留孤儿文件.
+	switch action {
+	case "create":
+		// 自包含的表结构快照（不引用业务 model），需要一个唯一的快照 struct 名。
+		extra["{{SnapshotStruct}}"] = stringx.Singular(stringx.ToCamel(tableName)) + "V" + strings.ReplaceAll(timeStr, "_", "")
+		snapshot := defaultSnapshot()
+		if fromModel {
+			if snapshot, err = snapshotFromModel(cfg.DB, cfg.DDLModels, tableName); err != nil {
+				return err
+			}
+		} else if cfg.ProjectName, err = resolveProjectName(cfg); err != nil {
+			return err // 脚手架的 import 前缀需要项目名
+		}
+		extra["{{SnapshotImports}}"] = snapshot.imports
+		extra["{{SnapshotFields}}"] = snapshot.fields
+	case "add":
+		sql, todo, err := addColumnSQL(cmd, tableName, columnName)
+		if err != nil {
+			return err
+		}
+		extra["{{AddColumnSQL}}"] = strconv.Quote(sql)
+		extra["{{AddColumnTodo}}"] = todo
+	}
+
+	model := newModel(cfg, tableName, columnName)
+	if action == "create" && !fromModel {
 		if err := generateModelScaffold(cfg, model); err != nil {
 			return err
 		}
 	}
-
-	if err := ensureMigrationSupportFiles(cfg, model); err != nil {
+	if err := createFileFromStub(migrationDocFilePath(cfg), "migration_doc", model, writeSkipIfExists, nil); err != nil {
 		return err
 	}
-
-	fileName := timeStr + "_" + args[0]
-	filePath := migrationFilePath(cfg, fileName)
-
-	extra := map[string]string{"{{FileName}}": fileName}
-	stubName := migrationStubName(action, objectName)
-	// create 迁移使用自包含的表结构快照（不引用业务 model），需要一个唯一的快照 struct 名。
-	if action == "create" {
-		compact := strings.ReplaceAll(timeStr, "_", "")
-		extra["{{SnapshotStruct}}"] = model.StructName + "V" + compact
-	}
-	// add 统一使用 raw SQL 模板；--after 通过 AFTER 子句注入（MySQL 列定位）。
-	if action == "add" {
-		afterClause := ""
-		if after, _ := cmd.Flags().GetString("after"); after != "" {
-			afterClause = " AFTER `" + after + "`"
-		}
-		extra["{{AfterClause}}"] = afterClause
-	}
-	if err := createFileFromStub(filePath, stubName, model, writeFailIfExists, extra); err != nil {
+	if err := createFileFromStub(migrationFilePath(cfg, fileName), migrationStubName(action, objectName), model, writeFailIfExists, extra); err != nil {
 		return err
 	}
 
@@ -68,8 +85,44 @@ func runMakeMigration(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func ensureMigrationSupportFiles(cfg Config, model Model) error {
-	return createFileFromStub(migrationDocFilePath(cfg), "migration_doc", model, writeSkipIfExists)
+// addColumnTodo 是 add 模板在未给出 --type 时保留的补全提示.
+const addColumnTodo = "\t\t// TODO: 补全列定义（类型/约束/注释）。大表建议标注在线 DDL 策略，例如：\n" +
+	"\t\t//   ADD COLUMN `col` VARCHAR(64) NOT NULL DEFAULT '' COMMENT '说明', ALGORITHM=INPLACE, LOCK=NONE\n"
+
+// addColumnSQL 由 --type/--not-null/--default/--comment/--after 拼出 ADD COLUMN 语句；
+// 未给出 --type 时保留 TODO 占位并返回提示注释（lint 会拦截未补全的迁移）.
+func addColumnSQL(cmd *cobra.Command, tableName, columnName string) (sql, todo string, err error) {
+	flags := cmd.Flags()
+	typ, _ := flags.GetString("type")
+	notNull, _ := flags.GetBool("not-null")
+	def, _ := flags.GetString("default")
+	comment, _ := flags.GetString("comment")
+	after, _ := flags.GetString("after")
+
+	definition := "/* TODO: 列定义 */"
+	if typ = strings.TrimSpace(typ); typ != "" {
+		definition = typ
+		if notNull {
+			definition += " NOT NULL"
+		}
+		if flags.Changed("default") {
+			definition += " DEFAULT " + def
+		}
+		if comment != "" {
+			definition += " COMMENT '" + strings.ReplaceAll(comment, "'", "''") + "'"
+		}
+	} else {
+		if notNull || flags.Changed("default") || comment != "" {
+			return "", "", fmt.Errorf("--not-null, --default and --comment require --type")
+		}
+		todo = addColumnTodo
+	}
+
+	sql = "ALTER TABLE `" + tableName + "` ADD COLUMN `" + columnName + "` " + definition
+	if after != "" {
+		sql += " AFTER `" + after + "`"
+	}
+	return sql, todo, nil
 }
 
 func parseMigrationName(arg string) (action, objectName, tableName, columnName string, err error) {
@@ -129,14 +182,13 @@ func parseMigrationName(arg string) (action, objectName, tableName, columnName s
 	return action, objectName, tableName, columnName, nil
 }
 
+// migrationStubName 按 action 与对象类型选择模板；action 已由 parseMigrationName 校验.
 func migrationStubName(action, objectName string) string {
 	switch action {
 	case "create":
 		return "migration_create"
 	case "add":
 		return "migration_add"
-	case "update":
-		return "migration_update"
 	case "drop":
 		switch objectName {
 		case "index":

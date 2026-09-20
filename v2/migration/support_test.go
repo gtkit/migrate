@@ -39,17 +39,17 @@ func TestDetectDBTypeVariants(t *testing.T) {
 
 // TestNewLockSelectsImplementation 验证按方言选择锁实现与超时回退.
 func TestNewLockSelectsImplementation(t *testing.T) {
-	if _, ok := newLock(nil, DBTypeMySQL, "lk", time.Second).(*mysqlLock); !ok {
+	if _, ok := newLock(nil, DBTypeMySQL, "lk", "migrations", time.Second).(*mysqlLock); !ok {
 		t.Fatalf("mysql should use mysqlLock")
 	}
-	if _, ok := newLock(nil, DBTypePostgres, "lk", time.Second).(*postgresLock); !ok {
+	if _, ok := newLock(nil, DBTypePostgres, "lk", "migrations", time.Second).(*postgresLock); !ok {
 		t.Fatalf("postgres should use postgresLock")
 	}
-	if _, ok := newLock(nil, DBTypeSQLite, "lk", time.Second).(*noopLock); !ok {
+	if _, ok := newLock(nil, DBTypeSQLite, "lk", "migrations", time.Second).(*noopLock); !ok {
 		t.Fatalf("sqlite should use noopLock")
 	}
 
-	ml, ok := newLock(nil, DBTypeMySQL, "lk", 0).(*mysqlLock)
+	ml, ok := newLock(nil, DBTypeMySQL, "lk", "migrations", 0).(*mysqlLock)
 	if !ok || ml.timeout != defaultLockTimeout {
 		t.Fatalf("non-positive timeout should fall back to default, got %+v", ml)
 	}
@@ -67,8 +67,9 @@ func TestLockOptionsApplied(t *testing.T) {
 		t.Fatalf("lock options not applied: %q %v", m.lockName, m.lockTimeout)
 	}
 
+	// 空锁名保持"派生"状态（MySQL 首次获取时按库名与账本表名派生），空超时回退默认.
 	m = NewMigrator(t.TempDir(), db, WithLockName(""), WithLockTimeout(0))
-	if m.lockName != defaultLockName || m.lockTimeout != defaultLockTimeout {
+	if m.lockName != "" || m.lockTimeout != defaultLockTimeout {
 		t.Fatalf("empty lock options should keep defaults: %q %v", m.lockName, m.lockTimeout)
 	}
 }

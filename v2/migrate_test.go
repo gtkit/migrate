@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -65,6 +66,12 @@ func TestOptionsApply(t *testing.T) {
 	}
 	if !cfg.AllowUnknownApplied {
 		t.Fatalf("WithAllowUnknownApplied should set AllowUnknownApplied")
+	}
+
+	// 缺省值：锁名与项目名为空，分别表示"MySQL 按库名与账本表名派生"与"从 go.mod 解析".
+	def := defaultConfig()
+	if def.LockName != "" || def.ProjectName != "" {
+		t.Fatalf("LockName and ProjectName must default to empty (derived), got %q %q", def.LockName, def.ProjectName)
 	}
 
 	// 空/零值应被忽略（覆盖 if 分支的另一半）。
@@ -340,5 +347,56 @@ func TestMigrateHandlersAllowUnknownApplied(t *testing.T) {
 	// 授权不放宽 baseline：mark-applied 仍拒绝.
 	if _, err := execMigrate(t, "mark-applied", "--force"); err == nil || !strings.Contains(err.Error(), ghost) {
 		t.Fatalf("mark-applied must stay fail-closed, got %v", err)
+	}
+}
+
+// TestMigrateHandlersDownStepAndStatusTime 验证 CLI 的 down --step 与 status 应用时间输出.
+func TestMigrateHandlersDownStepAndStatusTime(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, handlerMigrationName+".go"), []byte("package migrations\n"), 0o644); err != nil {
+		t.Fatalf("write migration file: %v", err)
+	}
+	db := newHandlerTestDB(t, "migrate_handlers_down_step")
+	if err := Setup(db, WithMigrationDir(dir), WithLogger(&migration.NopLogger{})); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	// status/pending 只读：未 up 前不建账本表.
+	if _, err := execMigrate(t, "status"); err != nil {
+		t.Fatalf("status before up: %v", err)
+	}
+	if db.Migrator().HasTable("migrations") {
+		t.Fatalf("status must not create the migrations table")
+	}
+
+	if _, err := execMigrate(t, "up"); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+	out, err := execMigrate(t, "status")
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if !regexp.MustCompile(`Ran \(batch 1, \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\)`).MatchString(out) {
+		t.Fatalf("status should show batch and applied time, got:\n%s", out)
+	}
+
+	if _, err := execMigrate(t, "down", "--step", "-1", "--force"); err == nil || !strings.Contains(err.Error(), "--step") {
+		t.Fatalf("negative --step should be rejected, got %v", err)
+	}
+	if !db.Migrator().HasTable("widgets") {
+		t.Fatalf("rejected --step must not roll back anything")
+	}
+	if _, err := execMigrate(t, "down", "--step", "1"); err == nil {
+		t.Fatalf("down --step without --force should error")
+	}
+	out, err = execMigrate(t, "down", "--step", "5", "--force")
+	if err != nil {
+		t.Fatalf("down --step 5 --force: %v", err)
+	}
+	if !strings.Contains(out, "at most 5") {
+		t.Fatalf("down --step should report the step budget, got:\n%s", out)
+	}
+	if db.Migrator().HasTable("widgets") {
+		t.Fatalf("down --step should roll back the applied migration")
 	}
 }

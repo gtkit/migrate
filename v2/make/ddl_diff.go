@@ -144,15 +144,12 @@ type diffOp struct {
 	line   string
 }
 
+// splitDiffLines 拆分已 normalizeDDLText 的文本（非空时恒以换行结尾）.
 func splitDiffLines(text string) []string {
 	if text == "" {
 		return nil
 	}
-	lines := strings.Split(strings.TrimSuffix(text, "\n"), "\n")
-	if len(lines) == 1 && lines[0] == "" {
-		return nil
-	}
-	return lines
+	return strings.Split(strings.TrimSuffix(text, "\n"), "\n")
 }
 
 func diffLines(existing, generated []string) []diffOp {

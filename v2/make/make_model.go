@@ -14,32 +14,26 @@ var CmdMakeModel = &cobra.Command{
 
 func runMakeModel(cmd *cobra.Command, args []string) error {
 	cfg := resolveConfig(cmd)
-	model := enrichModel(cfg, makeModelFromString(cfg.ProjectName, "", args[0], ""))
-	return generateModelScaffold(cfg, model)
+	name, err := resolveProjectName(cfg)
+	if err != nil {
+		return err
+	}
+	cfg.ProjectName = name
+	return generateModelScaffold(cfg, newModel(cfg, args[0], ""))
 }
 
+// generateModelScaffold 生成 model 包基础文件与该实体的 model/repository；均已存在则跳过，不覆盖.
 func generateModelScaffold(cfg Config, model Model) error {
-	if err := ensureModelSupportFiles(cfg, model); err != nil {
-		return err
-	}
-	if err := createFileFromStub(modelFilePath(cfg, model), "model/model", model, writeSkipIfExists); err != nil {
-		return err
-	}
-	if err := createFileFromStub(repositoryFilePath(cfg, model), "model/repository", model, writeSkipIfExists); err != nil {
-		return err
-	}
-	if err := createFileFromStub(repositoryUtilFilePath(cfg, model), "model/repository_util", model, writeSkipIfExists); err != nil {
-		return err
-	}
-	return nil
-}
-
-func ensureModelSupportFiles(cfg Config, model Model) error {
-	if err := createFileFromStub(modelBaseFilePath(cfg), "model/base", model, writeSkipIfExists); err != nil {
-		return err
-	}
-	if err := createFileFromStub(modelDocFilePath(cfg), "model/doc", model, writeSkipIfExists); err != nil {
-		return err
+	for _, f := range []struct{ path, stub string }{
+		{modelBaseFilePath(cfg), "model/base"},
+		{modelDocFilePath(cfg), "model/doc"},
+		{modelFilePath(cfg, model), "model/model"},
+		{repositoryFilePath(cfg, model), "model/repository"},
+		{repositoryUtilFilePath(cfg, model), "model/repository_util"},
+	} {
+		if err := createFileFromStub(f.path, f.stub, model, writeSkipIfExists, nil); err != nil {
+			return err
+		}
 	}
 	return nil
 }

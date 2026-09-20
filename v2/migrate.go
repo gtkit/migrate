@@ -18,7 +18,8 @@ import (
 
 // Config 迁移配置.
 type Config struct {
-	// ProjectName 项目名称，用于代码生成.
+	// ProjectName 项目 module path，用于代码生成的 import 前缀.
+	// 缺省时生成命令从执行目录向上查找 go.mod 解析；找不到则生成命令报错.
 	ProjectName string
 
 	// DB 数据库连接.
@@ -39,9 +40,10 @@ type Config struct {
 	// Timeout 迁移操作超时时间（默认 5 分钟）.
 	Timeout time.Duration
 
-	// LockName 迁移锁名称（默认 "migrate_lock"）.
+	// LockName 迁移锁名称.缺省时 MySQL 按 "migrate:<数据库名>:<账本表名>" 派生
+	// （同实例不同库、不同账本表互不阻塞），PostgreSQL 为 "migrate_lock".
 	// 多项目共库时按 DDL 资源边界选择：无共享表/外键时各项目用独立锁名；
-	// 存在共享 DDL 资源时相关项目配相同锁名串行化.
+	// 存在共享 DDL 资源时相关项目配相同锁名串行化.MySQL 上不得超过 64 字符.
 	LockName string
 
 	// LockTimeout 获取迁移锁的最长等待时间（默认 10 秒）.
@@ -74,7 +76,8 @@ type Config struct {
 // Option 配置选项函数.
 type Option func(*Config)
 
-// WithProjectName 设置项目名称.
+// WithProjectName 设置项目 module path（代码生成的 import 前缀）.
+// 缺省时从执行目录向上查找 go.mod 自动解析.
 func WithProjectName(name string) Option {
 	return func(c *Config) {
 		if name != "" {
@@ -128,9 +131,10 @@ func WithTimeout(d time.Duration) Option {
 	}
 }
 
-// WithLockName 设置迁移锁名称.
+// WithLockName 设置迁移锁名称，覆盖默认派生规则（MySQL 按库名与账本表名派生）.
 // 多项目共库时按 DDL 资源边界选择：项目间无共享表/外键时用独立锁名避免互相阻塞；
 // 存在共享 DDL 资源时相关项目应配相同锁名，用同一把锁串行化迁移.
+// MySQL 上不得超过 64 字符，超长时迁移命令 fail-closed 报错.
 func WithLockName(name string) Option {
 	return func(c *Config) {
 		if name != "" {
@@ -199,13 +203,11 @@ func WithDDLModels(models ...any) Option {
 // defaultConfig 返回默认配置.
 func defaultConfig() *Config {
 	return &Config{
-		ProjectName:     "project_name",
 		MigrationDir:    "database/migrations",
 		ModelDir:        "internal/models",
 		RepositoryDir:   "internal/repository",
 		DDLDir:          "database/ddl",
 		Timeout:         5 * time.Minute,
-		LockName:        "migrate_lock",
 		LockTimeout:     10 * time.Second,
 		MigrationsTable: "migrations",
 	}
@@ -303,7 +305,7 @@ var CmdMigrateUp = &cobra.Command{
 	RunE:  runUp,
 }
 
-// CmdMigrateRollback 回滚最后一个批次的迁移（down/rollback，需 --force）.
+// CmdMigrateRollback 回滚最后一个批次的迁移（down/rollback，需 --force；--step N 改为回滚最新 N 条）.
 var CmdMigrateRollback = &cobra.Command{
 	Use:     "down",
 	Aliases: []string{"rollback"},
@@ -374,6 +376,7 @@ func init() {
 	CmdMigrateLint.Flags().Bool("skip-db", false, "Skip database-applied migration drift checks")
 
 	CmdMigrateRollback.Flags().Bool("force", false, "Required: confirm rolling back the last batch")
+	CmdMigrateRollback.Flags().Int("step", 0, "Roll back at most N applied migrations instead of the last batch")
 	CmdMigrateDownTo.Flags().Bool("force", false, "Required: confirm rolling back migrations newer than the target")
 	CmdMigrateReset.Flags().Bool("force", false, "Required: confirm rolling back all migrations")
 	CmdMigrateRefresh.Flags().Bool("force", false, "Required: confirm rolling back and re-running all migrations")
@@ -427,15 +430,30 @@ func runDown(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
+	step, err := cmd.Flags().GetInt("step")
+	if err != nil {
+		return err
+	}
+	if step < 0 {
+		return fmt.Errorf("--step must be a positive integer, got %d", step)
+	}
+
 	m, ctx, cancel, err := commandEnv(cmd)
 	if err != nil {
 		return err
 	}
 	defer cancel()
 
-	cmd.Println("Rolling back last batch...")
-	if err := m.Rollback(ctx); err != nil {
-		return fmt.Errorf("migrate rollback: %w", err)
+	if step > 0 {
+		cmd.Printf("Rolling back at most %d migration(s)...\n", step)
+		if err := m.RollbackSteps(ctx, step); err != nil {
+			return fmt.Errorf("migrate rollback: %w", err)
+		}
+	} else {
+		cmd.Println("Rolling back last batch...")
+		if err := m.Rollback(ctx); err != nil {
+			return fmt.Errorf("migrate rollback: %w", err)
+		}
 	}
 
 	cmd.Println("Rollback completed.")
@@ -536,7 +554,7 @@ func runStatus(cmd *cobra.Command, _ []string) error {
 	for _, s := range statuses {
 		status := "Pending"
 		if s.Ran {
-			status = fmt.Sprintf("Ran (batch %d)", s.Batch)
+			status = fmt.Sprintf("Ran (batch %d, %s)", s.Batch, s.AppliedAt.Format(time.DateTime))
 		}
 		cmd.Printf("  %-50s %s\n", s.Name, status)
 	}

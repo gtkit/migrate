@@ -1,8 +1,7 @@
 package migrations
 
 import (
-	"time"
-
+{{SnapshotImports}}
 	"gorm.io/gorm"
 
 	"github.com/gtkit/migrate/v2/migration"
@@ -14,12 +13,7 @@ import (
 // 而迁移必须锁定它「创建当时」的结构，才能保证任何环境、任何时间执行本迁移
 // 都得到完全一致的表。后续字段/索引变更请新建 add_/update_ 迁移，切勿修改本文件。
 type {{SnapshotStruct}} struct {
-	ID        int64          `gorm:"column:id;primaryKey;autoIncrement;comment:主键编码"`
-	CreatedAt time.Time      `gorm:"column:created_at;type:datetime;index;comment:创建时间"`
-	UpdatedAt time.Time      `gorm:"column:updated_at;type:datetime;index;comment:最后更新时间"`
-	DeletedAt gorm.DeletedAt `gorm:"column:deleted_at;type:datetime;index;comment:删除时间"`
-
-	// TODO: 在此补全建表字段（可对照初始 model 定义，但不要 import 业务 model）。
+{{SnapshotFields}}
 }
 
 // TableName 锁定本迁移操作的表名。

@@ -1,14 +1,11 @@
-// Package {{PackageName}} 模型
 package {{ModelPackageName}}
 
 import (
+	"encoding/json"
 	"strconv"
-
-	"{{ProjectName}}/internal/pkg/paginator"
-
-	"github.com/gtkit/json"
 )
 
+// {{StructName}} 对应数据表 {{TableName}}。
 type {{StructName}} struct {
 	BaseID
 
@@ -22,22 +19,17 @@ func ({{VariableName}} *{{StructName}}) TableName() string {
 	return "{{TableName}}"
 }
 
-type {{StructName}}ListPaging struct {
-	List   []*{{StructName}}    `json:"list"`
-	Paging paginator.Paging `json:"paging"`
-}
-
-// GetStringID 获取 ID 的字符串格式.
+// GetStringID 返回主键的十进制字符串形式。
 func ({{VariableName}} *{{StructName}}) GetStringID() string {
-	return strconv.Itoa(int({{VariableName}}.ID))
+	return strconv.FormatInt({{VariableName}}.ID, 10)
 }
 
-// MarshalBinary 序列化到JSON.
+// MarshalBinary 序列化为 JSON，供缓存等二进制接口使用。
 func ({{VariableName}} *{{StructName}}) MarshalBinary() ([]byte, error) {
 	return json.Marshal({{VariableName}})
 }
 
-// UnmarshalBinary 反序列化.
+// UnmarshalBinary 从 JSON 反序列化。
 func ({{VariableName}} *{{StructName}}) UnmarshalBinary(data []byte) error {
 	return json.Unmarshal(data, {{VariableName}})
 }

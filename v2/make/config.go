@@ -1,7 +1,9 @@
 package make
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"path"
 	"path/filepath"
 	"slices"
@@ -30,7 +32,6 @@ var (
 
 func defaultConfig() Config {
 	return Config{
-		ProjectName:   "project_name",
 		ModelDir:      "internal/models",
 		RepositoryDir: "internal/repository",
 		MigrationDir:  "database/migrations",
@@ -72,9 +73,6 @@ func cloneConfig(cfg Config) Config {
 func normalizeConfig(cfg Config) Config {
 	def := defaultConfig()
 
-	if cfg.ProjectName == "" {
-		cfg.ProjectName = def.ProjectName
-	}
 	cfg.ModelDir = cleanDir(cfg.ModelDir, def.ModelDir)
 	cfg.RepositoryDir = cleanDir(cfg.RepositoryDir, def.RepositoryDir)
 	cfg.MigrationDir = cleanDir(cfg.MigrationDir, def.MigrationDir)
@@ -110,26 +108,51 @@ func resolveConfig(cmd *cobra.Command) Config {
 	return normalizeConfig(cfg)
 }
 
+// readStringFlag 读取命令自身或父命令持久化的字符串 flag（cobra 的 Flag 会沿父链查找）.
 func readStringFlag(cmd *cobra.Command, name string) string {
 	if cmd == nil {
 		return ""
 	}
-
 	if flag := cmd.Flag(name); flag != nil {
-		if value := strings.TrimSpace(flag.Value.String()); value != "" {
-			return value
-		}
-	}
-
-	inherited := cmd.InheritedFlags()
-	if inherited == nil {
-		return ""
-	}
-	if flag := inherited.Lookup(name); flag != nil {
 		return strings.TrimSpace(flag.Value.String())
 	}
-
 	return ""
+}
+
+// resolveProjectName 返回代码生成用的 module path：显式配置优先，
+// 否则从执行目录向上查找 go.mod 解析；两者都没有时 fail-closed 报错，不落盘错误 import.
+func resolveProjectName(cfg Config) (string, error) {
+	if cfg.ProjectName != "" {
+		return cfg.ProjectName, nil
+	}
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("resolve project name: %w", err)
+	}
+	for {
+		if name, ok := readModulePath(filepath.Join(dir, "go.mod")); ok {
+			return name, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", errors.New("project name is required: pass WithProjectName or run inside a Go module (no go.mod found)")
+		}
+		dir = parent
+	}
+}
+
+// readModulePath 读取 go.mod 的 module 指令；文件不存在或无 module 行返回 false.
+func readModulePath(goModPath string) (string, bool) {
+	data, err := os.ReadFile(goModPath)
+	if err != nil {
+		return "", false
+	}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "module "); ok {
+			return strings.Trim(strings.TrimSpace(rest), `"`), true
+		}
+	}
+	return "", false
 }
 
 func moduleImportPath(projectName, dir string) string {

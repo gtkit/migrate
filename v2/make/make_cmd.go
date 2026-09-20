@@ -16,16 +16,12 @@ var CmdMakeCMD = &cobra.Command{
 }
 
 func runMakeCMD(cmd *cobra.Command, args []string) error {
-	cfg := resolveConfig(cmd)
-	model := enrichModel(cfg, makeModelFromString(cfg.ProjectName, "cmd", args[0], ""))
-	filePath := fmt.Sprintf("cmd/%s.go", model.PackageName)
-
-	if err := createFileFromStub(filePath, "cmd", model, writeFailIfExists); err != nil {
+	model := newModel(resolveConfig(cmd), args[0], "")
+	if err := createFileFromStub(fmt.Sprintf("cmd/%s.go", model.PackageName), "cmd", model, writeFailIfExists, nil); err != nil {
 		return err
 	}
 
-	console.Success("command name: " + model.PackageName)
-	console.Success("command variable name: cmd.Cmd" + model.StructName)
-	console.Warning("please edit main.go's app.Commands slice to register command")
+	console.Success("command variable: cmd.Cmd" + model.StructName)
+	console.Warning("register it explicitly: rootCmd.AddCommand(cmd.Cmd" + model.StructName + ")")
 	return nil
 }

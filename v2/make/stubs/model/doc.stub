@@ -1,3 +1,2 @@
-package {{ModelPackageName}}
-
 // Package {{ModelPackageName}} stores GORM model definitions.
+package {{ModelPackageName}}

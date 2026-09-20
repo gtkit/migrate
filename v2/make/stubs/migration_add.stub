@@ -12,11 +12,7 @@ func init() {
 		if db.Migrator().HasColumn("{{TableName}}", "{{ColumnName}}") {
 			return nil
 		}
-		// TODO: 补全列定义（类型/约束/注释）。大表建议标注在线 DDL 策略，例如：
-		//   ADD COLUMN `{{ColumnName}}` VARCHAR(64) NOT NULL DEFAULT '' COMMENT '说明', ALGORITHM=INPLACE, LOCK=NONE
-		return db.Exec(
-			"ALTER TABLE `{{TableName}}` ADD COLUMN `{{ColumnName}}` /* TODO: 列定义 */{{AfterClause}}",
-		).Error
+{{AddColumnTodo}}		return db.Exec({{AddColumnSQL}}).Error
 	}
 
 	down := func(db *gorm.DB) error {

@@ -1,3 +1,2 @@
+// Package migrations stores database migration registrations.
 package migrations
-
-// Package migrations stores v2 database migration registrations.
