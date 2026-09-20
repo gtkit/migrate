@@ -2,16 +2,20 @@ package migrate
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	makecmd "github.com/gtkit/migrate/v2/make"
 	"github.com/gtkit/migrate/v2/migration"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"gorm.io/driver/mysql"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -399,4 +403,104 @@ func TestMigrateHandlersDownStepAndStatusTime(t *testing.T) {
 	if db.Migrator().HasTable("widgets") {
 		t.Fatalf("down --step should roll back the applied migration")
 	}
+}
+
+// TestGeneratedMigrationsPassLint 端到端锁定契约：make migration 的产出默认就能通过
+// 自己的 migrate lint（MySQL 方言）。只有刻意留 TODO 骨架的形态才报 unfilled_placeholder，
+// 只有真正不可逆的形态才报 irreversible_migration——其余一律零问题。
+func TestGeneratedMigrationsPassLint(t *testing.T) {
+	cases := []struct {
+		name      string
+		args      []string
+		wantCodes []string // 期望的问题码集合；空表示必须零问题
+	}{
+		{name: "create", args: []string{"migration", "create_widgets_table"}, wantCodes: []string{"unfilled_placeholder"}},
+		{name: "add column", args: []string{"migration", "add_email_to_widgets_table", "--type", "VARCHAR(128)", "--not-null", "--default", "''", "--comment", "邮箱"}},
+		{name: "add index", args: []string{"migration", "add_index_email_to_widgets_table"}},
+		{name: "add unique composite index", args: []string{"migration", "add_index_email_status_to_widgets_table", "--unique", "--columns", "email,status"}},
+		// 改列与 update 是待补全骨架：TODO 未填是 error，缺在线 DDL 策略是 warning——
+		// 两者都刻意保留，策略只能由使用者按实际变更决定。
+		{name: "modify column", args: []string{"migration", "modify_email_of_widgets_table", "--type", "VARCHAR(255)"}, wantCodes: []string{"unfilled_placeholder", "missing_online_ddl"}},
+		{name: "drop column reversible", args: []string{"migration", "drop_column_email_from_widgets_table", "--type", "VARCHAR(128)"}},
+		{name: "drop index reversible", args: []string{"migration", "drop_index_email_from_widgets_table", "--columns", "email"}},
+		{name: "drop column irreversible", args: []string{"migration", "drop_column_email_from_widgets_table"}, wantCodes: []string{"irreversible_migration"}},
+		{name: "drop index irreversible", args: []string{"migration", "drop_index_email_from_widgets_table"}, wantCodes: []string{"irreversible_migration"}},
+		{name: "drop table", args: []string{"migration", "drop_widgets_table"}, wantCodes: []string{"irreversible_migration"}},
+		{name: "update", args: []string{"migration", "update_widgets_table"}, wantCodes: []string{"unfilled_placeholder", "missing_online_ddl"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := generateIntoTempDir(t, tc.args...)
+
+			names, err := filepath.Glob(filepath.Join(dir, "2*.go"))
+			if err != nil || len(names) != 1 {
+				t.Fatalf("expected one generated migration, got %v (%v)", names, err)
+			}
+			name := strings.TrimSuffix(filepath.Base(names[0]), ".go")
+
+			registry := migration.NewRegistry()
+			noop := func(*gorm.DB) error { return nil }
+			registry.Add(name, noop, noop)
+
+			m := migration.NewMigrator(dir, offlineMySQLDB(t), migration.WithRegistry(registry), migration.WithLogger(&migration.NopLogger{}))
+			report, err := m.Lint(t.Context(), migration.LintOptions{SkipDatabase: true})
+			if err != nil {
+				t.Fatalf("lint: %v", err)
+			}
+
+			got := make([]string, 0, len(report.Issues))
+			for _, issue := range report.Issues {
+				got = append(got, issue.Code)
+			}
+			slices.Sort(got)
+			want := slices.Clone(tc.wantCodes)
+			slices.Sort(want)
+			if !slices.Equal(got, want) {
+				t.Fatalf("lint issues = %v, want %v (%+v)", got, want, report.Issues)
+			}
+		})
+	}
+}
+
+// generateIntoTempDir 在临时目录内执行一条 make migration 并返回迁移目录.
+func generateIntoTempDir(t *testing.T, args ...string) string {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/lintcheck\n\ngo 1.26\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+
+	makecmd.SetConfig(makecmd.Config{})
+	resetFlags(makecmd.CmdMake)
+	makecmd.CmdMake.SilenceErrors = true
+	makecmd.CmdMake.SilenceUsage = true
+	makecmd.CmdMake.SetOut(io.Discard)
+	makecmd.CmdMake.SetErr(io.Discard)
+	makecmd.CmdMake.SetArgs(args)
+	if err := makecmd.CmdMake.Execute(); err != nil {
+		t.Fatalf("make %v: %v", args, err)
+	}
+	return filepath.Join(root, "database/migrations")
+}
+
+// offlineMySQLDB 构造 MySQL 方言但不连接数据库，使 lint 走 MySQL 专属规则.
+func offlineMySQLDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	db, err := gorm.Open(mysql.New(mysql.Config{
+		DSN:                       "offline:@tcp(127.0.0.1:1)/offline",
+		SkipInitializeWithVersion: true,
+	}), &gorm.Config{DisableAutomaticPing: true})
+	if err != nil {
+		t.Fatalf("open offline mysql dialect: %v", err)
+	}
+	return db
 }

@@ -1,0 +1,26 @@
+package migrations
+
+import (
+	"gorm.io/gorm"
+
+	"github.com/gtkit/migrate/v2/migration"
+)
+
+func init() {
+	up := func(db *gorm.DB) error {
+		// 幂等：索引已存在则跳过，重复执行无副作用。
+		if db.Migrator().HasIndex("{{TableName}}", "{{IndexName}}") {
+			return nil
+		}
+		return db.Exec({{AddIndexSQL}}).Error
+	}
+
+	down := func(db *gorm.DB) error {
+		if !db.Migrator().HasIndex("{{TableName}}", "{{IndexName}}") {
+			return nil
+		}
+		return db.Exec({{DropIndexSQL}}).Error
+	}
+
+	migration.Add("{{FileName}}", up, down)
+}

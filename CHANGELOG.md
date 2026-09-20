@@ -6,6 +6,26 @@
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-09-20
+
+### Added
+
+- 新增迁移形态 `make migration modify_<列>_of_<表>_table`：up 由 `--type`/`--not-null`/`--default`/`--comment` 生成完整的 `MODIFY COLUMN`，down 生成同形骨架并把变更前的列定义留为 `TODO`（`MODIFY COLUMN` 整体替换定义，工具无从得知旧定义；由 lint 强制补全）。
+- `drop_column_*` 给出 `--type` 等列定义参数时，down 生成重建该列的 `ADD COLUMN`，并在文件中注明只重建结构、数据不会恢复；`drop_index_*` 给出 `--columns`（可配 `--unique`）时，down 生成重建该索引的 `ADD INDEX`。参数不给时仍标记为 `Irreversible`，行为不变。此前删列/删索引恒为不可逆，同批次里只要有一条就会让整批 `down` 被预检拒绝。
+- 新增迁移形态 `make migration add_index_<列>_to_<表>_table`：生成带 `HasIndex` 幂等守卫的 `ADD INDEX`/`DROP INDEX` 成对实现，默认索引名 `idx_<表>_<列...>`（与 GORM 默认命名策略一致），up 与 down 都默认标注 `ALGORITHM=INPLACE, LOCK=NONE`；加索引天然可逆，`down` 是真正的 `DROP INDEX` 而非 `Irreversible`。新增 flag `--unique`（唯一索引）、`--index-name`（覆盖默认名，超过 MySQL 64 字符上限时生成期报错）、`--columns`（复合索引列表，覆盖从迁移名推出的单列）。
+
+### Changed
+
+- `drop_index_*` 的默认索引名改为与 `add_index_*` 一致的 `idx_<表>_<列>`（此前是裸列名并留 `TODO` 待人工确认），支持 `--index-name` 覆盖；生成物不再含 `TODO`。
+- 加列、删列、加索引、删索引这些完整生成的语句统一带 `ALGORITHM=INPLACE, LOCK=NONE`（此前只有加索引带），生成物默认即可通过 `migrate lint` 的 `missing_online_ddl` 检查。`modify_*` 与 `update_*` 这类待补全骨架**不预填**策略：实测 MySQL 8.0 上 `MODIFY COLUMN` 仅少数场景（如 VARCHAR 扩容）支持 `ALGORITHM=INPLACE`，缩短长度与跨类型转换都会报 1846 要求 `COPY`，预填会让多数改列迁移直接执行失败；策略交由使用者决定，由 lint 提醒。
+- `update_*` 与 `modify_*` 模板注释里的 `migration.Irreversible(...)` 改为不带括号的表述，消除 lint 对注释文本的 `irreversible_migration` 误报。
+- **⚠ 解析行为修正** 表名、列名、索引名统一按标识符白名单校验（字母、数字、下划线，不以数字开头，长度不超过 64），非法时生成期报错且不落盘。此前 `add_ev il_to_users_table`、`create_users; DROP TABLE x_table` 这类输入会静默生成编译不过或执行必错的文件。以数字开头的表名 MySQL 本身允许，但无法用于 `create` 的快照 struct 名，一并拒绝。
+- **⚠ 解析行为修正** 迁移名里的 `_to_` / `_from_` / `_of_` 出现多于一次时改为报错，并指引用新增的 `--table <表名>` 显式消歧。此前按首次出现切分，`add_reply_to_id_to_messages_table` 会被静默切成「给 `id_to_messages` 表加 `reply` 列」；而按最后一次切分同样会让 `add_ref_to_order_to_shipment_table` 被切成「给 `shipment` 表加 `ref_to_order` 列」——列名与表名都可能自带分隔符，任何一种猜法都会在另一种场景下静默出错，因此改为 fail-closed。
+- 新增 `--table` flag：迁移名分隔符歧义时显式指定表名，生成器按后缀剥离得到目标名，不再依赖猜测。
+- **⚠ 解析行为修正** `add_index_*` 不再被解析为"加一个名叫 `index_xxx` 的列"。此前 `add_index_email_to_users_table` 会静默生成添加 `index_email` 列的迁移且不报错，与本项目 fail-closed 的原则冲突。真需要添加名字以 `index_` 开头的列时，请改用其他列名或直接写 `update_*` 迁移。
+- **⚠ 解析行为修正** `add_unique_index_*` 直接报错并指引改用 `add_index_* --unique`（此前同样被静默当作列名）；`add` 形态解析出的列名为空时报错。
+- flag 与迁移形态不匹配时报错而非静默忽略：加列迁移传 `--unique`/`--index-name`/`--columns`，或加索引迁移传 `--type`/`--not-null`/`--default`/`--comment`/`--after`，都会被拒绝且不生成文件。
+
 ## [2.3.0] - 2026-09-20
 
 ### Added

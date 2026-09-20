@@ -14,7 +14,7 @@ func init() {
 	}
 
 	down := func(db *gorm.DB) error {
-		// TODO: 补全与 up 对应的反向变更；无法回滚时改用 migration.Irreversible(...)。
+		// TODO: 补全与 up 对应的反向变更；无法回滚时改用 migration.Irreversible 标记为不可逆。
 		return db.Exec("ALTER TABLE `{{TableName}}` /* TODO: 反向变更定义 */").Error
 	}
 

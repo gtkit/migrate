@@ -1,0 +1,24 @@
+package migrations
+
+import (
+	"gorm.io/gorm"
+
+	"github.com/gtkit/migrate/v2/migration"
+)
+
+func init() {
+	// 在线 DDL 策略需按本次变更自行确定：MODIFY COLUMN 只有少数场景（如 VARCHAR 扩容）
+	// 支持 ALGORITHM=INPLACE，缩短长度或跨类型转换都要求 ALGORITHM=COPY（会阻塞写入）。
+	// 大表请走 gh-ost / pt-online-schema-change；确定后在语句末尾补上策略子句。
+	up := func(db *gorm.DB) error {
+{{ModifyColumnTodo}}		return db.Exec({{ModifyColumnSQL}}).Error
+	}
+
+	down := func(db *gorm.DB) error {
+		// TODO: 填入本迁移执行前 `{{ColumnName}}` 的完整定义（MODIFY COLUMN 整体替换定义，
+		// 必须写全类型、约束与注释）；确实无法还原时改用 migration.Irreversible 标记为不可逆。
+		return db.Exec("ALTER TABLE `{{TableName}}` MODIFY COLUMN `{{ColumnName}}` /* TODO: 变更前的列定义 */").Error
+	}
+
+	migration.Add("{{FileName}}", up, down)
+}

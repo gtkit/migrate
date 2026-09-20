@@ -7,20 +7,16 @@ import (
 )
 
 func init() {
-	// TODO: 确认索引名（下方默认用列名占位，按实际索引名修改后删除本 TODO）。
-	const indexName = "{{ColumnName}}"
-
 	up := func(db *gorm.DB) error {
 		// 幂等：索引不存在则跳过。
-		if !db.Migrator().HasIndex("{{TableName}}", indexName) {
+		if !db.Migrator().HasIndex("{{TableName}}", "{{IndexName}}") {
 			return nil
 		}
-		return db.Exec("ALTER TABLE `{{TableName}}` DROP INDEX `" + indexName + "`").Error
+		return db.Exec({{DropIndexSQL}}).Error
 	}
 
 	down := func(db *gorm.DB) error {
-		return migration.Irreversible("fill in the index recreation for {{FileName}} manually")
-	}
+{{DownBody}}	}
 
 	migration.Add("{{FileName}}", up, down)
 }

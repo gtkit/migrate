@@ -12,7 +12,7 @@
 - `lint` 命令检查 migration 文件、registry 和已执行记录漂移
 - 结构化日志接口，可注入 zap / zerolog 等
 - Lock name 可配置，同一数据库多项目共存不冲突
-- `make migration` 自动生成迁移文件和 model 脚手架；`create --from-model` 从已注册的 GORM model 生成结构快照，`add --type ...` 直接生成完整的加列 SQL
+- `make migration` 自动生成迁移文件和 model 脚手架；`create --from-model` 从已注册的 GORM model 生成结构快照，`add --type ...` 生成完整的加列 SQL，`add_index_*` 生成带在线 DDL 策略的加索引 SQL
 - `make ddl diff` 可对比当前模型生成的 strict DDL 与已提交 SQL 文件
 - 所有操作返回 `error`，不在库内调用 `os.Exit`
 
@@ -224,11 +224,20 @@ myapp make migration add_email_to_users_table --after phone
 # 从 WithDDLModels 注册的、表名为 users 的 GORM model 生成结构快照（不生成 model/repository 脚手架）
 myapp make migration create_users_table --from-model
 
-# 删除字段
-myapp make migration drop_column_avatar_from_users_table
+# 添加索引（默认名 idx_users_email，自带在线 DDL 策略）
+myapp make migration add_index_email_to_users_table
 
-# 删除索引
-myapp make migration drop_index_email_from_users_table
+# 唯一复合索引
+myapp make migration add_index_email_status_to_users_table --unique --columns email,status
+
+# 修改字段类型（up 完整生成，down 留成型骨架待补全）
+myapp make migration modify_email_of_users_table --type 'VARCHAR(255)' --not-null
+
+# 删除字段；给出原列定义即可生成真实回滚
+myapp make migration drop_column_avatar_from_users_table --type 'VARCHAR(255)'
+
+# 删除索引；给出原索引列即可生成真实回滚
+myapp make migration drop_index_email_from_users_table --columns email
 ```
 
 支持的命名模式：
@@ -241,10 +250,25 @@ myapp make migration drop_index_email_from_users_table
 | `add_<column>_to_<table>_table` | `add_email_to_users_table` | 生成 **raw SQL** 加列 migration，列类型/约束以 `TODO` 占位待补全 |
 | `add_<column>_to_<table>_table --type <T> [--not-null] [--default <expr>] [--comment <c>]` | `add_email_to_users_table --type 'VARCHAR(128)' --not-null --default "''" --comment '邮箱'` | 生成完整可执行的 `ADD COLUMN`，不含 `TODO`；`--not-null`/`--default`/`--comment` 必须与 `--type` 同时给出，否则报错 |
 | `add_<column>_to_<table>_table --after <col>` | `add_email_to_users_table --after phone` | 在 `ADD COLUMN` 后追加 `AFTER <col>` 子句（MySQL 列定位），可与 `--type` 组合 |
-| `drop_column_<column>_from_<table>_table` | `drop_column_email_from_users_table` | 生成 raw `DROP COLUMN` migration，`down` 标记为人工补全 |
-| `drop_index_<name>_from_<table>_table` | `drop_index_email_from_users_table` | 生成 raw `DROP INDEX` migration（索引名以 `TODO` 待确认），`down` 标记为人工补全 |
+| `add_index_<column>_to_<table>_table [--unique] [--index-name <n>] [--columns a,b]` | `add_index_email_to_users_table` | 生成 raw `ADD INDEX` migration，默认索引名 `idx_<表>_<列...>`、默认标注 `ALGORITHM`/`LOCK`；`down` 是对应的 `DROP INDEX`（可回滚，不是不可逆） |
+| `modify_<column>_of_<table>_table --type <T> [...]` | `modify_email_of_users_table --type 'VARCHAR(255)'` | 生成 raw `MODIFY COLUMN` migration，up 由参数完整生成，`down` 是同形骨架并把旧定义留为 `TODO` |
+| `drop_column_<column>_from_<table>_table [--type <T> ...]` | `drop_column_email_from_users_table --type 'VARCHAR(128)'` | 生成 raw `DROP COLUMN` migration；给出原列定义时 `down` 重建该列，否则标记为不可逆 |
+| `drop_index_<column>_from_<table>_table [--columns a,b] [--unique]` | `drop_index_email_from_users_table --columns email` | 生成 raw `DROP INDEX` migration，索引名默认与 `add_index` 一致；给出原索引列时 `down` 重建该索引，否则标记为不可逆 |
 
 > **迁移模板均自包含、显式、可审查**：都不 import 业务 model、不使用 `AutoMigrate`（避免随 model 演进漂移）。带 `TODO` 占位的模板需补全（大表建议标注 `ALGORITHM`/`LOCK` 在线 DDL 策略）后才能通过 `migrate lint`。
+>
+> 加列、删列、加索引、删索引这些**完整生成**的语句默认带 `ALGORITHM=INPLACE, LOCK=NONE`（已在 MySQL 8.0 上逐条验证可执行），默认产出即可通过 `migrate lint` 的在线 DDL 检查。`LOCK=NONE` 的含义是：MySQL 若无法在不阻塞写入的前提下完成变更，会**直接报错**而不是悄悄锁表。
+>
+> `modify_*` 与 `update_*` 是待补全骨架，**不预填**策略子句：`MODIFY COLUMN` 只有少数场景（如 VARCHAR 扩容）支持 `ALGORITHM=INPLACE`，缩短长度或跨类型转换都要求 `ALGORITHM=COPY`，预填一个多数情况下会报错的值比不填更糟。策略由你按实际变更决定，`migrate lint` 的 `missing_online_ddl` 会提醒。
+>
+> 表名、列名、索引名统一按标识符白名单校验（字母、数字、下划线，不以数字开头，不超过 64 字符），不合法时生成期直接报错、不落盘。以数字开头的表名虽然 MySQL 允许，但无法用于 `create` 的快照 struct 名，故一并拒绝；这类表请手写迁移。
+>
+> 迁移名里的 `_to_` / `_from_` / `_of_` 出现**多于一次**时无法判断哪一段是表名（列名可能自带分隔符如 `reply_to_id`，表名同样可能如 `order_to_shipment`），生成器直接报错，用 `--table <表名>` 显式指定即可：
+>
+> ```bash
+> myapp make migration add_ref_to_order_to_shipment_table --table order_to_shipment
+> myapp make migration add_reply_to_id_to_messages_table --table messages
+> ```
 >
 > `--after` 仅对 `add_*` 模式生效，通过在 raw `ALTER TABLE ... ADD COLUMN` 后追加 `AFTER <col>` 实现。注意列的物理顺序在 MySQL 中仅影响展示，不影响功能。
 >
@@ -257,10 +281,13 @@ myapp make migration drop_index_email_from_users_table
 | action | up 行为 | down 行为 |
 |--------|---------|-----------|
 | `create` | 快照 struct `CreateTable`（带存在性检查） | `DropTable` |
-| `update` | raw `ALTER TABLE`（TODO 待补全） | raw 反向 `ALTER`（TODO 待补全） |
-| `add` | raw `ALTER TABLE ADD COLUMN`（TODO 列定义，带存在性检查） | raw `DROP COLUMN`（带存在性检查） |
+| `update` | raw `ALTER TABLE` 骨架（TODO 待补全） | raw 反向 `ALTER` 骨架（TODO 待补全） |
+| `add`（列） | raw `ADD COLUMN`（带存在性检查；无 `--type` 时列定义为 TODO） | raw `DROP COLUMN`（带存在性检查） |
+| `add_index` | raw `ADD INDEX`（带存在性检查） | raw `DROP INDEX`（带存在性检查） |
+| `modify` | raw `MODIFY COLUMN`（无 `--type` 时列定义为 TODO） | raw `MODIFY COLUMN` 骨架，旧定义为 TODO |
 | `drop`（表） | `DropTable`（带存在性检查） | 标记为不可逆，需人工补全 |
-| `drop_column` / `drop_index` | raw `DROP COLUMN` / `DROP INDEX`（带存在性检查） | 标记为不可逆，需人工补全 |
+| `drop_column` | raw `DROP COLUMN`（带存在性检查） | 给出 `--type` 时重建该列，否则不可逆 |
+| `drop_index` | raw `DROP INDEX`（带存在性检查） | 给出 `--columns` 时重建该索引，否则不可逆 |
 
 示例（`create`）——迁移文件**自包含表结构快照，有意不引用业务 model**：业务 model 会随需求演进，而迁移必须锁定「创建当时」的结构；引用业务 model 的迁移会被 `migrate lint` 以 `non_self_contained` 判为 error：
 
@@ -423,7 +450,7 @@ lint 当前会检查：
 - migration 明确标记为 `Irreversible(...)`
 - 多个 migration 共享相同时间戳前缀
 - 数据库里已执行 migration，但源码/磁盘已经找不到
-- 迁移残留未补全的 `TODO` 占位（error）
+- 迁移残留未补全的 `TODO` 占位（error）,`update_*` 与 `modify_*` 的骨架默认就带 `TODO`，补全后才能执行
 - 迁移使用 `AutoMigrate`（error）
 - 迁移非自包含：import 了标准库、gorm、migrate 包以外的第三方/业务包（如业务 model）（error）
 - raw `ALTER TABLE` 缺 `ALGORITHM`/`LOCK` 在线 DDL 策略（warning）
@@ -766,18 +793,103 @@ func init() {
 - 大表加列请在 SQL 末尾补 `, ALGORITHM=INPLACE, LOCK=NONE`（MySQL 8.0 加列多数场景可用 `ALGORITHM=INSTANT`）。`migrate lint` 对缺在线 DDL 策略的 `ALTER TABLE` 报 warning，`--strict` 下视为失败。
 - 同步更新业务 model 加上 `Phone` 字段，再 `myapp make ddl users` 与 `myapp make ddl diff users` 确认 model 与落盘 DDL 一致。
 
-#### 7.4 其他结构变更
+#### 7.4 加索引：`add_index`
 
-| 需求 | 命令 | 生成物 |
-|------|------|--------|
-| 改列类型、加索引等 | `make migration update_users_table` | up/down 各一段 raw `ALTER TABLE` 骨架，`TODO` 待补全 |
-| 删列 | `make migration drop_column_avatar_from_users_table` | up 为带存在性检查的 `DROP COLUMN`，down 标记 `Irreversible` |
-| 删索引 | `make migration drop_index_email_from_users_table` | up 为带存在性检查的 `DROP INDEX`，索引名 `TODO` 待确认 |
-| 删表 | `make migration drop_users_table` | up 为带存在性检查的 `DropTable`，down 标记 `Irreversible` |
+```bash
+# 单列索引，索引名默认 idx_users_email
+myapp make migration add_index_email_to_users_table
 
-标记 `Irreversible` 的迁移无法自动回滚：`down` 到它时会报错并停在它之前。需要可回滚就在 down 里手写重建逻辑。
+# 唯一索引
+myapp make migration add_index_email_to_users_table --unique
 
-#### 7.5 发布到生产
+# 复合索引：列名写进迁移名保持文件自解释，--columns 给出实际列
+myapp make migration add_index_email_status_to_users_table --columns email,status
+
+# 自定义索引名
+myapp make migration add_index_email_to_users_table --index-name uk_users_email
+```
+
+生成的 up/down 成对且可回滚：
+
+```go
+func init() {
+	up := func(db *gorm.DB) error {
+		// 幂等：索引已存在则跳过，重复执行无副作用。
+		if db.Migrator().HasIndex("users", "idx_users_email") {
+			return nil
+		}
+		return db.Exec("ALTER TABLE `users` ADD INDEX `idx_users_email` (`email`), ALGORITHM=INPLACE, LOCK=NONE").Error
+	}
+
+	down := func(db *gorm.DB) error {
+		if !db.Migrator().HasIndex("users", "idx_users_email") {
+			return nil
+		}
+		return db.Exec("ALTER TABLE `users` DROP INDEX `idx_users_email`, ALGORITHM=INPLACE, LOCK=NONE").Error
+	}
+
+	migration.Add("2026_09_20_140000_add_index_email_to_users_table", up, down)
+}
+```
+
+要点：
+
+- 默认索引名 `idx_<表>_<列...>` 与 GORM 的默认命名策略一致：从 model tag 建表产出的索引名和这里对得上，`--index-name` 可覆盖。索引名超过 64 字符时生成期直接报错。
+- up 与 down 都默认标注 `ALGORITHM=INPLACE, LOCK=NONE`。`LOCK=NONE` 的意义是：MySQL 若无法在不阻塞写入的前提下建这个索引，会**直接报错**而不是悄悄锁表。生产上这是更安全的默认；确实需要接受锁表时，改生成的 SQL 即可。
+- 加索引天然可逆，`down` 是真正的 `DROP INDEX`，不像删索引/删表那样标记为 `Irreversible`。
+- `--unique` 建唯一索引；表中已有重复值时 `up` 会失败，这是预期行为，先清理数据再执行。
+- 写错形态会直接报错而不是生成错东西：`add_unique_index_*` 提示改用 `--unique`；给加列迁移传 `--unique`、给加索引迁移传 `--type` 都会报错。
+
+#### 7.5 改列类型：`modify`
+
+```bash
+myapp make migration modify_email_of_users_table --type 'VARCHAR(255)' --not-null --comment '邮箱'
+```
+
+up 由参数完整生成，down 是同形的 `MODIFY COLUMN` 骨架，把**变更前**的列定义留成 `TODO`：
+
+```go
+	up := func(db *gorm.DB) error {
+		return db.Exec("ALTER TABLE `users` MODIFY COLUMN `email` VARCHAR(255) NOT NULL COMMENT '邮箱', ALGORITHM=INPLACE, LOCK=NONE").Error
+	}
+
+	down := func(db *gorm.DB) error {
+		// TODO: 填入本迁移执行前 `email` 的完整定义（MODIFY COLUMN 整体替换定义，
+		// 必须写全类型、约束与注释）；确实无法还原时改用 migration.Irreversible 标记为不可逆。
+		return db.Exec("ALTER TABLE `users` MODIFY COLUMN `email` /* TODO: 变更前的列定义 */, ALGORITHM=INPLACE, LOCK=NONE").Error
+	}
+```
+
+down 之所以不自动生成：`MODIFY COLUMN` 是**整体替换**列定义，工具不知道变更前那一版长什么样。留成骨架加 `TODO` 意味着 `migrate lint` 会拦住未补全的迁移，等于强制你在合并前写清楚怎么退回去,这恰恰是改列最该被强制的一步。
+
+改列的 SQL **不预填在线 DDL 策略**，这是实测后的决定。MySQL 8.0 上只有少数改列能走 `ALGORITHM=INPLACE`：
+
+| 变更 | `ALGORITHM=INPLACE` |
+|------|---------------------|
+| `VARCHAR(128)` → `VARCHAR(255)` | 可用 |
+| `VARCHAR(128)` → `VARCHAR(32)` | 报错 1846，要求 `COPY` |
+| `VARCHAR(128)` → `TEXT` | 报错 1846，要求 `COPY` |
+| `INT` → `BIGINT` | 报错 1846，要求 `COPY` |
+
+预填 `INPLACE` 会让多数改列迁移直接执行失败，所以生成器把策略留给你：确认后在语句末尾补上 `, ALGORITHM=INPLACE, LOCK=NONE`，或对大表改走 gh-ost / pt-online-schema-change。补全前 `migrate lint` 会以 `missing_online_ddl` 提醒。
+
+#### 7.6 删除类变更与它们的可逆性
+
+| 需求 | 命令 | down |
+|------|------|------|
+| 删列 | `drop_column_avatar_from_users_table --type 'VARCHAR(255)' ...` | 给出原列定义则重建该列，否则不可逆 |
+| 删索引 | `drop_index_email_from_users_table --columns email [--unique]` | 给出原索引列则重建该索引，否则不可逆 |
+| 删表 | `drop_users_table` | 始终不可逆，需人工写重建逻辑 |
+| 其他变更 | `update_users_table` | up/down 各一段 raw `ALTER TABLE` 骨架，`TODO` 待补全 |
+
+要点：
+
+- 删列的 down 重建的是**列结构，被删除的数据不会回来**，生成的文件里也写明了这一点。需要保住数据请先备份或改用 expand-contract。
+- 删索引不承载数据，给出原索引定义后 down 是完全还原的。索引默认名与 `add_index` 一致，一来一回对得上。
+- 删除类迁移不给定义时标记为 `Irreversible`：回滚触及它时会整体拒绝并停在它之前，不会回滚一半。
+- 删列与删索引的参数就是创建时那一套（`--type` 系列 / `--columns` 与 `--unique`），照抄即可。
+
+#### 7.7 发布到生产
 
 1. 合并前跑 `myapp migrate lint --strict`，确认新迁移的时间戳前缀大于主干已有的最大值。
 2. 对目标库做可恢复备份，在预发库按同一份代码执行 `myapp migrate up`。
@@ -787,7 +899,7 @@ func init() {
 
 如果服务确实要在启动期调用 `Up`，加 `WithAllowUnknownApplied()`：应用回滚到旧版本时，旧 binary 对账本里"新版本写入、自己未注册"的记录记 Warn 后继续，不会启动失败。`mark-applied` 与所有回滚命令不受该选项影响。
 
-#### 7.6 回滚与排障
+#### 7.8 回滚与排障
 
 ```bash
 # 回滚最后一批（同一次 up 执行的所有迁移）
@@ -808,13 +920,13 @@ myapp migrate mark-applied --to 2026_09_20_120000_create_users_table --force
 - `up` 日志的 `migrated ... duration=` 字段是大表 DDL 耗时的第一手数据，`WithTimeout` 按它来定。
 - 程序化调用时用 `errors.Is` 区分 `migration.ErrLockNotAcquired`（另一实例在迁移，可重试）、`ErrRegistryDrift`（账本与 binary 不一致，需人工介入）、`ErrNoMigrations`（漏 import 迁移包）、`ErrDuplicateRegistration`（两个包注册了同名迁移）。
 
-#### 7.7 多实例与多项目
+#### 7.9 多实例与多项目
 
 - MySQL 默认锁名 `migrate:<数据库名>:<账本表名>`：同一实例上不同数据库、不同账本表的迁移互不阻塞。只有多个项目共用同一批表、需要串行化 DDL 时，才显式给它们配相同的 `WithLockName`。
 - 多项目共库时各配独立的 `WithMigrationsTable`，账本与漂移校验互不干扰。细节见下文「多项目共用数据库」。
 - 显式锁名在 MySQL 上不得超过 64 字符，超长时所有迁移命令直接报错。
 
-#### 7.8 CI 建议
+#### 7.10 CI 建议
 
 最常见的 CI 检查顺序：
 

@@ -553,7 +553,7 @@ func TestMakeMigrationAddWithColumnDefinition(t *testing.T) {
 	executeMakeCommand(t, "migration", "add_age_to_users_table", "--type", "INT")
 	migrations, _ = filepath.Glob(filepath.Join(tmpDir, "database/migrations/*_add_age_to_users_table.go"))
 	content = readFile(t, migrations[0])
-	if !strings.Contains(content, "ADD COLUMN `age` INT\"") || strings.Contains(content, "NOT NULL") {
+	if !strings.Contains(content, "ADD COLUMN `age` INT, ALGORITHM=INPLACE, LOCK=NONE") || strings.Contains(content, "NOT NULL") {
 		t.Fatalf("--type alone should emit the bare type, got:\n%s", content)
 	}
 }
@@ -690,5 +690,392 @@ func TestSnapshotRenderingHelpers(t *testing.T) {
 	}
 	if _, err := renderSnapshot(reflect.TypeOf(struct{ secret string }{})); err == nil {
 		t.Fatalf("struct without exported fields must error")
+	}
+}
+
+// TestMakeMigrationAddIndex 验证加索引迁移的生成内容：默认索引名、在线 DDL 策略、
+// HasIndex 幂等守卫、可逆的 down（不是 Irreversible）、无 TODO.
+func TestMakeMigrationAddIndex(t *testing.T) {
+	resetMakeTestState(t)
+	tmpDir := t.TempDir()
+	chdirForTest(t, tmpDir)
+
+	executeMakeCommand(t, "migration", "add_index_email_to_users_table")
+
+	migrations, err := filepath.Glob(filepath.Join(tmpDir, "database/migrations/*_add_index_email_to_users_table.go"))
+	if err != nil || len(migrations) != 1 {
+		t.Fatalf("expected exactly one generated migration, got %v (%v)", migrations, err)
+	}
+	assertGoFileParses(t, migrations[0])
+	content := readFile(t, migrations[0])
+
+	for _, want := range []string{
+		"ALTER TABLE `users` ADD INDEX `idx_users_email` (`email`), ALGORITHM=INPLACE, LOCK=NONE",
+		"ALTER TABLE `users` DROP INDEX `idx_users_email`, ALGORITHM=INPLACE, LOCK=NONE",
+		`HasIndex("users", "idx_users_email")`,
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("generated index migration missing %q:\n%s", want, content)
+		}
+	}
+	// 加索引天然可逆，且列定义无需补全.
+	for _, unwanted := range []string{"TODO", "Irreversible", "ADD COLUMN"} {
+		if strings.Contains(content, unwanted) {
+			t.Fatalf("index migration must not contain %q:\n%s", unwanted, content)
+		}
+	}
+}
+
+// TestMakeMigrationAddIndexOptions 验证 --unique / --columns / --index-name 的组合效果.
+func TestMakeMigrationAddIndexOptions(t *testing.T) {
+	cases := []struct {
+		name string
+		arg  string
+		glob string
+		args []string
+		want string
+	}{
+		{
+			name: "unique composite",
+			arg:  "add_index_email_status_to_users_table",
+			glob: "*_add_index_email_status_to_users_table.go",
+			args: []string{"--unique", "--columns", "email, status"},
+			want: "ADD UNIQUE INDEX `idx_users_email_status` (`email`, `status`)",
+		},
+		{
+			name: "custom name",
+			arg:  "add_index_email_to_users_table",
+			glob: "*_add_index_email_to_users_table.go",
+			args: []string{"--index-name", "uk_users_email"},
+			want: "ADD INDEX `uk_users_email` (`email`)",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetMakeTestState(t)
+			tmpDir := t.TempDir()
+			chdirForTest(t, tmpDir)
+
+			executeMakeCommand(t, append([]string{"migration", tc.arg}, tc.args...)...)
+
+			migrations, err := filepath.Glob(filepath.Join(tmpDir, "database/migrations", tc.glob))
+			if err != nil || len(migrations) != 1 {
+				t.Fatalf("expected exactly one generated migration, got %v (%v)", migrations, err)
+			}
+			assertGoFileParses(t, migrations[0])
+			if content := readFile(t, migrations[0]); !strings.Contains(content, tc.want) {
+				t.Fatalf("expected %q, got:\n%s", tc.want, content)
+			}
+		})
+	}
+}
+
+// TestMakeMigrationAddIndexRejectsInvalidInput 验证生成期的 fail-closed：
+// add_unique_index_* 报错指引、超长索引名报错、空 --columns 报错，且都不落盘.
+func TestMakeMigrationAddIndexRejectsInvalidInput(t *testing.T) {
+	cases := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{
+			name:    "unique_index prefix",
+			args:    []string{"migration", "add_unique_index_email_to_users_table"},
+			wantErr: "--unique",
+		},
+		{
+			name:    "empty column",
+			args:    []string{"migration", "add_index__to_users_table"},
+			wantErr: "could not parse column name",
+		},
+		{
+			name:    "index name too long",
+			args:    []string{"migration", "add_index_email_to_users_table", "--index-name", strings.Repeat("x", maxIdentifierLen+1)},
+			wantErr: "--index-name",
+		},
+		{
+			name:    "blank columns list",
+			args:    []string{"migration", "add_index_email_to_users_table", "--columns", " , "},
+			wantErr: "--columns",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetMakeTestState(t)
+			tmpDir := t.TempDir()
+			chdirForTest(t, tmpDir)
+
+			CmdMake.SetArgs(tc.args)
+			err := CmdMake.Execute()
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+			}
+			if files, _ := filepath.Glob(filepath.Join(tmpDir, "database/migrations/*_add_*.go")); len(files) != 0 {
+				t.Fatalf("rejected input must not write files, got %v", files)
+			}
+		})
+	}
+}
+
+// TestMakeMigrationAddFlagsAreScoped 验证 flag 与迁移形态不匹配时报错，不被静默忽略.
+func TestMakeMigrationAddFlagsAreScoped(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"index flag on column migration", []string{"migration", "add_email_to_users_table", "--type", "VARCHAR(32)", "--unique"}},
+		{"index-name on column migration", []string{"migration", "add_email_to_users_table", "--index-name", "idx_x"}},
+		{"columns on column migration", []string{"migration", "add_email_to_users_table", "--columns", "email"}},
+		{"type on index migration", []string{"migration", "add_index_email_to_users_table", "--type", "VARCHAR(32)"}},
+		{"after on index migration", []string{"migration", "add_index_email_to_users_table", "--after", "id"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetMakeTestState(t)
+			tmpDir := t.TempDir()
+			chdirForTest(t, tmpDir)
+
+			CmdMake.SetArgs(tc.args)
+			err := CmdMake.Execute()
+			if err == nil || !strings.Contains(err.Error(), "does not apply to") {
+				t.Fatalf("expected a flag-scope error, got %v", err)
+			}
+			if files, _ := filepath.Glob(filepath.Join(tmpDir, "database/migrations/*_add_*.go")); len(files) != 0 {
+				t.Fatalf("rejected input must not write files, got %v", files)
+			}
+		})
+	}
+}
+
+// TestParseMigrationNameAddVariants 验证 add 形态的解析分流：索引、列与被拒绝的写法.
+func TestParseMigrationNameAddVariants(t *testing.T) {
+	cases := []struct {
+		arg     string
+		object  string
+		table   string
+		column  string
+		wantErr bool
+	}{
+		{arg: "add_index_email_to_users_table", object: "index", table: "users", column: "email"},
+		{arg: "add_index_email_status_to_users_table", object: "index", table: "users", column: "email_status"},
+		{arg: "add_email_to_users_table", object: "column", table: "users", column: "email"},
+		// 列名恰好以 index_ 开头的旧写法改判为索引：属修正，CHANGELOG 已标注.
+		{arg: "add_indexed_at_to_users_table", object: "column", table: "users", column: "indexed_at"},
+		{arg: "add_unique_index_email_to_users_table", wantErr: true},
+		{arg: "add_index__to_users_table", wantErr: true},
+		{arg: "add_email_users_table", wantErr: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.arg, func(t *testing.T) {
+			action, object, table, column, err := parseMigrationName(tc.arg, "")
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected an error for %s, got action=%s object=%s table=%s column=%s", tc.arg, action, object, table, column)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if action != "add" || object != tc.object || table != tc.table || column != tc.column {
+				t.Fatalf("parsed (%s, %s, %s, %s), want (add, %s, %s, %s)", action, object, table, column, tc.object, tc.table, tc.column)
+			}
+		})
+	}
+}
+
+// generateMigration 生成一条迁移并返回其内容，供多个用例复用.
+func generateMigration(t *testing.T, glob string, args ...string) string {
+	t.Helper()
+	resetMakeTestState(t)
+	tmpDir := t.TempDir()
+	chdirForTest(t, tmpDir)
+
+	executeMakeCommand(t, append([]string{"migration"}, args...)...)
+
+	files, err := filepath.Glob(filepath.Join(tmpDir, "database/migrations", glob))
+	if err != nil || len(files) != 1 {
+		t.Fatalf("expected exactly one generated migration for %v, got %v (%v)", args, files, err)
+	}
+	assertGoFileParses(t, files[0])
+	return readFile(t, files[0])
+}
+
+// TestMakeMigrationDropColumnReversible 验证删列在给出列定义时生成真实 down，
+// 并写明数据不恢复；未给定义时仍为 Irreversible.
+func TestMakeMigrationDropColumnReversible(t *testing.T) {
+	content := generateMigration(t, "*_drop_column_email_from_users_table.go",
+		"drop_column_email_from_users_table", "--type", "VARCHAR(128)", "--not-null", "--default", "''")
+
+	for _, want := range []string{
+		"ALTER TABLE `users` DROP COLUMN `email`, ALGORITHM=INPLACE, LOCK=NONE",
+		"ALTER TABLE `users` ADD COLUMN `email` VARCHAR(128) NOT NULL DEFAULT '', ALGORITHM=INPLACE, LOCK=NONE",
+		"重建的只是列结构",
+		`HasColumn("users", "email")`,
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("reversible drop_column missing %q:\n%s", want, content)
+		}
+	}
+	if strings.Contains(content, "Irreversible") {
+		t.Fatalf("drop_column with --type must not be marked irreversible:\n%s", content)
+	}
+
+	// 不给列定义时保持不可逆.
+	content = generateMigration(t, "*_drop_column_email_from_users_table.go", "drop_column_email_from_users_table")
+	if !strings.Contains(content, "Irreversible") {
+		t.Fatalf("drop_column without --type should stay irreversible:\n%s", content)
+	}
+}
+
+// TestMakeMigrationDropIndexReversible 验证删索引的默认索引名与加索引一致、不再留 TODO，
+// 且给出 --columns 时生成真实的重建 down.
+func TestMakeMigrationDropIndexReversible(t *testing.T) {
+	content := generateMigration(t, "*_drop_index_email_from_users_table.go", "drop_index_email_from_users_table")
+	// 默认名与 add_index 对齐，且不再需要人工确认.
+	if !strings.Contains(content, "ALTER TABLE `users` DROP INDEX `idx_users_email`, ALGORITHM=INPLACE, LOCK=NONE") {
+		t.Fatalf("drop_index should default to the same name as add_index:\n%s", content)
+	}
+	if strings.Contains(content, "TODO") {
+		t.Fatalf("drop_index must not leave a TODO placeholder:\n%s", content)
+	}
+	if !strings.Contains(content, "Irreversible") {
+		t.Fatalf("drop_index without --columns should stay irreversible:\n%s", content)
+	}
+
+	content = generateMigration(t, "*_drop_index_email_status_from_users_table.go",
+		"drop_index_email_status_from_users_table", "--columns", "email,status", "--unique")
+	for _, want := range []string{
+		"DROP INDEX `idx_users_email_status`, ALGORITHM=INPLACE, LOCK=NONE",
+		"ADD UNIQUE INDEX `idx_users_email_status` (`email`, `status`), ALGORITHM=INPLACE, LOCK=NONE",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("reversible drop_index missing %q:\n%s", want, content)
+		}
+	}
+	if strings.Contains(content, "Irreversible") {
+		t.Fatalf("drop_index with --columns must not be marked irreversible:\n%s", content)
+	}
+
+	// --index-name 覆盖默认名.
+	content = generateMigration(t, "*_drop_index_email_from_users_table.go",
+		"drop_index_email_from_users_table", "--index-name", "uk_users_email")
+	if !strings.Contains(content, "DROP INDEX `uk_users_email`") {
+		t.Fatalf("--index-name should override the default:\n%s", content)
+	}
+}
+
+// TestMakeMigrationModifyColumn 验证改列迁移：up 由参数完整生成，down 是同形骨架带 TODO.
+func TestMakeMigrationModifyColumn(t *testing.T) {
+	content := generateMigration(t, "*_modify_email_of_users_table.go",
+		"modify_email_of_users_table", "--type", "VARCHAR(255)", "--not-null", "--comment", "邮箱")
+
+	if !strings.Contains(content, "ALTER TABLE `users` MODIFY COLUMN `email` VARCHAR(255) NOT NULL COMMENT '邮箱'\"") {
+		t.Fatalf("modify up should be fully generated:\n%s", content)
+	}
+	// 改列不预填在线 DDL 策略：MODIFY COLUMN 改类型时 INPLACE 多数不被支持，
+	// 预填会让生成的 SQL 直接报错。策略只在模板注释里说明，不进 SQL。
+	for line := range strings.SplitSeq(content, "\n") {
+		if strings.Contains(line, "db.Exec(") && strings.Contains(line, "ALGORITHM=") {
+			t.Fatalf("modify must not pre-fill an online DDL algorithm in SQL:\n%s", line)
+		}
+	}
+	// down 保留成型骨架与 TODO：lint 会拦住未补全的迁移，强制先想清楚怎么退.
+	if !strings.Contains(content, "MODIFY COLUMN `email` /* TODO: 变更前的列定义 */") {
+		t.Fatalf("modify down should keep a shaped TODO skeleton:\n%s", content)
+	}
+	if strings.Contains(content, "AFTER") || strings.Contains(content, "ADD COLUMN") {
+		t.Fatalf("modify must not emit ADD COLUMN or AFTER:\n%s", content)
+	}
+}
+
+// TestMakeMigrationRejectsInvalidIdentifiers 验证表名/列名/索引名的白名单校验，报错且不落盘.
+func TestMakeMigrationRejectsInvalidIdentifiers(t *testing.T) {
+	cases := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{"space in column", []string{"migration", "add_ev il_to_users_table"}, "column name"},
+		{"semicolon in table", []string{"migration", "create_users; DROP TABLE x_table"}, "table name"},
+		{"backtick in table", []string{"migration", "add_index_email_to_user`s_table"}, "table name"},
+		{"digit-leading column", []string{"migration", "add_1st_to_users_table"}, "column name"},
+		{"overlong index name", []string{"migration", "add_index_email_to_users_table", "--index-name", strings.Repeat("x", maxIdentifierLen+1)}, "--index-name"},
+		{"invalid --columns entry", []string{"migration", "add_index_email_to_users_table", "--columns", "email,st atus"}, "column name"},
+		{"invalid --after", []string{"migration", "add_email_to_users_table", "--type", "INT", "--after", "id;x"}, "column name"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetMakeTestState(t)
+			tmpDir := t.TempDir()
+			chdirForTest(t, tmpDir)
+
+			CmdMake.SetArgs(tc.args)
+			err := CmdMake.Execute()
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected an error containing %q, got %v", tc.wantErr, err)
+			}
+			if entries, _ := os.ReadDir(tmpDir); len(entries) != 0 {
+				t.Fatalf("rejected input must not write anything, got %d entries", len(entries))
+			}
+		})
+	}
+}
+
+// TestParseMigrationNameAmbiguousSeparator 验证分隔符出现多次时 fail-closed：
+// 列名可能自带分隔符（reply_to_id），表名同样可能（order_to_shipment），
+// 任何一种猜法都会在另一种场景静默切错，因此直接报错并要求用 --table 消歧.
+func TestParseMigrationNameAmbiguousSeparator(t *testing.T) {
+	ambiguous := []string{
+		"add_reply_to_id_to_messages_table",
+		"add_ref_to_order_to_shipment_table",
+		"modify_number_of_items_of_orders_table",
+		"drop_column_copied_from_id_from_orders_table",
+		"add_index_reply_to_id_to_messages_table",
+	}
+	for _, arg := range ambiguous {
+		t.Run(arg, func(t *testing.T) {
+			_, _, _, _, err := parseMigrationName(arg, "")
+			if err == nil || !strings.Contains(err.Error(), "--table") {
+				t.Fatalf("ambiguous name should fail closed and point at --table, got %v", err)
+			}
+		})
+	}
+
+	// --table 给出后按后缀剥离，两种读法都能正确表达.
+	cases := []struct {
+		arg    string
+		table  string
+		action string
+		object string
+		column string
+	}{
+		{"add_reply_to_id_to_messages_table", "messages", "add", "column", "reply_to_id"},
+		{"add_ref_to_order_to_shipment_table", "order_to_shipment", "add", "column", "ref"},
+		{"modify_number_of_items_of_orders_table", "orders", "modify", "column", "number_of_items"},
+		{"drop_column_copied_from_id_from_orders_table", "orders", "drop", "column", "copied_from_id"},
+		{"add_index_reply_to_id_to_messages_table", "messages", "add", "index", "reply_to_id"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.arg+"/--table="+tc.table, func(t *testing.T) {
+			action, object, table, column, err := parseMigrationName(tc.arg, tc.table)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if action != tc.action || object != tc.object || table != tc.table || column != tc.column {
+				t.Fatalf("parsed (%s, %s, %s, %s), want (%s, %s, %s, %s)",
+					action, object, table, column, tc.action, tc.object, tc.table, tc.column)
+			}
+		})
+	}
+
+	// --table 与迁移名对不上时报错，不静默采用.
+	if _, _, _, _, err := parseMigrationName("add_email_to_users_table", "orders"); err == nil {
+		t.Fatalf("mismatched --table should fail")
 	}
 }

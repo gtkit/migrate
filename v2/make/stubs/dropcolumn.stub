@@ -12,12 +12,11 @@ func init() {
 		if !db.Migrator().HasColumn("{{TableName}}", "{{ColumnName}}") {
 			return nil
 		}
-		return db.Exec("ALTER TABLE `{{TableName}}` DROP COLUMN `{{ColumnName}}`").Error
+		return db.Exec({{DropColumnSQL}}).Error
 	}
 
 	down := func(db *gorm.DB) error {
-		return migration.Irreversible("fill in the column recreation for {{FileName}} manually")
-	}
+{{DownBody}}	}
 
 	migration.Add("{{FileName}}", up, down)
 }

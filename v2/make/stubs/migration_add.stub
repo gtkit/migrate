@@ -19,7 +19,7 @@ func init() {
 		if !db.Migrator().HasColumn("{{TableName}}", "{{ColumnName}}") {
 			return nil
 		}
-		return db.Exec("ALTER TABLE `{{TableName}}` DROP COLUMN `{{ColumnName}}`").Error
+		return db.Exec({{DropColumnSQL}}).Error
 	}
 
 	migration.Add("{{FileName}}", up, down)
