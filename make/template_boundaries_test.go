@@ -60,6 +60,18 @@ func TestMakeScaffoldKeepsEditedFilesAndFormatsNewOnes(t *testing.T) {
 	SetProjectName("")
 	runMakeModel(CmdMakeModel, []string{"audit_events"})
 	runMakeCMD(CmdMakeCMD, []string{"rebuild_cache"})
+	if err := runMakeMigration(CmdMakeMigration, []string{"create_users_table"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{"internal/repository", "internal/repository/audit_event", "internal/repository/user", "database/migrations", "cmd"} {
+		info, err := os.Stat(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm()&0o022 != 0 {
+			t.Errorf("scaffold directory %s is writable by group or others: %v", dir, info.Mode())
+		}
+	}
 	for path, want := range map[string]string{
 		"internal/models/model.go":                            "type BaseID struct",
 		"internal/models/audit_event.go":                      "type AuditEvent struct",
@@ -86,5 +98,39 @@ func TestMakeScaffoldKeepsEditedFilesAndFormatsNewOnes(t *testing.T) {
 	got, err := os.ReadFile(model)
 	if err != nil || !bytes.Equal(got, edited) {
 		t.Fatalf("scaffolding overwrote an existing model: %v\n%s", err, got)
+	}
+}
+
+func TestMakeScaffoldStopsWhenRepositoryPathIsBlocked(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(*testing.T)
+	}{
+		{"model", func(t *testing.T) {
+			t.Helper()
+			runMakeModel(CmdMakeModel, []string{"users"})
+		}},
+		{"create migration", func(t *testing.T) {
+			t.Helper()
+			if err := runMakeMigration(CmdMakeMigration, []string{"create_users_table"}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			if err := os.Mkdir("internal", 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile("internal/repository", []byte("blocked"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			tc.run(t)
+			for _, path := range []string{"internal/models", "database"} {
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					t.Errorf("repository preflight failure left %s: %v", path, err)
+				}
+			}
+		})
 	}
 }

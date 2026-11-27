@@ -3,7 +3,6 @@ package make
 import (
 	"errors"
 	"fmt"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -140,7 +139,7 @@ func runMakeMigration(cmd *cobra.Command, args []string) error {
 	// create 操作同时生成 model 和 repository 文件
 	if action == "create" && !fromModel {
 		repositoryDir := fmt.Sprintf("internal/repository/%s/", model.PackageName)
-		if err := os.MkdirAll(repositoryDir, os.ModePerm); err != nil {
+		if err := makeScaffoldDir(repositoryDir); err != nil {
 			console.Error("Failed to create repository directory: " + err.Error())
 			return nil
 		}

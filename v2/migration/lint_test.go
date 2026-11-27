@@ -17,6 +17,20 @@ func newMySQLLintMigrator(dir string, db *gorm.DB, registry *Registry) *Migrator
 	return m
 }
 
+func TestMigratorLintRejectsLinkedMigration(t *testing.T) {
+	t.Parallel()
+	dir, outside := t.TempDir(), t.TempDir()
+	const migration = "2026_03_24_120000_create_users_table"
+	writeMigrationFile(t, outside, migration, "package migrations\n")
+	if err := os.Symlink(filepath.Join(outside, migration+".go"), filepath.Join(dir, migration+".go")); err != nil {
+		t.Fatal(err)
+	}
+	m := NewMigrator(dir, nil, WithRegistry(NewRegistry()))
+	if _, err := m.Lint(t.Context(), LintOptions{SkipDatabase: true}); err == nil || !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("lint accepted a symlink: %v", err)
+	}
+}
+
 func TestMigratorLintDetectsDiskRegistryAndDBDrift(t *testing.T) {
 	db := openExecTestDB(t, t.Name())
 

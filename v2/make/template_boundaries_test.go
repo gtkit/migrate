@@ -32,9 +32,17 @@ func TestTemplateRenderingErrorsLeaveNoFile(t *testing.T) {
 
 func TestGeneratedFileWriteModesPreserveExistingContent(t *testing.T) {
 	t.Parallel()
-	path := filepath.Join(t.TempDir(), "migration.sql")
+	dir := filepath.Join(t.TempDir(), "ddl")
+	path := filepath.Join(dir, "migration.sql")
 	if err := writeGeneratedFile(path, []byte("user changes"), writeFailIfExists); err != nil {
 		t.Fatal(err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		t.Errorf("scaffold directory is writable by group or others: %v", info.Mode())
 	}
 	assertContent := func(want string) {
 		t.Helper()

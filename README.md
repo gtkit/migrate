@@ -17,6 +17,7 @@
 - 结构化日志接口，可注入 zap / zerolog / slog 等
 - Lock name 可配置，同一数据库多项目共存不冲突
 - `make migration` 自动生成迁移文件和 model 脚手架
+  新建脚手架目录的权限最多为 `0755`，实际权限还受本机 umask 限制。
 - 所有操作返回 `error`，不在库内调用 `os.Exit`
 
 ## 安装

@@ -3,6 +3,7 @@ package make
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -58,12 +59,16 @@ func runMakeDDL(cmd *cobra.Command, args []string) error {
 	}
 
 	for _, target := range targets {
+		name, err := ddlSnapshotName(target.TableName)
+		if err != nil {
+			return err
+		}
 		sql, err := GenerateCreateTableDDL(cfg.DB, target.Value)
 		if err != nil {
 			return fmt.Errorf("generate ddl for %s: %w", target.StructName, err)
 		}
 
-		filePath := ddlFilePath(cfg, target.TableName)
+		filePath := filepath.Join(cfg.DDLDir, name)
 		if err := writeGeneratedFile(filePath, []byte(sql), mode); err != nil {
 			return err
 		}

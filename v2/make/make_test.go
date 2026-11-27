@@ -636,6 +636,21 @@ func TestMakeModelResolvesProjectNameFromGoMod(t *testing.T) {
 	}
 }
 
+func TestProjectNameIgnoresLinkedGoMod(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	target := filepath.Join(t.TempDir(), "go.mod")
+	if err := os.WriteFile(target, []byte("module example.com/external\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, "go.mod")); err != nil {
+		t.Fatal(err)
+	}
+	if name, _ := resolveProjectName(Config{}); name == "example.com/external" {
+		t.Fatalf("auto-discovery used a symlink: %q", name)
+	}
+}
+
 // TestMakeModelFailsWithoutProjectNameOrGoMod 验证既未配置项目名又找不到 go.mod 时 fail-closed 且不落盘.
 func TestMakeModelFailsWithoutProjectNameOrGoMod(t *testing.T) {
 	resetMakeTestState(t)

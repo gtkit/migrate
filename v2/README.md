@@ -368,6 +368,8 @@ myapp make --ddl-dir db/ddl ddl --all
 
 `make model`、`make migration`、`make ddl`、`make ddl diff` 都支持这些目录 flag，命令级 flag 优先级高于 `migrate.Setup(...)` 中的默认配置。
 
+脚手架新建目录的权限最多为 `0755`，实际权限还受本机 umask 限制。`migrate lint` 要求匹配命名规则的迁移文件是普通文件。
+
 ### 4. 执行迁移
 
 ```bash
@@ -504,6 +506,8 @@ database/ddl/create_users_table.sql
 5. 在 CI 中执行 `make ddl diff --all`
 
 `make ddl diff` 会比较当前 strict DDL 和 `database/ddl/` 中已有文件。若存在漂移，会输出文本 diff 并返回非零退出码，适合接入 CI。
+
+DDL 快照须为配置目录中的普通文件。模型表名用于生成快照文件名，不能包含路径分隔符。
 
 示例：
 
@@ -685,7 +689,7 @@ func main() {
 }
 ```
 
-`WithProjectName` 可以省略：生成命令会从执行目录向上查找 `go.mod` 读取 module path 作为 import 前缀。项目根目录没有 `go.mod` 又没配 `WithProjectName` 时，`make model` 与 `make migration create_*` 直接报错，不会写出带错误 import 的文件。
+`WithProjectName` 可以省略，生成命令会从执行目录向上查找普通的 `go.mod` 文件，并读取 module path 作为 import 前缀。找不到可用文件且未配置项目名时，生成命令会在写文件前报错。使用符号链接管理 `go.mod` 的项目可以显式设置 `WithProjectName`。
 
 #### 7.2 新建一张表：`create --from-model`
 

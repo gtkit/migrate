@@ -116,29 +116,40 @@ const (
 )
 
 func writeGeneratedFile(filePath string, data []byte, mode fileWriteMode) error {
-	// 三态判断：存在 / 不存在 / 未知错误——权限等未知错误显式上报，不静默当作已存在.
-	switch _, err := os.Stat(filePath); {
-	case err == nil:
-		switch mode {
-		case writeSkipIfExists:
-			return nil
-		case writeFailIfExists:
-			return fmt.Errorf("%s already exists", filePath)
-		case writeOverwrite:
-			// continue
-		default:
-			return errors.New("unsupported file write mode")
-		}
-	case errors.Is(err, fs.ErrNotExist):
-		// 不存在，继续创建
-	default:
-		return fmt.Errorf("stat %s: %w", filePath, err)
-	}
-
-	if err := file.CreateDirIfNotExists(filepath.Dir(filePath)); err != nil {
+	dir := filepath.Dir(filePath)
+	if err := file.CreateDirIfNotExists(dir, 0o755); err != nil {
 		return fmt.Errorf("create directory for %s: %w", filePath, err)
 	}
-	if err := file.Put(data, filePath); err != nil {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return fmt.Errorf("open directory for %s: %w", filePath, err)
+	}
+	defer func() { _ = root.Close() }()
+
+	name := filepath.Base(filePath)
+	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL
+	if mode == writeOverwrite {
+		info, err := root.Lstat(name)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("stat %s: %w", filePath, err)
+		}
+		if info != nil && !info.Mode().IsRegular() {
+			return fmt.Errorf("write %s: expected a regular file", filePath)
+		}
+		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	}
+	out, err := root.OpenFile(name, flags, 0o644)
+	if errors.Is(err, fs.ErrExist) {
+		if mode == writeSkipIfExists {
+			return nil
+		}
+		return fmt.Errorf("write %s: already exists: %w", filePath, err)
+	}
+	if err != nil {
+		return fmt.Errorf("write %s: %w", filePath, err)
+	}
+	_, writeErr := out.Write(data)
+	if err := errors.Join(writeErr, out.Close()); err != nil {
 		return fmt.Errorf("write %s: %w", filePath, err)
 	}
 	console.Success(fmt.Sprintf("[%s] created.", filePath))

@@ -4,9 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 
+	"github.com/gtkit/migrate/v2/internal/regularfile"
 	"github.com/spf13/cobra"
 )
 
@@ -75,15 +77,30 @@ func runMakeDDLDiff(cmd *cobra.Command, args []string) error {
 }
 
 func diffDDLTargets(cfg Config, targets []ddlTarget) ([]ddlDiff, error) {
+	root, err := os.OpenRoot(cfg.DDLDir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("open DDL dir %s: %w", cfg.DDLDir, err)
+	}
+	if root != nil {
+		defer func() { _ = root.Close() }()
+	}
 	diffs := make([]ddlDiff, 0, len(targets))
 	for _, target := range targets {
+		name, err := ddlSnapshotName(target.TableName)
+		if err != nil {
+			return nil, err
+		}
 		expected, err := GenerateCreateTableDDL(cfg.DB, target.Value)
 		if err != nil {
 			return nil, fmt.Errorf("generate ddl for %s: %w", target.StructName, err)
 		}
 
-		filePath := ddlFilePath(cfg, target.TableName)
-		current, err := os.ReadFile(filePath)
+		filePath := filepath.Join(cfg.DDLDir, name)
+		var current []byte
+		err = os.ErrNotExist
+		if root != nil {
+			current, err = regularfile.Read(root, name)
+		}
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				diffs = append(diffs, ddlDiff{

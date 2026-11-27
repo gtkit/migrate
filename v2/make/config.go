@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/gtkit/migrate/v2/internal/regularfile"
 	"github.com/spf13/cobra"
 	"gorm.io/gorm"
 )
@@ -143,7 +144,13 @@ func resolveProjectName(cfg Config) (string, error) {
 
 // readModulePath 读取 go.mod 的 module 指令；文件不存在或无 module 行返回 false.
 func readModulePath(goModPath string) (string, bool) {
-	data, err := os.ReadFile(goModPath)
+	root, err := os.OpenRoot(filepath.Dir(goModPath))
+	if err != nil {
+		return "", false
+	}
+	defer func() { _ = root.Close() }()
+
+	data, err := regularfile.Read(root, filepath.Base(goModPath))
 	if err != nil {
 		return "", false
 	}
@@ -196,6 +203,10 @@ func migrationFilePath(cfg Config, fileName string) string {
 	return filepath.Join(cfg.MigrationDir, fileName+".go")
 }
 
-func ddlFilePath(cfg Config, tableName string) string {
-	return filepath.Join(cfg.DDLDir, fmt.Sprintf("create_%s_table.sql", tableName))
+func ddlSnapshotName(tableName string) (string, error) {
+	name := fmt.Sprintf("create_%s_table.sql", tableName)
+	if strings.ContainsAny(tableName, "/\\\x00") || !filepath.IsLocal(name) {
+		return "", fmt.Errorf("invalid DDL snapshot filename for table %q", tableName)
+	}
+	return name, nil
 }

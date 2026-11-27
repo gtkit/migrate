@@ -84,6 +84,10 @@ func makeModelFromString(project, action, name, column string) Model {
 	return model
 }
 
+func makeScaffoldDir(dir string) error {
+	return os.MkdirAll(dir, 0o755)
+}
+
 // createFileFromStub 读取 stub 文件并进行变量替换.
 // 最后一个选项可选，如若传参，应传 map[string]string 类型作为附加的变量替换.
 func createFileFromStub(filePath, stubName string, model Model, variables ...any) {
@@ -128,7 +132,7 @@ func createFileFromStub(filePath, stubName string, model Model, variables ...any
 		console.Exit(fmt.Sprintf("format generated %s: %v", filePath, err))
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
+	if err := makeScaffoldDir(filepath.Dir(filePath)); err != nil {
 		console.Exit(fmt.Sprintf("create directory for %s: %v", filePath, err))
 		return
 	}

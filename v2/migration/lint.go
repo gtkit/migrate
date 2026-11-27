@@ -8,12 +8,15 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/gtkit/migrate/v2/internal/regularfile"
 )
 
 var (
@@ -228,7 +231,13 @@ func (m *Migrator) lintDatabase(ctx context.Context, diskMap map[string]diskMigr
 }
 
 func (m *Migrator) readDiskMigrationFiles() ([]diskMigrationFile, error) {
-	entries, err := os.ReadDir(m.folder)
+	root, err := os.OpenRoot(m.folder)
+	if err != nil {
+		return nil, fmt.Errorf("open migration dir %s: %w", m.folder, err)
+	}
+	defer func() { _ = root.Close() }()
+
+	entries, err := fs.ReadDir(root.FS(), ".")
 	if err != nil {
 		return nil, fmt.Errorf("read migration dir %s: %w", m.folder, err)
 	}
@@ -248,7 +257,7 @@ func (m *Migrator) readDiskMigrationFiles() ([]diskMigrationFile, error) {
 		}
 
 		path := filepath.Join(m.folder, entry.Name())
-		content, err := os.ReadFile(path)
+		content, err := regularfile.Read(root, entry.Name())
 		if err != nil {
 			return nil, fmt.Errorf("read migration file %s: %w", path, err)
 		}

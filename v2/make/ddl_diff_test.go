@@ -86,6 +86,56 @@ func TestRenderDDLTextDiff(t *testing.T) {
 	}
 }
 
+func TestMakeDDLRejectsLinkedSnapshot(t *testing.T) {
+	resetMakeTestState(t)
+	dir := t.TempDir()
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	SetConfig(Config{DB: db, DDLModels: []any{&ddlUser{}}, DDLDir: dir})
+
+	snapshot := "external snapshot fixture"
+	target := filepath.Join(t.TempDir(), "external.sql")
+	if err := os.WriteFile(target, []byte(snapshot), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, "create_users_table.sql")); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, args := range [][]string{{"ddl", "diff", "users"}, {"ddl", "users", "--force"}} {
+		if err := executeMakeCommandWithError(args...); err == nil || !strings.Contains(err.Error(), "regular file") {
+			t.Fatalf("%v accepted a symlink: %v", args, err)
+		}
+	}
+	if got := readFile(t, target); got != snapshot {
+		t.Fatalf("linked snapshot was modified: %q", got)
+	}
+}
+
+type ddlPathLikeTable struct{ ID uint }
+
+func (ddlPathLikeTable) TableName() string { return "subdir/../../outside" }
+
+func TestMakeDDLRejectsPathLikeTableNames(t *testing.T) {
+	resetMakeTestState(t)
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "ddl")
+	SetConfig(Config{DB: db, DDLModels: []any{&ddlPathLikeTable{}}, DDLDir: dir})
+	for _, args := range [][]string{{"ddl", "diff", "--all"}, {"ddl", "--all"}} {
+		if err := executeMakeCommandWithError(args...); err == nil || !strings.Contains(err.Error(), "DDL snapshot filename") {
+			t.Fatalf("%v accepted table name with path separators: %v", args, err)
+		}
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("invalid table name created a DDL directory: %v", err)
+	}
+}
+
 func executeMakeCommandWithError(args ...string) error {
 	CmdMake.SilenceErrors = true
 	CmdMake.SilenceUsage = true
