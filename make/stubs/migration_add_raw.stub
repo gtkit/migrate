@@ -1,29 +1,33 @@
 package migrations
 
 import (
-	"gorm.io/gorm"
+	"errors"
 
 	"github.com/gtkit/migrate/migration"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 func init() {
+	table := clause.Table{Name: "{{TableName}}"}
+	column := clause.Column{Name: "{{ColumnName}}"}
+	after := clause.Column{Name: "{{AfterColumnName}}"}
+
 	up := func(db *gorm.DB) error {
-		// 幂等：列已存在则跳过，重复执行无副作用。
-		if db.Migrator().HasColumn("{{TableName}}", "{{ColumnName}}") {
-			return nil
+		// 填写完整列定义，例如 VARCHAR(64) NOT NULL DEFAULT ''。
+		const definition = ""
+		if definition == "" {
+			return errors.New("fill in the column definition for {{TableName}}.{{ColumnName}}")
 		}
-		// TODO: 补全列定义（类型/约束/注释），例如：
-		//   VARCHAR(64) NOT NULL DEFAULT '' COMMENT '说明'
-		return db.Exec(
-			"ALTER TABLE `{{TableName}}` ADD COLUMN `{{ColumnName}}` /* TODO: 列定义 */ AFTER `{{AfterColumnName}}`",
-		).Error
+		exists, err := migration.MySQLColumnMatches(db, table.Name, column.Name, definition, after.Name)
+		if err != nil || exists {
+			return err
+		}
+		return db.Exec("ALTER TABLE ? ADD COLUMN ? ? AFTER ?", table, column, gorm.Expr(definition), after).Error
 	}
 
 	down := func(db *gorm.DB) error {
-		if !db.Migrator().HasColumn("{{TableName}}", "{{ColumnName}}") {
-			return nil
-		}
-		return db.Exec("ALTER TABLE `{{TableName}}` DROP COLUMN `{{ColumnName}}`").Error
+		return db.Exec("ALTER TABLE ? DROP COLUMN ?", table, column).Error
 	}
 
 	migration.Add("{{FileName}}", up, down)

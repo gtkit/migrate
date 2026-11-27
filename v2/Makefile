@@ -5,8 +5,7 @@ LINT_TARGETS ?= ./...
 BUMP ?= patch
 # VULNCHECK=off 显式跳过漏洞扫描（仅限 vuln.go.dev 不可达的环境，默认强制）.
 VULNCHECK ?= on
-# INTEGRATION=off 显式跳过真实数据库集成测试（默认强制：需设置
-# MIGRATE_TEST_MYSQL_DSN 与 MIGRATE_TEST_POSTGRES_DSN 指向可丢弃的测试库）.
+# INTEGRATION=off 显式跳过 MySQL 实库集成测试（默认要求 MIGRATE_TEST_MYSQL_DSN 指向可丢弃的测试库）.
 INTEGRATION ?= on
 # 发版覆盖率门槛（百分比，统计口径含集成测试）.
 COVER_MIN ?= 80
@@ -50,17 +49,20 @@ tag: ## Bump version (BUMP=patch|minor) and push tag
 	echo "▶️ go vet"; go vet ./...; \
 	echo "▶️ golangci-lint"; golangci-lint run ./...; \
 	echo "▶️ go mod tidy -diff"; go mod tidy -diff; \
+	unset MIGRATE_TEST_POSTGRES_DSN; \
 	if [ "$(INTEGRATION)" = "off" ]; then \
-		echo "⚠️ INTEGRATION=off：已跳过真实数据库集成测试"; testtags=""; \
-	elif [ -z "$$MIGRATE_TEST_MYSQL_DSN" ] || [ -z "$$MIGRATE_TEST_POSTGRES_DSN" ]; then \
-		echo "✗ 缺少 MIGRATE_TEST_MYSQL_DSN / MIGRATE_TEST_POSTGRES_DSN（真实数据库集成测试是发版门禁；或显式 INTEGRATION=off 跳过）"; exit 1; \
+		echo "⚠️ INTEGRATION=off：已跳过 MySQL 实库集成测试"; testflags=""; \
+	elif [ -z "$$MIGRATE_TEST_MYSQL_DSN" ]; then \
+		echo "✗ 缺少 MIGRATE_TEST_MYSQL_DSN（MySQL 实库测试是发版门禁；或显式 INTEGRATION=off 跳过）"; exit 1; \
 	else \
-		testtags="-tags=integration"; \
+		export MIGRATE_TEST_REQUIRE_DATABASES=1; testflags="-tags=integration -skip=^TestMigratorPostgres"; \
 	fi; \
-	echo "▶️ 测试 (race$${testtags:+ + integration})"; go test $$testtags -race -count=1 -timeout=10m ./...; \
-	echo "▶️ 覆盖率 (>= $(COVER_MIN)%)"; go test $$testtags -count=1 -coverprofile=coverage.out ./...; \
-	pct=$$(go tool cover -func=coverage.out | awk '/^total:/{gsub(/%/,"",$$NF); print $$NF}'); \
-	rm -f coverage.out; \
+	migration_cover_report=$$(mktemp "$${TMPDIR:-/tmp}/migrate-v2-cover.XXXXXX"); \
+	trap 'rm -f "$$migration_cover_report"' 0; \
+	trap 'exit 1' HUP INT TERM; \
+	echo "▶️ 测试 (race$${testflags:+ + MySQL integration})"; go test $$testflags -race -count=1 -timeout=10m ./...; \
+	echo "▶️ 覆盖率 (>= $(COVER_MIN)%)"; go test $$testflags -count=1 -coverprofile="$$migration_cover_report" ./...; \
+	pct=$$(go tool cover -func="$$migration_cover_report" | awk '/^total:/{gsub(/%/,"",$$NF); print $$NF}'); \
 	echo "覆盖率: $$pct%"; \
 	if ! awk -v p="$$pct" -v m="$(COVER_MIN)" 'BEGIN{exit !(p+0 >= m+0)}'; then \
 		echo "✗ 覆盖率 $$pct% 低于门槛 $(COVER_MIN)%"; exit 1; \

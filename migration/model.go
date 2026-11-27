@@ -1,6 +1,10 @@
 package migration
 
-import "time"
+import (
+	"time"
+
+	"github.com/gtkit/migrate/internal/ledger"
+)
 
 // Migration 对应数据库 migrations 表中的一条记录.
 type Migration struct {
@@ -12,5 +16,5 @@ type Migration struct {
 
 // TableName 指定表名.
 func (Migration) TableName() string {
-	return "migrations"
+	return ledger.DefaultTableName
 }

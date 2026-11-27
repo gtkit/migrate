@@ -1,23 +1,15 @@
 package migrations
 
 import (
-	"{{ProjectName}}/internal/models"
-	"gorm.io/gorm"
-
 	"github.com/gtkit/migrate/migration"
+	"gorm.io/gorm"
 )
 
 func init() {
 	up := func(db *gorm.DB) error {
-		if !db.Migrator().HasTable(&models.{{StructName}}{}) {
-			return nil
-		}
-		return db.Migrator().DropTable(&models.{{StructName}}{})
+		return db.Migrator().DropTable("{{TableName}}")
 	}
 
-	down := func(db *gorm.DB) error {
-		return db.Migrator().CreateTable(&models.{{StructName}}{})
-	}
-
-	migration.Add("{{FileName}}", up, down)
+	// 删除表会丢弃原数据。反向操作需要明确的结构和数据恢复方案。
+	migration.Add("{{FileName}}", up, nil)
 }

@@ -103,8 +103,7 @@ func deleteMySQLTables(db *gorm.DB) error {
 
 	// 关闭外键检查、删表、恢复必须在同一连接上完成：foreign_key_checks 是会话级变量，
 	// 若经连接池分发，关闭态可能落不到删表连接，或残留污染被业务复用的池内连接.
-	// 使用专属 *sql.Conn（与迁移锁同款模式）：恢复失败时标坏连接物理关闭结束会话，
-	// 绝不把 foreign_key_checks=0 的连接归还连接池.
+	// 使用专属 *sql.Conn 保存原值，恢复失败时物理关闭连接，避免把状态未知的会话归还连接池.
 	sqlDB, err := db.DB()
 	if err != nil {
 		return fmt.Errorf("get sql db: %w", err)
@@ -119,7 +118,11 @@ func deleteMySQLTables(db *gorm.DB) error {
 	}
 	defer func() { _ = conn.Close() }()
 
-	if _, err := conn.ExecContext(ctx, "SET foreign_key_checks = 0"); err != nil {
+	var original bool
+	if err := conn.QueryRowContext(ctx, "SELECT @@SESSION.foreign_key_checks").Scan(&original); err != nil {
+		return fmt.Errorf("read foreign key checks: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, "SET SESSION foreign_key_checks = 0"); err != nil {
 		// 网络错误/上下文取消时服务端可能已执行成功——会话状态未知的连接
 		// 不得归还连接池，标坏后 Close 物理关闭（与锁获取失败路径同一原则）.
 		markBadConn(conn)
@@ -134,15 +137,15 @@ func deleteMySQLTables(db *gorm.DB) error {
 		}
 	}
 
-	// 无论删表成功与否都恢复外键检查.恢复使用独立超时上下文：业务 ctx 已取消时仍要
+	// 无论删表成功与否都恢复外键检查原值.恢复使用独立超时上下文：业务 ctx 已取消时仍要
 	// 尝试把会话复位.恢复失败则标坏连接（Close 物理关闭），并且仅在没有更早错误时上报，
 	// 避免掩盖删表错误.
 	restoreCtx, cancel := context.WithTimeout(context.Background(), lockReleaseTimeout)
 	defer cancel()
-	if _, err := conn.ExecContext(restoreCtx, "SET foreign_key_checks = 1"); err != nil {
+	if _, err := conn.ExecContext(restoreCtx, "SET SESSION foreign_key_checks = ?", original); err != nil {
 		markBadConn(conn)
 		if dropErr == nil {
-			return fmt.Errorf("enable foreign key checks: %w", err)
+			return fmt.Errorf("restore foreign key checks: %w", err)
 		}
 	}
 	return dropErr
@@ -154,35 +157,59 @@ func quotePostgresIdent(name string) string {
 }
 
 func deletePostgresTables(db *gorm.DB) error {
-	// 查询与 DROP 都显式限定 public：不依赖 search_path，
-	// 其他 schema 的同名对象绝不受影响.
-	var views []string
-	if err := db.Raw(`SELECT viewname FROM pg_views WHERE schemaname = 'public'`).
-		Scan(&views).Error; err != nil {
-		return fmt.Errorf("list postgres views: %w", err)
-	}
-	// 先删视图：残留视图会使重放中的 CREATE VIEW 冲突（独立视图不被表的 CASCADE 覆盖）.
-	for _, view := range views {
-		if err := db.Exec(`DROP VIEW IF EXISTS "public".` + quotePostgresIdent(view) + " CASCADE").Error; err != nil {
-			return fmt.Errorf("drop view %s: %w", view, err)
+	return db.Transaction(func(tx *gorm.DB) error {
+		var views, tables []string
+		if err := tx.Raw(`SELECT viewname FROM pg_catalog.pg_views WHERE schemaname = 'public' ORDER BY viewname`).
+			Scan(&views).Error; err != nil {
+			return fmt.Errorf("list postgres views: %w", err)
 		}
-	}
-
-	var tables []string
-	err := db.Raw(`SELECT tablename FROM pg_tables WHERE schemaname = 'public'`).
-		Scan(&tables).Error
-	if err != nil {
-		return fmt.Errorf("list postgres tables: %w", err)
-	}
-
-	// CASCADE 删除所有表及其依赖
-	for _, table := range tables {
-		if err := db.Exec(`DROP TABLE IF EXISTS "public".` + quotePostgresIdent(table) + " CASCADE").Error; err != nil {
-			return fmt.Errorf("drop table %s: %w", table, err)
+		if err := tx.Raw(`SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'public' ORDER BY tablename`).
+			Scan(&tables).Error; err != nil {
+			return fmt.Errorf("list postgres tables: %w", err)
 		}
-	}
 
-	return nil
+		for i, table := range tables {
+			tables[i] = `"public".` + quotePostgresIdent(table)
+		}
+		if len(tables) != 0 {
+			// 锁定清理目标，阻止并发 attach、detach 或其他 DDL 改变依赖。
+			if err := tx.Exec("LOCK TABLE ONLY " + strings.Join(tables, ", ONLY ") + " IN ACCESS EXCLUSIVE MODE").Error; err != nil {
+				return fmt.Errorf("lock postgres cleanup targets: %w", err)
+			}
+			var outsidePublic bool
+			if err := tx.Raw(`
+				SELECT EXISTS (
+					SELECT 1 FROM pg_catalog.pg_inherits i
+					JOIN pg_catalog.pg_class parent ON parent.oid = i.inhparent
+					JOIN pg_catalog.pg_namespace parent_schema ON parent_schema.oid = parent.relnamespace
+					JOIN pg_catalog.pg_class child ON child.oid = i.inhrelid
+					JOIN pg_catalog.pg_namespace child_schema ON child_schema.oid = child.relnamespace
+					WHERE (parent_schema.nspname = 'public' AND parent.relkind IN ('r', 'p') AND child_schema.nspname <> 'public')
+					   OR (child_schema.nspname = 'public' AND child.relkind IN ('r', 'p') AND parent_schema.nspname <> 'public')
+				)
+			`).Scan(&outsidePublic).Error; err != nil {
+				return fmt.Errorf("check postgres cleanup dependencies: %w", err)
+			}
+			if outsidePublic {
+				return fmt.Errorf("postgres cleanup refused: inheritance or partition relationship crosses the public schema")
+			}
+		}
+
+		if len(views) != 0 {
+			for i, view := range views {
+				views[i] = `"public".` + quotePostgresIdent(view)
+			}
+			if err := tx.Exec("DROP VIEW " + strings.Join(views, ", ") + " RESTRICT").Error; err != nil {
+				return fmt.Errorf("drop postgres public views: %w", err)
+			}
+		}
+		if len(tables) != 0 {
+			if err := tx.Exec("DROP TABLE " + strings.Join(tables, ", ") + " RESTRICT").Error; err != nil {
+				return fmt.Errorf("drop postgres public tables: %w", err)
+			}
+		}
+		return nil
+	})
 }
 
 func deleteSQLiteTables(db *gorm.DB) error {

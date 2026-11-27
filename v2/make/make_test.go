@@ -1,12 +1,17 @@
 package make
 
 import (
+	"context"
 	"errors"
+	"go/ast"
 	"go/format"
+	"go/importer"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -136,10 +141,8 @@ func TestMakeMigrationSupportsCustomDirectories(t *testing.T) {
 	if !strings.Contains(migrationContent, "CreateTable(") {
 		t.Fatalf("create migration should call CreateTable on the snapshot struct, got:\n%s", migrationContent)
 	}
-	// 幂等守卫必须在 CreateTable 之前：MySQL DDL 已提交但记录未写时重跑 up 才能自愈.
-	guard := strings.Index(migrationContent, `HasTable("users")`)
-	if guard < 0 || guard > strings.Index(migrationContent, "CreateTable(") {
-		t.Fatalf("create migration should check HasTable before CreateTable, got:\n%s", migrationContent)
+	if strings.Contains(migrationContent, "HasTable(") {
+		t.Fatalf("create migration must let the database reject a same-name table:\n%s", migrationContent)
 	}
 }
 
@@ -163,7 +166,7 @@ func TestMakeMigrationDropColumnMarksIrreversibleDown(t *testing.T) {
 	}
 
 	content := readFile(t, migrations[0])
-	if !strings.Contains(content, `migration.Irreversible("fill in the column recreation`) {
+	if !strings.Contains(content, "migration.AddIrreversible(") {
 		t.Fatalf("drop column migration should require manual down logic, got:\n%s", content)
 	}
 }
@@ -337,14 +340,26 @@ func TestMakeMigrationTemplatesAreSelfContained(t *testing.T) {
 
 func resetMakeTestState(t *testing.T) {
 	t.Helper()
+	previous := CurrentConfig()
+	out, errOut := CmdMake.OutOrStdout(), CmdMake.ErrOrStderr()
+	silenceErrors, silenceUsage := CmdMake.SilenceErrors, CmdMake.SilenceUsage
+	t.Cleanup(func() {
+		SetConfig(previous)
+		resetCommandTree(CmdMake)
+		CmdMake.SetOut(out)
+		CmdMake.SetErr(errOut)
+		CmdMake.SilenceErrors = silenceErrors
+		CmdMake.SilenceUsage = silenceUsage
+	})
 	SetConfig(defaultConfig())
 	resetCommandTree(CmdMake)
+	CmdMake.SetOut(io.Discard)
+	CmdMake.SetErr(io.Discard)
 }
 
 func resetCommandTree(cmd *cobra.Command) {
 	cmd.SetArgs(nil)
-	cmd.SetOut(io.Discard)
-	cmd.SetErr(io.Discard)
+	cmd.SetContext(context.Background())
 	resetFlagSet(cmd.Flags())
 	resetFlagSet(cmd.PersistentFlags())
 	for _, child := range cmd.Commands() {
@@ -437,22 +452,33 @@ func TestSetProjectNameOverridesConfig(t *testing.T) {
 	}
 }
 
-type snapshotTestBase struct {
+type SnapshotTestBase struct {
 	ID int64 `gorm:"column:id;primaryKey;autoIncrement"`
+}
+
+type SnapshotTestContact struct {
+	Phone string `gorm:"column:phone;type:varchar(32);default:'unset'"`
+}
+
+type snapshotPrivateEmbed struct {
+	IgnoredPrivateEmbed string
 }
 
 type snapshotTestStatus int8
 
 type snapshotTestUser struct {
-	snapshotTestBase
-	Name      string             `gorm:"column:name;size:64;not null"`
-	Nick      *string            `gorm:"column:nick;size:32"`
-	Status    snapshotTestStatus `gorm:"column:status;default:0"`
-	Payload   []byte             `gorm:"column:payload;type:json"`
-	secret    string             //nolint:unused // 故意保留：验证快照生成跳过未导出字段
-	Ignored   string             `gorm:"-"`
-	CreatedAt time.Time          `gorm:"column:created_at;type:datetime;index"`
-	DeletedAt gorm.DeletedAt     `gorm:"column:deleted_at;index"`
+	SnapshotTestBase
+	SnapshotTestContact `json:"contact" gorm:"embeddedPrefix:contact_"`
+	snapshotPrivateEmbed
+	Backup    *SnapshotTestContact `gorm:"embedded;embeddedPrefix:backup_"`
+	Name      string               `gorm:"column:name;size:64;not null"`
+	Nick      *string              `gorm:"column:nick;size:32"`
+	Status    int8                 `gorm:"column:status;default:0"`
+	Payload   []byte               `gorm:"column:payload;type:json"`
+	secret    string               //nolint:unused // 故意保留：验证快照生成跳过未导出字段
+	Ignored   string               `gorm:"-"`
+	CreatedAt time.Time            `gorm:"column:created_at;type:datetime;index"`
+	DeletedAt gorm.DeletedAt       `gorm:"column:deleted_at;index"`
 }
 
 func (snapshotTestUser) TableName() string { return "snapshot_users" }
@@ -460,6 +486,10 @@ func (snapshotTestUser) TableName() string { return "snapshot_users" }
 // TestMakeMigrationCreateFromModel 验证 --from-model：字段来自注册 model（嵌入展平、跳过未导出与 gorm:"-"、
 // []byte 渲染、tag 原样、无 TODO）、不生成脚手架、产物经 gofmt；表名不匹配时报错且不落盘.
 func TestMakeMigrationCreateFromModel(t *testing.T) {
+	moduleDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
 	resetMakeTestState(t)
 	tmpDir := t.TempDir()
 	chdirForTest(t, tmpDir)
@@ -471,7 +501,7 @@ func TestMakeMigrationCreateFromModel(t *testing.T) {
 	if err != nil || len(migrations) != 1 {
 		t.Fatalf("expected exactly one generated migration, got %v (%v)", migrations, err)
 	}
-	assertGoFileParses(t, migrations[0])
+	checkGeneratedMigrationTypes(t, moduleDir, migrations[0])
 	content := readFile(t, migrations[0])
 
 	formatted, err := format.Source([]byte(content))
@@ -481,20 +511,23 @@ func TestMakeMigrationCreateFromModel(t *testing.T) {
 	// 字段行用正则匹配：gofmt 的列对齐宽度取决于最长字段名与类型名，不在此固化空格数.
 	for _, want := range []string{
 		`ID\s+int64\s+` + "`gorm:\"column:id;primaryKey;autoIncrement\"`",
+		`SnapshotTestContact\s+struct\s*\{`,
+		`Backup\s+\*struct\s*\{`,
+		`json:"contact" gorm:"embedded;embeddedPrefix:contact_"`,
+		`gorm:"embedded;embeddedPrefix:backup_"`,
+		`gorm:"column:phone;type:varchar\(32\);default:'unset'"`,
 		`Nick\s+\*string\s+` + "`gorm:\"column:nick;size:32\"`",
-		`Status\s+make\.snapshotTestStatus\s+` + "`gorm:\"column:status;default:0\"`",
+		`Status\s+int8\s+` + "`gorm:\"column:status;default:0\"`",
 		`Payload\s+\[\]byte\s+` + "`gorm:\"column:payload;type:json\"`",
 		`DeletedAt\s+gorm\.DeletedAt\s+` + "`gorm:\"column:deleted_at;index\"`",
 		`return "snapshot_users"`,
 		"\n\t\"time\"\n",
-		"\n\t\"github.com/gtkit/migrate/v2/make\"\n",
-		`HasTable\("snapshot_users"\)`,
 	} {
 		if !regexp.MustCompile(want).MatchString(content) {
 			t.Errorf("generated snapshot missing %q:\n%s", want, content)
 		}
 	}
-	for _, unwanted := range []string{"secret", "Ignored", "TODO", "snapshotTestBase"} {
+	for _, unwanted := range []string{"secret", "Ignored", "TODO", "SnapshotTestBase", "HasTable("} {
 		if strings.Contains(content, unwanted) {
 			t.Errorf("generated snapshot must not contain %q:\n%s", unwanted, content)
 		}
@@ -679,14 +712,15 @@ func TestSnapshotRenderingHelpers(t *testing.T) {
 
 	// 匿名嵌入实现 driver.Valuer 的 struct 视为单列不展平.
 	src, err := renderSnapshot(reflect.TypeOf(struct {
-		gorm.DeletedAt
+		*gorm.DeletedAt
+		time.Time
 		Name string
 	}{}))
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
-	if !strings.Contains(src.fields, "DeletedAt gorm.DeletedAt") {
-		t.Fatalf("Valuer embed must stay a single column, got:\n%s", src.fields)
+	if !strings.Contains(src.fields, "DeletedAt *gorm.DeletedAt") || !strings.Contains(src.fields, "Time time.Time") {
+		t.Fatalf("Valuer and time embeds must keep their field types, got:\n%s", src.fields)
 	}
 	if _, err := renderSnapshot(reflect.TypeOf(struct{ secret string }{})); err == nil {
 		t.Fatalf("struct without exported fields must error")
@@ -694,7 +728,7 @@ func TestSnapshotRenderingHelpers(t *testing.T) {
 }
 
 // TestMakeMigrationAddIndex 验证加索引迁移的生成内容：默认索引名、在线 DDL 策略、
-// HasIndex 幂等守卫、可逆的 down（不是 Irreversible）、无 TODO.
+// 索引定义校验、可逆的 down（不是 Irreversible）、无 TODO.
 func TestMakeMigrationAddIndex(t *testing.T) {
 	resetMakeTestState(t)
 	tmpDir := t.TempDir()
@@ -712,7 +746,7 @@ func TestMakeMigrationAddIndex(t *testing.T) {
 	for _, want := range []string{
 		"ALTER TABLE `users` ADD INDEX `idx_users_email` (`email`), ALGORITHM=INPLACE, LOCK=NONE",
 		"ALTER TABLE `users` DROP INDEX `idx_users_email`, ALGORITHM=INPLACE, LOCK=NONE",
-		`HasIndex("users", "idx_users_email")`,
+		`migration.MySQLIndexMatches(db, "users", "idx_users_email", false, "email")`,
 	} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("generated index migration missing %q:\n%s", want, content)
@@ -871,18 +905,19 @@ func TestParseMigrationNameAddVariants(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.arg, func(t *testing.T) {
-			action, object, table, column, err := parseMigrationName(tc.arg, "")
+			parsed, err := parseMigrationName(tc.arg, "")
 			if tc.wantErr {
 				if err == nil {
-					t.Fatalf("expected an error for %s, got action=%s object=%s table=%s column=%s", tc.arg, action, object, table, column)
+					t.Fatalf("expected an error for %s, got %+v", tc.arg, parsed)
 				}
 				return
 			}
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if action != "add" || object != tc.object || table != tc.table || column != tc.column {
-				t.Fatalf("parsed (%s, %s, %s, %s), want (add, %s, %s, %s)", action, object, table, column, tc.object, tc.table, tc.column)
+			want := migrationName{action: "add", objectName: tc.object, tableName: tc.table, columnName: tc.column}
+			if parsed != want {
+				t.Fatalf("parsed %+v, want %+v", parsed, want)
 			}
 		})
 	}
@@ -929,6 +964,27 @@ func TestMakeMigrationDropColumnReversible(t *testing.T) {
 	content = generateMigration(t, "*_drop_column_email_from_users_table.go", "drop_column_email_from_users_table")
 	if !strings.Contains(content, "Irreversible") {
 		t.Fatalf("drop_column without --type should stay irreversible:\n%s", content)
+	}
+}
+
+func TestMakeMigrationRenameUsesPhysicalTableNames(t *testing.T) {
+	const name = "rename_audit_logs_to_event_log_table"
+	content := generateMigration(t, "*_"+name+".go", name)
+	for _, want := range []string{
+		`return db.Migrator().RenameTable("audit_logs", "event_log")`,
+		`return db.Migrator().RenameTable("event_log", "audit_logs")`,
+		`"github.com/gtkit/migrate/v2/migration"`,
+		`_rename_audit_logs_to_event_log_table", up, down)`,
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("rename migration missing %q:\n%s", want, content)
+		}
+	}
+	if strings.Contains(content, "{{") || strings.Contains(content, "TODO") {
+		t.Errorf("rename migration has unresolved placeholders:\n%s", content)
+	}
+	if _, err := os.Stat("internal"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rename should only generate migration files: %v", err)
 	}
 }
 
@@ -1007,6 +1063,14 @@ func TestMakeMigrationRejectsInvalidIdentifiers(t *testing.T) {
 		{"overlong index name", []string{"migration", "add_index_email_to_users_table", "--index-name", strings.Repeat("x", maxIdentifierLen+1)}, "--index-name"},
 		{"invalid --columns entry", []string{"migration", "add_index_email_to_users_table", "--columns", "email,st atus"}, "column name"},
 		{"invalid --after", []string{"migration", "add_email_to_users_table", "--type", "INT", "--after", "id;x"}, "column name"},
+		{"rename without delimiter", []string{"migration", "rename_users_table"}, "_to_"},
+		{"rename with overlapping delimiters", []string{"migration", "rename_users_to_to_accounts_table"}, "_to_"},
+		{"rename with ambiguous names", []string{"migration", "rename_users_to_accounts_to_members_table"}, "_to_"},
+		{"rename with empty source", []string{"migration", "rename__to_accounts_table"}, "table name"},
+		{"rename with empty destination", []string{"migration", "rename_users_to__table"}, "table name"},
+		{"rename with invalid destination", []string{"migration", "rename_users_to_account-s_table"}, "new table name"},
+		{"rename with long destination", []string{"migration", "rename_users_to_" + strings.Repeat("a", maxIdentifierLen+1) + "_table"}, "identifier limit"},
+		{"rename to same name", []string{"migration", "rename_users_to_users_table"}, "different"},
 	}
 
 	for _, tc := range cases {
@@ -1040,7 +1104,7 @@ func TestParseMigrationNameAmbiguousSeparator(t *testing.T) {
 	}
 	for _, arg := range ambiguous {
 		t.Run(arg, func(t *testing.T) {
-			_, _, _, _, err := parseMigrationName(arg, "")
+			_, err := parseMigrationName(arg, "")
 			if err == nil || !strings.Contains(err.Error(), "--table") {
 				t.Fatalf("ambiguous name should fail closed and point at --table, got %v", err)
 			}
@@ -1063,19 +1127,91 @@ func TestParseMigrationNameAmbiguousSeparator(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.arg+"/--table="+tc.table, func(t *testing.T) {
-			action, object, table, column, err := parseMigrationName(tc.arg, tc.table)
+			parsed, err := parseMigrationName(tc.arg, tc.table)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if action != tc.action || object != tc.object || table != tc.table || column != tc.column {
-				t.Fatalf("parsed (%s, %s, %s, %s), want (%s, %s, %s, %s)",
-					action, object, table, column, tc.action, tc.object, tc.table, tc.column)
+			want := migrationName{action: tc.action, objectName: tc.object, tableName: tc.table, columnName: tc.column}
+			if parsed != want {
+				t.Fatalf("parsed %+v, want %+v", parsed, want)
 			}
 		})
 	}
 
 	// --table 与迁移名对不上时报错，不静默采用.
-	if _, _, _, _, err := parseMigrationName("add_email_to_users_table", "orders"); err == nil {
+	if _, err := parseMigrationName("add_email_to_users_table", "orders"); err == nil {
 		t.Fatalf("mismatched --table should fail")
+	}
+}
+
+func TestMigrationPreservesSingularPhysicalTable(t *testing.T) {
+	content := generateMigration(t, "*_drop_column_email_from_audit_log_table.go",
+		"drop_column_email_from_audit_log_table", "--type", "VARCHAR(128)")
+	for _, want := range []string{`HasColumn("audit_log", "email")`, "ALTER TABLE `audit_log` DROP COLUMN", "ALTER TABLE `audit_log` ADD COLUMN"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("generated migration missing %q:\n%s", want, content)
+		}
+	}
+	if strings.Contains(content, "audit_logs") {
+		t.Errorf("migration targeted pluralized table:\n%s", content)
+	}
+}
+
+func checkGeneratedMigrationTypes(t *testing.T, moduleDir, source string) {
+	t.Helper()
+	cmd := exec.CommandContext(t.Context(), "go", "list", "-export", "-deps", "-f",
+		"{{if .Export}}{{.ImportPath}} {{.Export}}{{end}}", "github.com/gtkit/migrate/v2/migration")
+	cmd.Dir = moduleDir
+	cmd.Env = append(cmd.Environ(), "GOWORK=off")
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("load compiled imports: %v", err)
+	}
+	exports := make(map[string]string)
+	for line := range strings.SplitSeq(string(output), "\n") {
+		if name, path, ok := strings.Cut(line, " "); ok {
+			exports[name] = path
+		}
+	}
+	files := token.NewFileSet()
+	file, err := parser.ParseFile(files, source, nil, parser.AllErrors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := types.Config{Importer: importer.ForCompiler(files, "gc", func(path string) (io.ReadCloser, error) {
+		return os.Open(exports[path])
+	})}
+	if _, err := config.Check("migrations", files, []*ast.File{file}, nil); err != nil {
+		t.Fatalf("generated migration does not type-check: %v", err)
+	}
+}
+
+func TestSnapshotRejectsInaccessibleTypeBeforeWriting(t *testing.T) {
+	type privateFieldModel struct {
+		Status *snapshotTestStatus
+	}
+	resetMakeTestState(t)
+	t.Chdir(t.TempDir())
+	SetConfig(Config{DDLModels: []any{&privateFieldModel{}}})
+	CmdMake.SetArgs([]string{"migration", "--from-model", "create_private_field_models_table"})
+	if err := CmdMake.Execute(); err == nil || !strings.Contains(err.Error(), "field Status") || !strings.Contains(err.Error(), "snapshotTestStatus") {
+		t.Fatalf("expected inaccessible field type error, got %v", err)
+	}
+	if _, err := os.Stat("database"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("inaccessible type generated output: %v", err)
+	}
+}
+
+func TestGeneratedAddColumnUsesItsOwnDefinitionForReconciliation(t *testing.T) {
+	content := generateMigration(t, "*_add_email_to_users_table.go",
+		"add_email_to_users_table", "--type", "VARCHAR(64)", "--comment", "{{TableName}}")
+	up, _, _ := strings.Cut(content, "down := ")
+	if !strings.Contains(up, "ADD COLUMN `email` VARCHAR(64)") ||
+		!strings.Contains(up, `MySQLAddColumnMatches(db, "users", "email", statement)`) ||
+		!strings.Contains(up, "db.Exec(statement)") {
+		t.Fatalf("Up must check the same ADD COLUMN used for creation:\n%s", up)
+	}
+	if !strings.Contains(up, "COMMENT '{{TableName}}'") {
+		t.Fatalf("template rendering changed the supplied column comment:\n%s", up)
 	}
 }

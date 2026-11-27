@@ -4,8 +4,12 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 
+	"github.com/gtkit/migrate/internal/ledger"
+	"github.com/gtkit/migrate/internal/snapshot"
 	"github.com/gtkit/migrate/make"
 	"github.com/gtkit/migrate/migration"
 	"gorm.io/gorm"
@@ -38,6 +42,11 @@ type Config struct {
 	// Logger 自定义日志实现.
 	// 传入 nil 时使用默认的 stdout 日志.
 	Logger migration.Logger
+
+	// MigrationsTable 迁移记录表名（默认 "migrations"）.
+	MigrationsTable string
+
+	ddlModels *[]any // 待初始化成功后注册，保持 Config 可比较.
 }
 
 // Option 配置选项函数.
@@ -99,19 +108,46 @@ func WithLogger(l migration.Logger) Option {
 	}
 }
 
-// defaultConfig 返回默认配置.
-func defaultConfig() *Config {
-	return &Config{
-		ProjectName:  "project_name",
-		MigrationDir: "database/migrations",
-		Timeout:      5 * time.Minute,
-		LockName:     "migrate_lock",
-		LockTimeout:  10 * time.Second,
+// WithMigrationsTable 设置迁移记录表名（默认 "migrations"）.
+// 首尾空白会去除。表名须以字母或下划线开头，最多 63 个 ASCII 字母、数字或下划线。
+// 空白或非法表名会使 Setup 返回错误。
+func WithMigrationsTable(name string) Option {
+	return func(c *Config) {
+		c.MigrationsTable = strings.TrimSpace(name)
 	}
 }
 
+// WithDDLModels registers GORM models during Setup for make migration create --from-model.
+// By default Setup registers no models.
+func WithDDLModels(models ...any) Option {
+	models = slices.Clone(models)
+	return func(c *Config) {
+		if c.ddlModels == nil {
+			c.ddlModels = new([]any)
+		}
+		*c.ddlModels = append(*c.ddlModels, models...)
+	}
+}
+
+// defaultConfig 返回默认配置.
+func defaultConfig() *Config {
+	return &Config{
+		ProjectName:     "project_name",
+		MigrationDir:    "database/migrations",
+		Timeout:         5 * time.Minute,
+		LockName:        "migrate_lock",
+		LockTimeout:     10 * time.Second,
+		MigrationsTable: ledger.DefaultTableName,
+	}
+}
+
+type appState struct {
+	*Config
+	registry *migration.Registry
+}
+
 // app 全局配置实例（由 Setup 初始化）.
-var app *Config
+var app *appState
 
 // Setup 初始化迁移工具.
 // 必须在使用任何迁移命令之前调用.
@@ -126,8 +162,18 @@ func Setup(db *gorm.DB, opts ...Option) error {
 	for _, opt := range opts {
 		opt(cfg)
 	}
+	if err := ledger.ValidateTableName(cfg.MigrationsTable); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
 
-	app = cfg
+	snapshot.Reset()
+	if cfg.ddlModels != nil {
+		snapshot.Register((*cfg.ddlModels)...)
+		cfg.ddlModels = nil
+	}
+	snapshot.SetNamingStrategy(cfg.DB)
+
+	app = &appState{Config: cfg}
 
 	// 同步项目名称到 make 包（用于代码生成）
 	make.SetProjectName(cfg.ProjectName)
@@ -136,7 +182,7 @@ func Setup(db *gorm.DB, opts ...Option) error {
 }
 
 // mustApp 获取配置，未初始化时 panic（仅在 cobra.Command.Run 中使用）.
-func mustApp() *Config {
+func mustApp() *appState {
 	if app == nil {
 		panic("migrate: Setup() must be called before using migration commands")
 	}
@@ -157,6 +203,10 @@ func newMigrator() *migration.Migrator {
 	if cfg.Logger != nil {
 		opts = append(opts, migration.WithLogger(cfg.Logger))
 	}
+	if cfg.registry != nil {
+		opts = append(opts, migration.WithRegistry(cfg.registry))
+	}
+	opts = append(opts, migration.WithMigrationsTable(cfg.MigrationsTable))
 
 	return migration.NewMigrator(cfg.MigrationDir, cfg.DB, opts...)
 }

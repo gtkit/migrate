@@ -1,0 +1,26 @@
+package migrations
+
+import (
+{{SnapshotImports}}
+	"github.com/gtkit/migrate/migration"
+	"gorm.io/gorm"
+)
+
+func init() {
+	up := func(db *gorm.DB) error {
+		type snapshot struct {
+{{SnapshotFields}}
+		}
+		exists, err := migration.MySQLTableMatches(db, "{{TableName}}", &snapshot{})
+		if err != nil || exists {
+			return err
+		}
+		return db.Table("{{TableName}}").Migrator().CreateTable(&snapshot{})
+	}
+
+	down := func(db *gorm.DB) error {
+		return db.Migrator().DropTable("{{TableName}}")
+	}
+
+	migration.Add("{{FileName}}", up, down)
+}

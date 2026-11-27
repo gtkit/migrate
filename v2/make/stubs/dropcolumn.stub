@@ -15,8 +15,5 @@ func init() {
 		return db.Exec({{DropColumnSQL}}).Error
 	}
 
-	down := func(db *gorm.DB) error {
-{{DownBody}}	}
-
-	migration.Add("{{FileName}}", up, down)
+{{DownAndRegister}}
 }

@@ -6,6 +6,45 @@
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-11-27
+
+### Added
+
+- 新增 `make migration rename_<old>_to_<new>_table`，生成 MySQL 的重命名与反向回滚。
+
+### Changed
+
+- 新生成的 MySQL 建表、加列和加索引迁移会核对同名对象的定义。一致时登记为已应用，冲突或无法核实时返回错误并保留为待执行。已登记的迁移按其 `Down` 回滚，包括登记前已存在的对象。
+- 官方数据库支持范围为 MySQL。发版默认使用 `MIGRATE_TEST_MYSQL_DSN` 验证实库，可通过 `INTEGRATION=off` 显式跳过。
+
+### Fixed
+
+- `--from-model` 快照保留嵌入字段的列名前缀、GORM 标签、默认值和索引。
+- MySQL `fresh` 在成功或删表失败时均尝试恢复同一会话的 `foreign_key_checks` 原值，连接断开或恢复失败时丢弃故障连接。
+- MySQL 持锁迁移复用持锁会话执行账本和迁移事务，避免旧版迁移回调在小连接池中因无可用连接而阻塞。
+- `refresh` 和 `fresh` 在执行破坏性操作前预检可重放的迁移，使用预检通过的清单重放。
+
+## [1.1.0] - 2026-11-27
+
+### Added
+
+- 新增 `WithDDLModels` 和 `make migration create_<table>_table --from-model`，从已注册的 GORM 模型生成自包含建表快照，保留字段和标签。
+- 新增 `WithMigrationsTable`，为建表、状态查询和回滚指定迁移记录表，默认使用 `migrations`。
+- 新增 `WithLockTimeout`，限制申请 MySQL 连接和等待迁移锁的时间。
+- 新增表名重命名与加索引迁移模板。重命名可反向回滚，加索引支持唯一索引、自定义名称和复合索引。
+
+### Changed
+
+- 建表迁移固定使用生成时的物理表名与结构快照，基础模型和快照保留秒级 `DATETIME` 精度。
+- 新生成的 MySQL 建表、加列和加索引迁移会核对同名对象的定义。一致时登记为已应用，冲突或无法核实时返回错误并保留为待执行。已登记的迁移按其 `Down` 回滚，包括登记前已存在的对象。
+- 执行器为每条 `Up` 和 `Down` 记录开始、结果和耗时，支持通过 `WithLogger` 注入日志适配器。
+- 官方数据库支持范围为 MySQL。发版默认使用 `MIGRATE_TEST_MYSQL_DSN` 验证实库，可通过 `INTEGRATION=off` 显式跳过。
+
+### Fixed
+
+- MySQL `fresh` 在成功或删表失败时均尝试恢复同一会话的 `foreign_key_checks` 原值，连接断开或恢复失败时丢弃故障连接。
+- 回滚在执行前检查整批迁移的注册和 `Down` 回调。 `refresh` 和 `fresh` 在执行前预检可重放的迁移，避免清理后才发现无法重放。
+
 ## [2.4.0] - 2026-09-20
 
 ### Added

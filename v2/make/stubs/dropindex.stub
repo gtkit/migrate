@@ -8,15 +8,11 @@ import (
 
 func init() {
 	up := func(db *gorm.DB) error {
-		// 幂等：索引不存在则跳过。
-		if !db.Migrator().HasIndex("{{TableName}}", "{{IndexName}}") {
+{{IndexExists}}		if !exists {
 			return nil
 		}
 		return db.Exec({{DropIndexSQL}}).Error
 	}
 
-	down := func(db *gorm.DB) error {
-{{DownBody}}	}
-
-	migration.Add("{{FileName}}", up, down)
+{{DownAndRegister}}
 }

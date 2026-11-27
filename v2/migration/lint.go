@@ -199,13 +199,9 @@ func (m *Migrator) Lint(ctx context.Context, opts LintOptions) (LintReport, erro
 }
 
 func (m *Migrator) lintDatabase(ctx context.Context, diskMap map[string]diskMigrationFile, registryMap map[string]MigrationFile) ([]LintIssue, error) {
-	if !m.db.WithContext(ctx).Migrator().HasTable(m.tableName) {
-		return nil, nil
-	}
-
-	var records []Migration
-	if err := m.records(ctx).Find(&records).Error; err != nil {
-		return nil, fmt.Errorf("query migration records: %w", err)
+	records, err := m.readLedger(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	issues := make([]LintIssue, 0, len(records))

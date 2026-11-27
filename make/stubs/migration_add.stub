@@ -1,25 +1,32 @@
 package migrations
 
 import (
-	"{{ProjectName}}/internal/models"
-	"gorm.io/gorm"
+	"errors"
 
 	"github.com/gtkit/migrate/migration"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 func init() {
+	table := clause.Table{Name: "{{TableName}}"}
+	column := clause.Column{Name: "{{ColumnName}}"}
+
 	up := func(db *gorm.DB) error {
-		if db.Migrator().HasColumn(&models.{{StructName}}{}, "{{StructFieldName}}") {
-			return nil
+		// 填写完整列定义，例如 VARCHAR(64) NOT NULL DEFAULT ''。
+		const definition = ""
+		if definition == "" {
+			return errors.New("fill in the column definition for {{TableName}}.{{ColumnName}}")
 		}
-		return db.Migrator().AddColumn(&models.{{StructName}}{}, "{{StructFieldName}}")
+		exists, err := migration.MySQLColumnMatches(db, table.Name, column.Name, definition, "")
+		if err != nil || exists {
+			return err
+		}
+		return db.Exec("ALTER TABLE ? ADD COLUMN ? ?", table, column, gorm.Expr(definition)).Error
 	}
 
 	down := func(db *gorm.DB) error {
-		if !db.Migrator().HasColumn(&models.{{StructName}}{}, "{{ColumnName}}") {
-			return nil
-		}
-		return db.Migrator().DropColumn(&models.{{StructName}}{}, "{{ColumnName}}")
+		return db.Exec("ALTER TABLE ? DROP COLUMN ?", table, column).Error
 	}
 
 	migration.Add("{{FileName}}", up, down)

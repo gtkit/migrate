@@ -2,6 +2,7 @@ package migrate
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"os"
 	"path/filepath"
@@ -20,15 +21,25 @@ import (
 	"gorm.io/gorm"
 )
 
-// 注册一条用于 handler 端到端测试的迁移（本测试二进制的 defaultRegistry 只含它）。
-func init() {
-	migration.Add(handlerMigrationName,
+const handlerMigrationName = "2026_01_01_000000_create_widgets_table"
+
+func setupHandlerTest(t *testing.T, db *gorm.DB, dir string, opts ...Option) {
+	t.Helper()
+	previousApp, previousMake := app.Load(), makecmd.CurrentConfig()
+	t.Cleanup(func() {
+		app.Store(previousApp)
+		makecmd.SetConfig(previousMake)
+	})
+	if err := Setup(db, append([]Option{WithMigrationDir(dir), WithLogger(&migration.NopLogger{})}, opts...)...); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	registry := migration.NewRegistry()
+	registry.Add(handlerMigrationName,
 		func(db *gorm.DB) error { return db.Exec("CREATE TABLE widgets (id integer primary key)").Error },
 		func(db *gorm.DB) error { return db.Exec("DROP TABLE widgets").Error },
 	)
+	app.Store(&appState{Config: app.Load().Config, registry: registry})
 }
-
-const handlerMigrationName = "2026_01_01_000000_create_widgets_table"
 
 // TestOptionsApply 覆盖所有 WithX 选项与 defaultConfig（含空值忽略分支）。
 func TestOptionsApply(t *testing.T) {
@@ -122,9 +133,7 @@ func TestMigrateHandlersEndToEnd(t *testing.T) {
 	}
 
 	db := newHandlerTestDB(t, "migrate_handlers")
-	if err := Setup(db, WithMigrationDir(dir), WithLogger(&migration.NopLogger{})); err != nil {
-		t.Fatalf("setup: %v", err)
-	}
+	setupHandlerTest(t, db, dir)
 
 	out, err := execMigrate(t, "pending")
 	if err != nil {
@@ -183,9 +192,7 @@ func TestMigrateHandlersEndToEnd(t *testing.T) {
 		t.Fatalf("rejected fresh must not drop tables")
 	}
 
-	if err := Setup(db, WithMigrationDir(dir), WithLogger(&migration.NopLogger{}), WithAllowFresh()); err != nil {
-		t.Fatalf("re-setup with WithAllowFresh: %v", err)
-	}
+	setupHandlerTest(t, db, dir, WithAllowFresh())
 	if _, err := execMigrate(t, "fresh", "--force"); err != nil {
 		t.Fatalf("fresh --force: %v", err)
 	}
@@ -230,9 +237,10 @@ func newHandlerTestDB(t *testing.T, name string) *gorm.DB {
 // execMigrate 通过 cobra 命令树执行一条 migrate 子命令并返回输出.
 func execMigrate(t *testing.T, args ...string) (string, error) {
 	t.Helper()
-	resetFlags(CmdMigrate)
 	root := &cobra.Command{Use: "app"}
 	root.AddCommand(CmdMigrate)
+	defer root.RemoveCommand(CmdMigrate)
+	defer resetCommandState(t, CmdMigrate)
 	var buf bytes.Buffer
 	root.SetOut(&buf)
 	root.SetErr(&buf)
@@ -243,13 +251,17 @@ func execMigrate(t *testing.T, args ...string) (string, error) {
 	return buf.String(), err
 }
 
-func resetFlags(cmd *cobra.Command) {
+func resetCommandState(t *testing.T, cmd *cobra.Command) {
+	t.Helper()
+	cmd.SetContext(context.Background())
 	cmd.Flags().VisitAll(func(f *pflag.Flag) {
-		_ = f.Value.Set(f.DefValue)
+		if err := f.Value.Set(f.DefValue); err != nil {
+			t.Errorf("reset flag %s: %v", f.Name, err)
+		}
 		f.Changed = false
 	})
 	for _, c := range cmd.Commands() {
-		resetFlags(c)
+		resetCommandState(t, c)
 	}
 }
 
@@ -308,9 +320,7 @@ func TestMigrateHandlersAllowUnknownApplied(t *testing.T) {
 	}
 
 	db := newHandlerTestDB(t, "migrate_handlers_unknown_applied")
-	if err := Setup(db, WithMigrationDir(dir), WithLogger(&migration.NopLogger{})); err != nil {
-		t.Fatalf("setup: %v", err)
-	}
+	setupHandlerTest(t, db, dir)
 	if _, err := execMigrate(t, "up"); err != nil {
 		t.Fatalf("up: %v", err)
 	}
@@ -327,9 +337,7 @@ func TestMigrateHandlersAllowUnknownApplied(t *testing.T) {
 		t.Fatalf("up without WithAllowUnknownApplied should fail")
 	}
 
-	if err := Setup(db, WithMigrationDir(dir), WithLogger(&migration.NopLogger{}), WithAllowUnknownApplied()); err != nil {
-		t.Fatalf("re-setup with WithAllowUnknownApplied: %v", err)
-	}
+	setupHandlerTest(t, db, dir, WithAllowUnknownApplied())
 	out, err := execMigrate(t, "pending")
 	if err != nil {
 		t.Fatalf("pending with WithAllowUnknownApplied: %v", err)
@@ -361,9 +369,7 @@ func TestMigrateHandlersDownStepAndStatusTime(t *testing.T) {
 		t.Fatalf("write migration file: %v", err)
 	}
 	db := newHandlerTestDB(t, "migrate_handlers_down_step")
-	if err := Setup(db, WithMigrationDir(dir), WithLogger(&migration.NopLogger{})); err != nil {
-		t.Fatalf("setup: %v", err)
-	}
+	setupHandlerTest(t, db, dir)
 
 	// status/pending 只读：未 up 前不建账本表.
 	if _, err := execMigrate(t, "status"); err != nil {
@@ -415,6 +421,7 @@ func TestGeneratedMigrationsPassLint(t *testing.T) {
 		wantCodes []string // 期望的问题码集合；空表示必须零问题
 	}{
 		{name: "create", args: []string{"migration", "create_widgets_table"}, wantCodes: []string{"unfilled_placeholder"}},
+		{name: "rename table", args: []string{"migration", "rename_users_to_accounts_table"}},
 		{name: "add column", args: []string{"migration", "add_email_to_widgets_table", "--type", "VARCHAR(128)", "--not-null", "--default", "''", "--comment", "邮箱"}},
 		{name: "add index", args: []string{"migration", "add_index_email_to_widgets_table"}},
 		{name: "add unique composite index", args: []string{"migration", "add_index_email_status_to_widgets_table", "--unique", "--columns", "email,status"}},
@@ -470,23 +477,19 @@ func generateIntoTempDir(t *testing.T, args ...string) string {
 	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/lintcheck\n\ngo 1.26\n"), 0o644); err != nil {
 		t.Fatalf("write go.mod: %v", err)
 	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("getwd: %v", err)
-	}
-	if err := os.Chdir(root); err != nil {
-		t.Fatalf("chdir: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	t.Chdir(root)
 
+	previous := makecmd.CurrentConfig()
+	defer makecmd.SetConfig(previous)
 	makecmd.SetConfig(makecmd.Config{})
-	resetFlags(makecmd.CmdMake)
-	makecmd.CmdMake.SilenceErrors = true
-	makecmd.CmdMake.SilenceUsage = true
-	makecmd.CmdMake.SetOut(io.Discard)
-	makecmd.CmdMake.SetErr(io.Discard)
-	makecmd.CmdMake.SetArgs(args)
-	if err := makecmd.CmdMake.Execute(); err != nil {
+	cmd := &cobra.Command{Use: "app", SilenceErrors: true, SilenceUsage: true}
+	cmd.AddCommand(makecmd.CmdMake)
+	defer cmd.RemoveCommand(makecmd.CmdMake)
+	defer resetCommandState(t, makecmd.CmdMake)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs(append([]string{"make"}, args...))
+	if err := cmd.Execute(); err != nil {
 		t.Fatalf("make %v: %v", args, err)
 	}
 	return filepath.Join(root, "database/migrations")

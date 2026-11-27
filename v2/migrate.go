@@ -213,9 +213,14 @@ func defaultConfig() *Config {
 	}
 }
 
+type appState struct {
+	*Config
+	registry *migration.Registry
+}
+
 // app 全局配置实例（由 Setup 初始化）.
 // 原子指针：Setup 与命令执行可能不在同一 goroutine，避免数据竞争.
-var app atomic.Pointer[Config]
+var app atomic.Pointer[appState]
 
 // Setup 初始化迁移工具.
 // 必须在使用任何迁移命令之前调用.
@@ -237,7 +242,7 @@ func Setup(db *gorm.DB, opts ...Option) error {
 		return fmt.Errorf("migrate: %w", err)
 	}
 
-	app.Store(cfg)
+	app.Store(&appState{Config: cfg})
 
 	make.SetConfig(make.Config{
 		ProjectName:   cfg.ProjectName,
@@ -278,6 +283,9 @@ func commandEnv(cmd *cobra.Command) (*migration.Migrator, context.Context, conte
 	}
 	if cfg.AllowUnknownApplied {
 		opts = append(opts, migration.WithAllowUnknownApplied())
+	}
+	if cfg.registry != nil {
+		opts = append(opts, migration.WithRegistry(cfg.registry))
 	}
 
 	parent := context.Background()

@@ -1,22 +1,15 @@
 package migrations
 
 import (
-    "github.com/gtkit/logger"
-    "gorm.io/gorm"
-
-    "{{ProjectName}}/internal/models"
-
-    "github.com/gtkit/migrate/migration"
+	"github.com/gtkit/migrate/migration"
+	"gorm.io/gorm"
 )
 
 func init() {
-    up := func(db *gorm.DB) error {
-        if err := db.Migrator().DropIndex(&models.{{StructName}}{}, "{{ColumnName}}"); err != nil {
-            logger.Errorf("failed to drop index {{ColumnName}} from {{StructName}}: %v", err)
-            return err
-        }
-        return nil
-    }
+	up := func(db *gorm.DB) error {
+		return db.Migrator().DropIndex("{{TableName}}", "{{ColumnName}}")
+	}
 
-    migration.Add("{{FileName}}", up, nil)
+	// 如需回滚，请按原列顺序、唯一性和索引方式补齐重建逻辑。
+	migration.Add("{{FileName}}", up, nil)
 }

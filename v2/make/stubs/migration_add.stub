@@ -8,11 +8,12 @@ import (
 
 func init() {
 	up := func(db *gorm.DB) error {
-		// 幂等：列已存在则跳过，重复执行无副作用。
-		if db.Migrator().HasColumn("{{TableName}}", "{{ColumnName}}") {
-			return nil
+{{AddColumnTodo}}		const statement = {{AddColumnSQL}}
+		exists, err := migration.MySQLAddColumnMatches(db, "{{TableName}}", "{{ColumnName}}", statement)
+		if err != nil || exists {
+			return err
 		}
-{{AddColumnTodo}}		return db.Exec({{AddColumnSQL}}).Error
+		return db.Exec(statement).Error
 	}
 
 	down := func(db *gorm.DB) error {

@@ -1,6 +1,6 @@
 # migrate
 
-基于 GORM + Cobra 的 Go 数据库迁移工具，支持 MySQL、PostgreSQL、SQLite。
+基于 GORM + Cobra 的 Go 数据库迁移工具。官方支持与实库验收范围仅为 MySQL。
 
 > **⚠️ 维护状态**：本目录是 v1 线（`github.com/gtkit/migrate`），已进入维护模式，仅接收关键修复，新功能与安全加固只在 v2 线发布。新项目请使用 [v2](./v2/README.md)：
 >
@@ -11,8 +11,8 @@
 ## 特性
 
 - 迁移文件按时间戳排序，支持 up / down / reset / refresh / fresh
-- 每个迁移的执行逻辑与迁移记录写入在同一事务中提交：PostgreSQL / SQLite 支持事务型 DDL，失败自动整体回滚，不留"已执行但无记录"的中间状态（MySQL 的 DDL 会隐式提交、无法回滚，属其固有限制）
-- Advisory Lock 防止多实例并发迁移冲突（MySQL `GET_LOCK`、PostgreSQL `pg_advisory_lock`），获取锁超时可配置，超时返回错误而非无限阻塞
+- 每个迁移在事务块内执行回调和账本操作。MySQL DDL 会隐式提交，迁移中途失败时需核对表结构和账本。
+- 使用 MySQL `GET_LOCK` 防止多实例并发迁移，获取锁的超时可配置。
 - `pending` 命令预览待执行迁移（dry-run）
 - 结构化日志接口，可注入 zap / zerolog / slog 等
 - Lock name 可配置，同一数据库多项目共存不冲突
@@ -74,6 +74,8 @@ func main() {
 migrate.Setup(db,
     migrate.WithProjectName("myproject"),             // 项目名称，用于代码生成
     migrate.WithMigrationDir("database/migrations"),  // 迁移文件目录，默认 database/migrations
+    migrate.WithMigrationsTable("app_migrations"),    // 迁移记录表，默认 migrations
+    migrate.WithDDLModels(&models.User{}),             // 注册用于建表快照的模型，默认空
     migrate.WithTimeout(10 * time.Minute),            // 迁移超时时间，默认 5 分钟
     migrate.WithLockName("myproject_migrate"),         // 迁移锁名称，默认 migrate_lock
     migrate.WithLockTimeout(30 * time.Second),        // 获取迁移锁的最长等待时间，默认 10 秒
@@ -87,8 +89,14 @@ migrate.Setup(db,
 # 创建表
 myapp make migration create_users_table
 
+# 从已注册的模型生成建表快照
+myapp make migration create_users_table --from-model
+
 # 修改表
 myapp make migration update_users_table
+
+# 重命名表
+myapp make migration rename_users_to_accounts_table
 
 # 添加字段到表
 myapp make migration add_email_to_users_table
@@ -96,71 +104,45 @@ myapp make migration add_email_to_users_table
 # 添加字段并指定位置（MySQL AFTER）——生成 raw SQL，在 ADD COLUMN 后追加 AFTER 子句
 myapp make migration add_email_to_users_table --after phone
 
+# 添加唯一索引，复合索引可传 --columns email,tenant_id，自定义索引名用 --index-name
+myapp make migration add_index_email_to_users_table --unique
+
 # 删除字段
 myapp make migration drop_column_avatar_from_users_table
 
-# 删除索引
-myapp make migration drop_index_email_from_users_table
+# 删除索引，使用数据库中的实际索引名
+myapp make migration drop_index_idx_users_email_from_users_table
 ```
 
 执行后会在 `database/migrations/` 下生成形如 `2026_03_17_120000_create_users_table.go` 的文件。
 
-**迁移模板均自包含、显式、可审查**：`create` 生成结构快照 struct，`add`/`update`/`drop`/`drop_column`/`drop_index` 生成**显式 raw SQL**，都不 import 业务 model、不使用 `AutoMigrate`（避免随 model 演进漂移）。`add`/`update` 及删索引模板留有 `TODO` 占位，需补全列/变更定义（大表建议标注 `ALGORITHM`/`LOCK` 在线 DDL 策略）后才能通过 `migrate lint`。
+迁移模板固定物理表名和列名。建表使用迁移文件内的结构快照。加列和更新模板需要填写明确的 SQL 定义，留空时会返回错误。生成目录会自动创建，生成的 Go 文件会按 gofmt 格式输出。
 
-| action | up 行为 | down 行为 |
-|--------|---------|-----------|
-| `create` | 快照 struct `CreateTable` | `DropTable` |
-| `update` | raw `ALTER TABLE`（TODO 待补全） | raw 反向 `ALTER`（TODO 待补全） |
-| `add` | raw `ALTER TABLE ADD COLUMN`（TODO 列定义，带存在性检查） | raw `DROP COLUMN`（带存在性检查） |
-| `drop` (表) | `DropTable`（带存在性检查） | 标记为不可逆，需人工补全 |
-| `drop_column` / `drop_index` | raw `DROP COLUMN` / `DROP INDEX`（带存在性检查） | 标记为不可逆，需人工补全 |
+| 操作 | Up | Down |
+|---|---|---|
+| `create` | 用文件内的结构快照建表 | 删除同一张表 |
+| `create --from-model` | 用已注册模型的字段和 GORM 标签生成完整建表快照 | 删除同一张表 |
+| `add` | 填完列定义后执行显式加列，`--after` 使用 MySQL 列定位 | 删除同一列 |
+| `add_index` | 创建指定索引，默认索引名为 `idx_<表>_<列...>` | 删除同一索引 |
+| `update` | 填完变更 SQL 后执行 | 补齐反向 SQL 后注册 |
+| `rename` | 将旧表名改为新表名 | 将新表名改回旧表名 |
+| `drop` / `drop_column` / `drop_index` | 按物理表、列或索引名执行删除 | 默认不可逆，回滚前返回错误 |
 
-示例（`create`）——迁移文件**自包含表结构快照，有意不引用业务 model**：业务 model 会随需求演进，而迁移必须锁定「创建当时」的结构，才能保证任何环境、任何时间执行都得到一致的表：
+新生成的 MySQL 建表、加列和加索引迁移会读取现有对象的定义。对象缺失时执行创建，定义一致时保留对象并记入迁移记录。定义不同、读取失败或无法确认一致时返回错误，迁移保留为待执行。登记后，回滚按迁移文件里的 Down 删除对应对象，包括原先已存在的对象。
 
-```go
-package migrations
+重命名命令使用 `rename_<旧表>_to_<新表>_table`，两个物理表名须不同，名称中只能有一个 `_to_` 分隔符。生成的 Up 和 Down 可直接执行，目标表名已存在时会返回数据库错误。业务模型的 `TableName()` 由应用在切换到新表时更新。
 
-import (
-    "time"
+`--from-model` 用 GORM 的 `TableName()` 或命名策略确定物理表名，再与命令中的表名精确匹配。生成器复制导出字段及标签，展开普通匿名嵌入字段，跳过 `gorm:"-"`，并写入字段类型需要的导入。模型只在生成时读取。字段引用自定义类型时，该类型需要能从迁移包访问。找不到匹配模型时会报错且不落盘。此模式只生成迁移文件。
 
-    "gorm.io/gorm"
+普通建表模板生成 ID 和时间戳字段。在首次执行迁移前，将当时的业务字段补进迁移文件内的 `snapshot`。生成的 model 和 repository 脚手架使用应用项目中的分页包。
 
-    "github.com/gtkit/migrate/migration"
-)
-
-// userV20260317120000 是本迁移建表时的结构快照，锁定创建当时的表结构。
-type userV20260317120000 struct {
-    ID        int64          `gorm:"column:id;primaryKey;autoIncrement"`
-    CreatedAt time.Time      `gorm:"column:created_at;type:datetime;index"`
-    UpdatedAt time.Time      `gorm:"column:updated_at;type:datetime;index"`
-    DeletedAt gorm.DeletedAt `gorm:"column:deleted_at;type:datetime;index"`
-    // 在此补全建表字段（不要 import 业务 model）。
-}
-
-func (userV20260317120000) TableName() string { return "users" }
-
-func init() {
-    up := func(db *gorm.DB) error {
-        return db.Migrator().CreateTable(&userV20260317120000{})
-    }
-
-    down := func(db *gorm.DB) error {
-        return db.Migrator().DropTable("users")
-    }
-
-    migration.Add("2026_03_17_120000_create_users_table", up, down)
-}
-```
-
-> 生成的业务 model 脚手架（`internal/models/user.go`）与本快照初始一致，但二者之后各自演进：model 随业务变化，迁移文件一旦执行不再修改，字段变更请新建 `add_`/`update_` 迁移。
-
-`create` 操作会同时生成以下文件：
+普通 `create` 还会生成以下文件：
 
 ```text
 internal/models/model.go                    # BaseID、BaseTimeField（仅首次生成）
 internal/models/user.go                     # GORM model 骨架（含 ListPaging、CRUD 方法）
-internal/repository/user/repository.go      # Repository 结构体 + New(db) 构造函数
-internal/repository/user/repository_util.go # Get / GetBy / All / IsExist / Paginate
+internal/repository/user/user_i.go          # Repository 结构体 + New(db) 构造函数
+internal/repository/user/user_util.go       # Get / GetBy / All / IsExist / Paginate
 ```
 
 ### 4. 执行迁移
@@ -178,29 +160,18 @@ myapp migrate status
 # 回滚最后一批迁移
 myapp migrate down
 
-# 回滚到指定版本（回滚所有比该版本新的迁移，不含该版本本身）
-myapp migrate down-to 2026_03_17_120000_create_users_table
+# 回滚所有迁移
+myapp migrate reset
 
-# 回滚所有迁移（破坏性，需 --force）
-myapp migrate reset --force
+# 回滚所有后重新执行
+myapp migrate refresh
 
-# 回滚所有后重新执行（破坏性，需 --force；需连接池 MaxOpenConns ≥ 2）
-myapp migrate refresh --force
-
-# 删除所有表后重新执行（⚠️ 危险，会丢失数据；需 --force；需连接池 MaxOpenConns ≥ 2）
-myapp migrate fresh --force
-
-# 把 pending 迁移标记为已应用而不执行其 SQL（用于接入已有等价结构的存量库，需 --force）
-myapp migrate mark-applied --force
-# 只标记到指定版本为止
-myapp migrate mark-applied --to 2026_03_17_120000_create_users_table --force
+# 删除所有表后重新执行（⚠️ 危险，会丢失数据）
+myapp migrate fresh
 ```
 
-> `mark-applied` 只写迁移记录、不执行建表/改表，且**不校验数据库真实结构是否与这些迁移等价**——仅用于数据库结构已等价于这些迁移净效果的存量库（如从其他工具迁移过来）。标错会让后续 `up` 跳过真实建表、造成 schema 漂移，故强制 `--force`。
->
-> `reset` / `refresh` / `fresh` 会回滚或删除数据，必须显式加 `--force` 才执行，缺失时直接报错拒绝，避免误触丢数据。
->
-> `fresh` / `refresh` 需要连接池至少 2 条连接（一条持迁移锁、另一条删表/回滚重建）；`SetMaxOpenConns(1)` 时会提前报错而非死等超时。
+`fresh` 和 `refresh` 会在修改表或回滚前检查重放清单。缺少已注册文件、迁移未注册或缺少 `Up` 时会报错。回滚目标缺少 `Down` 时，整批拒绝执行。支持显式确认及指定版本回滚的命令见 v2 README。
+
 
 ### 5. Makefile 集成
 
@@ -295,6 +266,25 @@ type Logger interface {
 
 签名兼容 `zap.SugaredLogger`、`slog` 的 key-value 风格。
 
+### 接入 gtkit/logger
+
+执行器在每条 `Up` 或 `Down` 开始时记录迁移名和批次，事务返回后记录成功或失败和耗时。只需在应用入口通过 `WithLogger` 注入适配器，生成的回调可以直接返回执行错误。
+
+```go
+import gtkitlog "github.com/gtkit/logger/v2"
+
+type migrationLogger struct {
+    logger *gtkitlog.Logger
+}
+
+func (l migrationLogger) Info(msg string, kv ...any)  { l.logger.Infow(msg, kv...) }
+func (l migrationLogger) Warn(msg string, kv ...any)  { l.logger.Warnw(msg, kv...) }
+func (l migrationLogger) Error(msg string, kv ...any) { l.logger.Errorw(msg, kv...) }
+
+// 在应用初始化日志后，使用已配置的 appLogger。
+err := migrate.Setup(db, migrate.WithLogger(migrationLogger{logger: appLogger}))
+```
+
 ### 接入 zap
 
 ```go
@@ -360,17 +350,25 @@ migrate.Setup(db, migrate.WithLogger(&migration.NopLogger{}))
 
 ## 多项目共用数据库
 
-当多个服务共享同一个数据库时，使用 `WithLockName` 避免迁移锁冲突：
+当多个服务共用一个数据库时，可以分别配置迁移记录表。需要迁移同一组业务表的服务应使用同一个锁名。
 
 ```go
 // user-service
-migrate.Setup(db, migrate.WithLockName("user_svc_migrate"))
+migrate.Setup(db,
+    migrate.WithMigrationsTable("user_svc_migrations"),
+    migrate.WithLockName("user_svc_migrate"),
+)
 
 // order-service
-migrate.Setup(db, migrate.WithLockName("order_svc_migrate"))
+migrate.Setup(db,
+    migrate.WithMigrationsTable("order_svc_migrations"),
+    migrate.WithLockName("order_svc_migrate"),
+)
 ```
 
-不同的 lock name 会生成不同的 advisory lock key，各项目的迁移互不阻塞。
+`WithMigrationsTable` 默认使用 `migrations`。表名须以 ASCII 字母或下划线开头，最多 63 个 ASCII 字母、数字或下划线。首尾空白会被去除，空白或非法表名会使 `Setup` 返回错误。
+
+建表、迁移状态、批次记录和回滚都使用配置的表。已有迁移的数据库切换表名时，迁移状态会从新选中的表读取。`fresh` 仍会清理整个数据库中的表，只适用于项目独占的数据库。
 
 ## 编程式调用
 
@@ -378,6 +376,7 @@ migrate.Setup(db, migrate.WithLockName("order_svc_migrate"))
 
 ```go
 m := migration.NewMigrator("database/migrations", db,
+    migration.WithMigrationsTable("app_migrations"),
     migration.WithLockName("myproject_migrate"),
     migration.WithLogger(myLogger),
 )
@@ -399,6 +398,21 @@ err = m.RollbackSteps(ctx, 3)
 // 查看状态
 statuses, err := m.Status(ctx)
 ```
+
+## 集成测试
+
+v1 发版检查默认要求 `MIGRATE_TEST_MYSQL_DSN`，在竞态和覆盖率检查中运行 MySQL 实库测试。请使用独立的空测试库，库名须包含 `test`。指定 `INTEGRATION=off` 可显式跳过实库，普通测试和覆盖率检查仍会运行。
+
+```bash
+export MIGRATE_TEST_MYSQL_DSN='user:pass@tcp(127.0.0.1:3306)/migrate_test?parseTime=true'
+GOWORK=off MIGRATE_TEST_REQUIRE_DATABASES=1 go test -tags=integration -race -count=1 ./migration -run '^TestMigratorMySQLIntegration$'
+```
+
+实库用例验证建表、回滚和迁移记录、同名迁移锁竞争与超时后的锁释放，以及 `fresh` 成功或删表中途失败时是否在同一 MySQL 会话恢复 `foreign_key_checks` 原值。测试覆盖初始开启和关闭两种状态，并在结束后清理测试表。
+
+`fresh` 用例还会验证删表连接断开或恢复语句被 MySQL 拒绝后，故障会话从服务端退出，且连接池补充新会话。
+
+迁移记录表用例验证默认表名、自定义表的写入、状态和回滚，并核对默认表中的记录在自定义表的操作期间保持原值。
 
 ## 项目结构
 

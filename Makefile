@@ -5,7 +5,11 @@ LINT_TARGETS ?= ./...
 # ── 发版参数（可按库在命令行覆盖，如 make tag REMOTE=origin BUMP=minor）──
 REMOTE       ?= gtkit        # 推送远端名
 VERSION_FILE ?= version.go   # 版本常量所在文件（需含 const Version = "vX.Y.Z"）
-BUMP         ?= patch        # patch / minor / major
+# BUMP 控制版本号递增级别：patch / minor / major.
+BUMP         ?= patch
+# INTEGRATION=off 显式跳过 MySQL 实库测试，默认要求 MIGRATE_TEST_MYSQL_DSN.
+INTEGRATION  ?= on
+COVER_MIN    ?= 80
 
 tool: ## golangci-lint + gofumpt
 	@ echo "▶️ golangci-lint run"
@@ -29,8 +33,25 @@ tag:
 	if [ -n "$$(git status --porcelain)" ]; then \
 		echo "✗ 工作区不干净，发版前请先提交或清理："; git status --short; exit 1; \
 	fi; \
+	export GOWORK=off; \
+	if [ "$(INTEGRATION)" = "off" ]; then \
+		echo "⚠️ INTEGRATION=off：已跳过 MySQL 实库集成测试"; testflags=""; \
+	elif [ -z "$$MIGRATE_TEST_MYSQL_DSN" ]; then \
+		echo "✗ 缺少 MIGRATE_TEST_MYSQL_DSN（MySQL 实库测试是发版门禁；或显式 INTEGRATION=off 跳过）"; exit 1; \
+	else \
+		export MIGRATE_TEST_REQUIRE_DATABASES=1; testflags="-tags=integration"; \
+	fi; \
 	echo "▶️ go vet"; go vet ./...; \
-	echo "▶️ 测试 (race)"; go test -race -count=1 -timeout=5m ./...; \
+	echo "▶️ 测试 (race$${testflags:+ + MySQL integration})"; go test $$testflags -race -count=1 -timeout=5m ./...; \
+	migration_cover_report=$$(mktemp "$${TMPDIR:-/tmp}/migrate-v1-cover.XXXXXX"); \
+	trap 'rm -f "$$migration_cover_report"' 0; \
+	trap 'exit 1' HUP INT TERM; \
+	echo "▶️ 覆盖率 (>= $(COVER_MIN)%)"; go test $$testflags -count=1 -coverprofile="$$migration_cover_report" ./...; \
+	pct=$$(go tool cover -func="$$migration_cover_report" | awk '/^total:/{gsub(/%/,"",$$NF); print $$NF}'); \
+	echo "覆盖率: $$pct%"; \
+	if ! awk -v p="$$pct" -v m="$(COVER_MIN)" 'BEGIN{exit !(p+0 >= m+0)}'; then \
+		echo "✗ 覆盖率 $$pct% 低于门槛 $(COVER_MIN)%"; exit 1; \
+	fi; \
 	current=$$(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' $(VERSION_FILE) | head -n1 | tr -d 'v'); \
 	if [ -z "$$current" ]; then echo "✗ 在 $(VERSION_FILE) 中找不到 const Version"; exit 1; fi; \
 	maj=$$(echo $$current | cut -d. -f1); \

@@ -1,7 +1,10 @@
 package migration
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"strings"
 
 	"gorm.io/gorm"
 )
@@ -51,39 +54,59 @@ func DeleteAllTables(db *gorm.DB) error {
 }
 
 func deleteMySQLTables(db *gorm.DB) error {
-	dbname := CurrentDatabase(db)
+	ctx := context.Background()
+	if db.Statement != nil && db.Statement.Context != nil {
+		ctx = db.Statement.Context
+	}
+	conn, err := reserveMigrationConn(ctx, db)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
 
-	var tables []string
-	err := db.Table("information_schema.tables").
-		Where("table_schema = ?", dbname).
-		Pluck("table_name", &tables).
-		Error
+	rows, err := conn.QueryContext(ctx, "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'")
 	if err != nil {
 		return fmt.Errorf("list mysql tables: %w", err)
 	}
-
+	var tables []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return errors.Join(fmt.Errorf("read mysql table: %w", err), rows.Close())
+		}
+		tables = append(tables, name)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("list mysql tables: %w", err)
+	}
 	if len(tables) == 0 {
 		return nil
 	}
 
-	// 关闭外键检测
-	if err := db.Exec("SET foreign_key_checks = 0").Error; err != nil {
+	var original bool
+	if err := conn.QueryRowContext(ctx, "SELECT @@SESSION.foreign_key_checks").Scan(&original); err != nil {
+		return fmt.Errorf("read foreign key checks: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, "SET SESSION foreign_key_checks = 0"); err != nil {
+		discardMigrationConn(conn)
 		return fmt.Errorf("disable foreign key checks: %w", err)
 	}
 
+	var dropErr error
 	for _, table := range tables {
-		if err := db.Migrator().DropTable(table); err != nil {
-			// 恢复外键检测后再返回错误
-			_ = db.Exec("SET foreign_key_checks = 1").Error
-			return fmt.Errorf("drop table %s: %w", table, err)
+		quoted := "`" + strings.ReplaceAll(table, "`", "``") + "`"
+		if _, err := conn.ExecContext(ctx, "DROP TABLE IF EXISTS "+quoted); err != nil {
+			dropErr = fmt.Errorf("drop table %s: %w", table, err)
+			break
 		}
 	}
-
-	if err := db.Exec("SET foreign_key_checks = 1").Error; err != nil {
-		return fmt.Errorf("enable foreign key checks: %w", err)
+	restore, cancel := context.WithTimeout(context.Background(), defaultLockTimeout)
+	defer cancel()
+	if _, err := conn.ExecContext(restore, "SET SESSION foreign_key_checks = ?", original); err != nil {
+		discardMigrationConn(conn)
+		return errors.Join(dropErr, fmt.Errorf("restore foreign key checks: %w", err))
 	}
-
-	return nil
+	return dropErr
 }
 
 func deletePostgresTables(db *gorm.DB) error {

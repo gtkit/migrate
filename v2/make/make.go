@@ -94,12 +94,11 @@ func createFileFromStub(filePath, stubName string, model Model, mode fileWriteMo
 	}
 	maps.Copy(replaces, extra)
 
-	modelStub := string(stub)
-	for search, replace := range replaces {
-		modelStub = strings.ReplaceAll(modelStub, search, replace)
+	pairs := make([]string, 0, 2*len(replaces))
+	for name, value := range replaces {
+		pairs = append(pairs, name, value)
 	}
-
-	data := []byte(modelStub)
+	data := []byte(strings.NewReplacer(pairs...).Replace(string(stub)))
 	if strings.HasSuffix(filePath, ".go") {
 		if data, err = format.Source(data); err != nil {
 			return fmt.Errorf("format generated %s: %w", filePath, err)

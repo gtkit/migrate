@@ -19,10 +19,11 @@ type MigrationFile struct {
 
 // Registry 管理所有已注册的迁移文件，线程安全.
 type Registry struct {
-	mu    sync.RWMutex
-	files map[string]MigrationFile
-	order []string // 保持注册顺序
-	dupes []string // 被忽略的重复注册名（供 lint 发现"两个包注册同名"）
+	mu           sync.RWMutex
+	files        map[string]MigrationFile
+	order        []string // 保持注册顺序
+	irreversible map[string]string
+	dupes        []string // 被忽略的重复注册名（供 lint 发现"两个包注册同名"）
 }
 
 // defaultRegistry 默认的全局注册表.
@@ -41,8 +42,22 @@ func Add(name string, up, down MigrateFunc) {
 	defaultRegistry.Add(name, up, down)
 }
 
+// AddIrreversible 注册一个不可逆的迁移，回滚时在执行任何 Down 前报告原因。
+func AddIrreversible(name string, up MigrateFunc, reason string) {
+	defaultRegistry.AddIrreversible(name, up, reason)
+}
+
 // Add 注册一个迁移文件到注册表.
 func (r *Registry) Add(name string, up, down MigrateFunc) {
+	r.add(name, up, down, nil)
+}
+
+// AddIrreversible 注册一个不可逆的迁移，回滚时在执行任何 Down 前报告原因。
+func (r *Registry) AddIrreversible(name string, up MigrateFunc, reason string) {
+	r.add(name, up, func(*gorm.DB) error { return Irreversible(reason) }, &reason)
+}
+
+func (r *Registry) add(name string, up, down MigrateFunc, irreversible *string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -59,6 +74,19 @@ func (r *Registry) Add(name string, up, down MigrateFunc) {
 		Down:     down,
 	}
 	r.order = append(r.order, name)
+	if irreversible != nil {
+		if r.irreversible == nil {
+			r.irreversible = make(map[string]string)
+		}
+		r.irreversible[name] = *irreversible
+	}
+}
+
+func (r *Registry) irreversibleReason(name string) (string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	reason, ok := r.irreversible[name]
+	return reason, ok
 }
 
 // Duplicates 返回被忽略的重复注册名（去重、升序）.

@@ -4,6 +4,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"go/token"
 	"maps"
 	"path"
 	"reflect"
@@ -12,6 +13,7 @@ import (
 	"strings"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 )
 
 // defaultSnapshotFields 是 create 模板在未指定 --from-model 时的基础字段与占位.
@@ -34,7 +36,7 @@ func defaultSnapshot() snapshotSource {
 
 // snapshotFromModel 在已注册的 DDL model 中找到表名为 tableName 的 model，
 // 反射其字段生成快照 struct 的字段源码与 import 行.
-// 只取导出字段；匿名嵌入 struct 展平；gorm:"-" 跳过；tag 原样保留.
+// 跳过未导出和 gorm:"-" 字段，保留 GORM 标签及嵌入字段的配置.
 // model 只在生成时读取，生成后的文件是唯一事实来源.
 func snapshotFromModel(db *gorm.DB, models []any, tableName string) (snapshotSource, error) {
 	targets, err := buildDDLTargets(db, models)
@@ -52,30 +54,51 @@ func snapshotFromModel(db *gorm.DB, models []any, tableName string) (snapshotSou
 }
 
 func renderSnapshot(t reflect.Type) (snapshotSource, error) {
-	var (
-		fields  []string
-		imports = map[string]string{} // path -> alias（与 path.Base 相同时为空）
-	)
-	var walk func(t reflect.Type) error
-	walk = func(t reflect.Type) error {
+	if t.Kind() != reflect.Struct {
+		return snapshotSource{}, errors.New("--from-model: model must be a struct")
+	}
+	imports := map[string]string{} // path -> alias（与 path.Base 相同时为空）
+	var walk func(t reflect.Type) ([]string, error)
+	walk = func(t reflect.Type) ([]string, error) {
+		var fields []string
 		for f := range t.Fields() {
-			if !f.IsExported() && !f.Anonymous {
+			if !f.IsExported() {
 				continue
 			}
-			if strings.TrimSpace(f.Tag.Get("gorm")) == "-" {
+			gormTag := strings.TrimSpace(f.Tag.Get("gorm"))
+			if gormTag == "-" {
 				continue
 			}
 			ft := f.Type
-			if f.Anonymous {
-				if ft.Kind() == reflect.Pointer {
-					ft = ft.Elem()
+			embedded := ft
+			if embedded.Kind() == reflect.Pointer {
+				embedded = embedded.Elem()
+			}
+			_, explicitEmbed := schema.ParseTagSetting(gormTag, ";")["EMBEDDED"]
+			isEmbedded := embedded.Kind() == reflect.Struct &&
+				(explicitEmbed || (f.Anonymous && !isSingleColumnEmbed(embedded)))
+			if isEmbedded {
+				nested, err := walk(embedded)
+				if err != nil {
+					return nil, err
 				}
-				if ft.Kind() == reflect.Struct && ft.PkgPath() != "" && !isSingleColumnEmbed(ft) {
-					if err := walk(ft); err != nil {
-						return err
-					}
+				if gormTag == "" {
+					fields = append(fields, nested...)
 					continue
 				}
+				tag := string(f.Tag)
+				if !explicitEmbed {
+					tag = withEmbeddedSetting(tag)
+				}
+				structType := "struct"
+				if ft.Kind() == reflect.Pointer {
+					structType = "*struct"
+				}
+				fields = append(fields, "\t"+f.Name+" "+structType+" {\n"+strings.Join(nested, "\n")+"\n\t} "+tagLiteral(tag))
+				continue
+			}
+			if err := validateSnapshotType(ft); err != nil {
+				return nil, fmt.Errorf("--from-model: model %s field %s: %w", t, f.Name, err)
 			}
 			collectImports(ft, imports)
 			line := "\t" + f.Name + " " + typeString(ft)
@@ -84,12 +107,10 @@ func renderSnapshot(t reflect.Type) (snapshotSource, error) {
 			}
 			fields = append(fields, line)
 		}
-		return nil
+		return fields, nil
 	}
-	if t.Kind() != reflect.Struct {
-		return snapshotSource{}, errors.New("--from-model: model must be a struct")
-	}
-	if err := walk(t); err != nil {
+	fields, err := walk(t)
+	if err != nil {
 		return snapshotSource{}, err
 	}
 	if len(fields) == 0 {
@@ -121,41 +142,71 @@ func renderSnapshot(t reflect.Type) (snapshotSource, error) {
 	return snapshotSource{fields: strings.Join(fields, "\n"), imports: group}, nil
 }
 
+// withEmbeddedSetting 为内联的命名字段保留原匿名字段的嵌入语义.
+func withEmbeddedSetting(tag string) string {
+	const prefix = `gorm:"`
+	if after, ok := strings.CutPrefix(tag, prefix); ok {
+		return prefix + "embedded;" + after
+	}
+	return strings.Replace(tag, " "+prefix, " "+prefix+"embedded;", 1)
+}
+
 // typeString 渲染字段类型源码；reflect 把 []byte 打印为 []uint8，按惯例还原.
 func typeString(t reflect.Type) string {
-	if t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8 && t.Elem().PkgPath() == "" {
+	if t == reflect.TypeFor[[]byte]() {
 		return "[]byte"
 	}
 	return t.String()
 }
 
 // isSingleColumnEmbed 判断匿名嵌入 struct 是否按 GORM 语义视为单列而非展平：
-// 实现 driver.Valuer 的类型（如自定义时间/JSON 包装）是一个列，GORM 不会展平它.
+// 时间类型和实现 driver.Valuer 的类型对应单列.
 func isSingleColumnEmbed(t reflect.Type) bool {
-	return t.Implements(valuerType) || reflect.PointerTo(t).Implements(valuerType)
+	return t.ConvertibleTo(schema.TimeReflectType) || t.Implements(valuerType) || reflect.PointerTo(t).Implements(valuerType)
 }
 
 var valuerType = reflect.TypeFor[driver.Valuer]()
 
-// collectImports 收集类型（穿透指针/切片/数组/map）涉及的命名类型包路径与别名.
+func validateSnapshotType(t reflect.Type) error {
+	if name := t.Name(); name != "" {
+		if t.PkgPath() != "" && (!token.IsExported(name) || strings.Contains(name, "[")) {
+			return fmt.Errorf("type %s cannot be rendered as a portable snapshot field", t)
+		}
+		return nil
+	}
+	switch t.Kind() {
+	case reflect.Pointer, reflect.Slice, reflect.Array:
+		return validateSnapshotType(t.Elem())
+	case reflect.Map:
+		if err := validateSnapshotType(t.Key()); err != nil {
+			return err
+		}
+		return validateSnapshotType(t.Elem())
+	case reflect.Interface:
+		if t.NumMethod() == 0 {
+			return nil
+		}
+	}
+	return fmt.Errorf("unsupported anonymous snapshot field type %s", t)
+}
+
+// collectImports 收集类型源码实际引用的包路径与别名。
 func collectImports(t reflect.Type, imports map[string]string) {
-	for {
+	for t.Name() == "" {
 		switch t.Kind() {
 		case reflect.Pointer, reflect.Slice, reflect.Array:
 			t = t.Elem()
-			continue
 		case reflect.Map:
 			collectImports(t.Key(), imports)
 			t = t.Elem()
-			continue
+		default:
+			return
 		}
-		break
 	}
 	pkgPath := t.PkgPath()
 	if pkgPath == "" {
 		return
 	}
-	// reflect 的 String() 形如 "pkgname.Type"，包名与路径末段不一致时需要别名.
 	pkgName, _, _ := strings.Cut(t.String(), ".")
 	alias := ""
 	if pkgName != path.Base(pkgPath) {

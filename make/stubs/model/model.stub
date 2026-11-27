@@ -23,8 +23,8 @@ func ({{VariableName}} *{{StructName}}) TableName() string {
 }
 
 type {{StructName}}ListPaging struct {
-	List   []*{{StructName}}    `json:"list"`
-	Paging paginator.Paging `json:"paging"`
+	List   []*{{StructName}} `json:"list"`
+	Paging paginator.Paging              `json:"paging"`
 }
 
 // GetStringID 获取 ID 的字符串格式.

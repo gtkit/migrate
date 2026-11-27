@@ -1,0 +1,26 @@
+package migrations
+
+import (
+	"github.com/gtkit/migrate/migration"
+	"gorm.io/gorm"
+)
+
+func init() {
+	up := func(db *gorm.DB) error {
+		exists, err := {{IndexMatch}}
+		if err != nil || exists {
+			return err
+		}
+		return db.Exec({{AddIndexSQL}}).Error
+	}
+
+	down := func(db *gorm.DB) error {
+		exists, err := {{IndexMatch}}
+		if err != nil || !exists {
+			return err
+		}
+		return db.Exec({{DropIndexSQL}}).Error
+	}
+
+	migration.Add("{{FileName}}", up, down)
+}

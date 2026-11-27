@@ -19,8 +19,8 @@ func (r *Repository) GetBy(ctx context.Context, field, value string) ({{Variable
 	return
 }
 
-func (r *Repository) All(ctx context.Context) ({{VariableNamePlural}} []models.{{StructName}}) {
-	r.mdbCtx(ctx).Find(&{{VariableNamePlural}})
+func (r *Repository) All(ctx context.Context) ({{VariableName}}Plural []models.{{StructName}}) {
+	r.mdbCtx(ctx).Find(&{{VariableName}}Plural)
 	return
 }
 
@@ -32,23 +32,23 @@ func (r *Repository) IsExist(ctx context.Context, field, value string) bool {
 
 func (r *Repository) Paginate(ctx context.Context, baseURL string, pagination paginator.Pagination, args ...paginator.Option) (*models.{{StructName}}ListPaging, error) {
 	var (
-		{{VariableNamePlural}} []*models.{{StructName}}
-		paging               paginator.Paging
-		err                  error
+		{{VariableName}}Plural []*models.{{StructName}}
+		paging                             paginator.Paging
+		err                                error
 	)
 
 	db := r.mdbCtx(ctx).Model(models.{{StructName}}{})
-	paging, err = paginator.Paginate(db, &{{VariableNamePlural}}, baseURL, paginator.Pagination{
+	paging, err = paginator.Paginate(db, &{{VariableName}}Plural, baseURL, paginator.Pagination{
 		Page:     pagination.Page,
 		PageSize: pagination.PageSize,
 		Order:    "desc",
 	}, args...)
 	if err != nil {
-		return nil, fmt.Errorf("paginate {{VariableNamePlural}}: %w", err)
+		return nil, fmt.Errorf("paginate {{VariableName}}Plural: %w", err)
 	}
 
 	return &models.{{StructName}}ListPaging{
-		List:   {{VariableNamePlural}},
+		List:   {{VariableName}}Plural,
 		Paging: paging,
 	}, nil
 }

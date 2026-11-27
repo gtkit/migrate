@@ -88,9 +88,16 @@ func TestIrreversibleError(t *testing.T) {
 
 // TestGlobalAddRegistersToDefaultRegistry 验证包级 Add 注册进默认注册表.
 func TestGlobalAddRegistersToDefaultRegistry(t *testing.T) {
+	previous := defaultRegistry
+	defaultRegistry = NewRegistry()
+	t.Cleanup(func() { defaultRegistry = previous })
+
 	name := "2026_07_29_000000_support_test_global_add"
 	noop := func(*gorm.DB) error { return nil }
 	Add(name, noop, noop)
+	if duplicates := defaultRegistry.Duplicates(); len(duplicates) != 0 {
+		t.Fatalf("global Add recorded unexpected duplicates: %v", duplicates)
+	}
 
 	for _, f := range defaultRegistry.All() {
 		if f.FileName == name {

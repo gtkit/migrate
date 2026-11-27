@@ -77,6 +77,11 @@ type mysqlLock struct {
 }
 
 func (l *mysqlLock) Acquire(ctx context.Context) (func(), error) {
+	_, release, err := l.acquireConn(ctx)
+	return release, err
+}
+
+func (l *mysqlLock) acquireConn(ctx context.Context) (*sql.Conn, func(), error) {
 	// GET_LOCK 的超时参数以秒为单位，至少为 1 秒.
 	timeoutSec := max(1, int(l.timeout.Seconds()))
 
@@ -84,11 +89,11 @@ func (l *mysqlLock) Acquire(ctx context.Context) (func(), error) {
 	// 且不能用绑业务 ctx 的事务（取消后无法可靠释放）.
 	sqlDB, err := l.db.DB()
 	if err != nil {
-		return nil, fmt.Errorf("get sql.DB for lock: %w", err)
+		return nil, nil, fmt.Errorf("get sql.DB for lock: %w", err)
 	}
 	conn, err := sqlDB.Conn(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("reserve lock connection: %w", err)
+		return nil, nil, fmt.Errorf("reserve lock connection: %w", err)
 	}
 
 	lockName := l.lockName
@@ -97,7 +102,7 @@ func (l *mysqlLock) Acquire(ctx context.Context) (func(), error) {
 		if err := conn.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&dbName); err != nil {
 			markBadConn(conn)
 			_ = conn.Close()
-			return nil, fmt.Errorf("resolve database name for lock: %w", err)
+			return nil, nil, fmt.Errorf("resolve database name for lock: %w", err)
 		}
 		lockName = deriveMySQLLockName(dbName.String, l.tableName)
 	}
@@ -108,12 +113,12 @@ func (l *mysqlLock) Acquire(ctx context.Context) (func(), error) {
 		// 标坏连接物理关闭、结束会话，未确认的锁随会话释放，绝不带锁归还连接池.
 		markBadConn(conn)
 		_ = conn.Close()
-		return nil, fmt.Errorf("acquire mysql lock %q: %w", lockName, err)
+		return nil, nil, fmt.Errorf("acquire mysql lock %q: %w", lockName, err)
 	}
 	if !result.Valid || result.Int64 != 1 {
 		// 服务端明确拒绝（等待超时），连接状态确定，可正常归还.
 		_ = conn.Close()
-		return nil, fmt.Errorf("%w: mysql advisory lock %q not acquired within %ds", ErrLockNotAcquired, lockName, timeoutSec)
+		return nil, nil, fmt.Errorf("%w: mysql advisory lock %q not acquired within %ds", ErrLockNotAcquired, lockName, timeoutSec)
 	}
 
 	release := func() {
@@ -129,7 +134,7 @@ func (l *mysqlLock) Acquire(ctx context.Context) (func(), error) {
 		}
 		_ = conn.Close()
 	}
-	return release, nil
+	return conn, release, nil
 }
 
 // postgresLock 使用 PostgreSQL pg_advisory_lock 实现的迁移锁.

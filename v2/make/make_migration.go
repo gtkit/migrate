@@ -31,7 +31,7 @@ func init() {
 	CmdMakeMigration.Flags().String("comment", "", "With --type: column COMMENT")
 	CmdMakeMigration.Flags().Bool("from-model", false, "For `create_*` migrations: build the snapshot struct from the registered DDL model with the same table name (skips model/repository scaffolding)")
 	CmdMakeMigration.Flags().Bool("unique", false, "For `add_index_*` migrations: create a UNIQUE index")
-	CmdMakeMigration.Flags().String("table", "", "Table name, required when the migration name contains `_to_`/`_from_`/`_of_` more than once and the split would be ambiguous")
+	CmdMakeMigration.Flags().String("table", "", "Table name for ambiguous column or index migration names containing `_to_`/`_from_`/`_of_` more than once")
 	CmdMakeMigration.Flags().String("index-name", "", "For `add_index_*`/`drop_index_*` migrations: index name (default idx_<table>_<columns>)")
 	CmdMakeMigration.Flags().String("columns", "", "For `add_index_*`/`drop_index_*` migrations: comma-separated columns of a composite index (overrides the column parsed from the migration name)")
 }
@@ -39,10 +39,12 @@ func init() {
 func runMakeMigration(cmd *cobra.Command, args []string) error {
 	cfg := resolveConfig(cmd)
 	explicitTable, _ := cmd.Flags().GetString("table")
-	action, objectName, tableName, columnName, err := parseMigrationName(args[0], strings.TrimSpace(explicitTable))
+	parsed, err := parseMigrationName(args[0], strings.TrimSpace(explicitTable))
 	if err != nil {
 		return err
 	}
+	action, objectName := parsed.action, parsed.objectName
+	tableName, columnName := parsed.tableName, parsed.columnName
 	fromModel, err := cmd.Flags().GetBool("from-model")
 	if err != nil {
 		return err
@@ -67,13 +69,19 @@ func runMakeMigration(cmd *cobra.Command, args []string) error {
 		}
 		extra["{{SnapshotImports}}"] = snapshot.imports
 		extra["{{SnapshotFields}}"] = snapshot.fields
+	case "rename":
+		if err := rejectFlags(cmd.Flags(), "rename_*", "after", "type", "not-null", "default", "comment",
+			"from-model", "unique", "table", "index-name", "columns"); err != nil {
+			return err
+		}
+		extra["{{NewTableName}}"] = parsed.newTableName
 	case "add":
 		if objectName == "index" {
 			spec, err := resolveIndexSpec(cmd, "add_index_*", tableName, columnName)
 			if err != nil {
 				return err
 			}
-			extra["{{IndexName}}"] = spec.Name
+			extra["{{IndexMatch}}"] = indexMatchCall(spec, tableName)
 			extra["{{AddIndexSQL}}"] = strconv.Quote(spec.AddSQL)
 			extra["{{DropIndexSQL}}"] = strconv.Quote(spec.DropSQL)
 			break
@@ -95,24 +103,25 @@ func runMakeMigration(cmd *cobra.Command, args []string) error {
 	case "drop":
 		switch objectName {
 		case "column":
-			down, err := dropColumnDown(cmd, tableName, columnName, fileName)
+			down, err := dropColumnDown(cmd, tableName, columnName)
 			if err != nil {
 				return err
 			}
 			extra["{{DropColumnSQL}}"] = strconv.Quote(dropColumnSQL(tableName, columnName))
-			extra["{{DownBody}}"] = down
+			extra["{{DownAndRegister}}"] = dropRegistration(fileName, "column", down)
 		case "index":
 			spec, err := resolveIndexSpec(cmd, "drop_index_*", tableName, columnName)
 			if err != nil {
 				return err
 			}
-			extra["{{IndexName}}"] = spec.Name
+			extra["{{IndexExists}}"] = dropIndexGuard(spec, tableName)
 			extra["{{DropIndexSQL}}"] = strconv.Quote(spec.DropSQL)
-			extra["{{DownBody}}"] = dropIndexDown(spec, tableName, fileName)
+			extra["{{DownAndRegister}}"] = dropRegistration(fileName, "index", dropIndexDown(spec, tableName))
 		}
 	}
 
 	model := newModel(cfg, tableName, columnName)
+	model.TableName = tableName
 	if action == "create" && !fromModel {
 		if err := generateModelScaffold(cfg, model); err != nil {
 			return err
@@ -125,7 +134,11 @@ func runMakeMigration(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	console.Success("Migration file created. After modifying it, use `migrate up` to run.")
+	if action == "rename" {
+		console.Success("Migration file created. Use `migrate up` to run.")
+	} else {
+		console.Success("Migration file created. After modifying it, use `migrate up` to run.")
+	}
 	return nil
 }
 
@@ -144,6 +157,8 @@ type indexSpec struct {
 	Name         string
 	AddSQL       string
 	DropSQL      string
+	Columns      []string
+	Unique       bool
 	ColumnsGiven bool // 是否显式给出了 --columns（删索引据此决定 down 能否重建）
 }
 
@@ -185,8 +200,10 @@ func resolveIndexSpec(cmd *cobra.Command, kindLabel, tableName, columnName strin
 		return indexSpec{}, fmt.Errorf("%w; pass --index-name to override it", err)
 	}
 
+	spec.Columns = columns
+	spec.Unique, _ = flags.GetBool("unique")
 	kind := "INDEX"
-	if unique, _ := flags.GetBool("unique"); unique {
+	if spec.Unique {
 		kind = "UNIQUE INDEX"
 	}
 	quoted := make([]string, len(columns))
@@ -202,12 +219,12 @@ func resolveIndexSpec(cmd *cobra.Command, kindLabel, tableName, columnName strin
 
 // dropColumnDown 生成删列迁移的 down：给出 --type 时重建列结构，否则标记不可逆.
 // 重建的只是结构，被删除的数据不会恢复——生成的文件里必须写明这一点.
-func dropColumnDown(cmd *cobra.Command, tableName, columnName, fileName string) (string, error) {
+func dropColumnDown(cmd *cobra.Command, tableName, columnName string) (string, error) {
 	if typ, _ := cmd.Flags().GetString("type"); strings.TrimSpace(typ) == "" {
 		if err := rejectFlags(cmd.Flags(), "drop_column_* without --type", "not-null", "default", "comment", "after"); err != nil {
 			return "", err
 		}
-		return irreversibleDown("column", fileName), nil
+		return "", nil
 	}
 	sql, _, err := addColumnSQL(cmd, tableName, columnName)
 	if err != nil {
@@ -221,17 +238,36 @@ func dropColumnDown(cmd *cobra.Command, tableName, columnName, fileName string) 
 `, tableName, columnName, strconv.Quote(sql)), nil
 }
 
-// dropIndexDown 生成删索引迁移的 down：给出 --columns 时重建索引，否则标记不可逆.
-// 索引不承载数据，重建即完全还原，无需数据丢失提示.
-func dropIndexDown(spec indexSpec, tableName, fileName string) string {
-	if !spec.ColumnsGiven {
-		return irreversibleDown("index", fileName)
+func indexMatchCall(spec indexSpec, tableName string) string {
+	columns := make([]string, len(spec.Columns))
+	for i, column := range spec.Columns {
+		columns[i] = strconv.Quote(column)
 	}
-	return fmt.Sprintf(`		if db.Migrator().HasIndex(%q, %q) {
+	return fmt.Sprintf("migration.MySQLIndexMatches(db, %q, %q, %t, %s)",
+		tableName, spec.Name, spec.Unique, strings.Join(columns, ", "))
+}
+
+func dropIndexGuard(spec indexSpec, tableName string) string {
+	if !spec.ColumnsGiven {
+		return fmt.Sprintf("\t\texists := db.Migrator().HasIndex(%q, %q)\n", tableName, spec.Name)
+	}
+	return fmt.Sprintf(`		exists, err := %s
+		if err != nil {
+			return err
+		}
+`, indexMatchCall(spec, tableName))
+}
+
+// dropIndexDown 重建定义明确的索引，或留空以注册为不可逆。
+func dropIndexDown(spec indexSpec, tableName string) string {
+	if !spec.ColumnsGiven {
+		return ""
+	}
+	return fmt.Sprintf(`%s		if exists {
 			return nil
 		}
 		return db.Exec(%s).Error
-`, tableName, spec.Name, strconv.Quote(spec.AddSQL))
+`, dropIndexGuard(spec, tableName), strconv.Quote(spec.AddSQL))
 }
 
 // rejectFlags 拒绝与当前迁移形态无关的 flag：写了却被静默忽略比报错危险.
@@ -316,96 +352,122 @@ func dropColumnSQL(tableName, columnName string) string {
 	return fmt.Sprintf("ALTER TABLE `%s` DROP COLUMN `%s`%s", tableName, columnName, onlineDDLClause)
 }
 
-// irreversibleDown 是删除类迁移未给出重建定义时的 down 实现.
-func irreversibleDown(object, fileName string) string {
-	return fmt.Sprintf("\t\treturn migration.Irreversible(\"fill in the %s recreation for %s manually\")\n", object, fileName)
+// dropRegistration 声明不可逆迁移，或注册调用方提供的反向定义。
+func dropRegistration(fileName, object, down string) string {
+	if down == "" {
+		return fmt.Sprintf("\tmigration.AddIrreversible(%q, up, %q)", fileName,
+			fmt.Sprintf("fill in the %s recreation for %s manually", object, fileName))
+	}
+	return fmt.Sprintf("\tdown := func(db *gorm.DB) error {\n%s\t}\n\n\tmigration.Add(%q, up, down)", down, fileName)
 }
 
-func parseMigrationName(arg, explicitTable string) (action, objectName, tableName, columnName string, err error) {
+type migrationName struct {
+	action       string
+	objectName   string
+	tableName    string
+	columnName   string
+	newTableName string
+}
+
+func parseMigrationName(arg, explicitTable string) (migrationName, error) {
 	action, rest, found := strings.Cut(arg, "_")
 	if !found {
-		return "", "", "", "", fmt.Errorf("invalid migration name: %s", arg)
+		return migrationName{}, fmt.Errorf("invalid migration name: %s", arg)
 	}
 
 	switch action {
-	case "add", "drop", "update", "create", "modify":
+	case "add", "drop", "update", "create", "modify", "rename":
 	default:
-		return "", "", "", "", fmt.Errorf("invalid action: %s (expected: add, drop, update, create, modify)", action)
+		return migrationName{}, fmt.Errorf("invalid action: %s (expected: add, drop, update, create, modify, rename)", action)
 	}
 
 	// rest 形如 <body>_table，先剥掉固定后缀.
 	body, found := strings.CutSuffix(rest, "_table")
 	if !found {
-		return "", "", "", "", fmt.Errorf("invalid migration suffix in %s (expected: *_table)", arg)
+		return migrationName{}, fmt.Errorf("invalid migration suffix in %s (expected: *_table)", arg)
 	}
 
+	parsed := migrationName{action: action}
 	switch action {
 	case "add":
 		target, table, err := cutSeparator(body, "_to_", arg, explicitTable)
 		if err != nil {
-			return "", "", "", "", err
+			return migrationName{}, err
 		}
-		tableName = table
+		parsed.tableName = table
 		switch {
 		case strings.HasPrefix(target, "unique_index_"):
 			// 与 add_index_* 表达同一件事，不提供第二种写法；报错指引而非静默当成列名.
-			return "", "", "", "", fmt.Errorf(
+			return migrationName{}, fmt.Errorf(
 				"invalid add migration name: %s (use add_index_<column>_to_<table>_table with --unique for a unique index)", arg)
 		case strings.HasPrefix(target, "index_"):
-			columnName = strings.TrimPrefix(target, "index_")
-			objectName = "index"
+			parsed.columnName = strings.TrimPrefix(target, "index_")
+			parsed.objectName = "index"
 		default:
-			columnName = target
-			objectName = "column"
+			parsed.columnName = target
+			parsed.objectName = "column"
 		}
-		if columnName == "" {
-			return "", "", "", "", fmt.Errorf("could not parse column name from: %s", arg)
+		if parsed.columnName == "" {
+			return migrationName{}, fmt.Errorf("could not parse column name from: %s", arg)
 		}
 	case "drop":
 		if !strings.Contains(body, "_from_") {
-			tableName = body
-			objectName = "table"
+			parsed.tableName = body
+			parsed.objectName = "table"
 			break
 		}
 		target, table, err := cutSeparator(body, "_from_", arg, explicitTable)
 		if err != nil {
-			return "", "", "", "", err
+			return migrationName{}, err
 		}
-		tableName = table
+		parsed.tableName = table
 		switch {
 		case strings.HasPrefix(target, "index_"):
-			columnName = strings.TrimPrefix(target, "index_")
-			objectName = "index"
+			parsed.columnName = strings.TrimPrefix(target, "index_")
+			parsed.objectName = "index"
 		case strings.HasPrefix(target, "column_"):
-			columnName = strings.TrimPrefix(target, "column_")
-			objectName = "column"
+			parsed.columnName = strings.TrimPrefix(target, "column_")
+			parsed.objectName = "column"
 		default:
-			return "", "", "", "", fmt.Errorf("invalid drop migration name: %s (expected drop_column_* or drop_index_*)", arg)
+			return migrationName{}, fmt.Errorf("invalid drop migration name: %s (expected drop_column_* or drop_index_*)", arg)
 		}
 	case "modify":
 		column, table, err := cutSeparator(body, "_of_", arg, explicitTable)
 		if err != nil {
-			return "", "", "", "", err
+			return migrationName{}, err
 		}
-		columnName = column
-		tableName = table
-		objectName = "column"
+		parsed.columnName = column
+		parsed.tableName = table
+		parsed.objectName = "column"
 	case "create", "update":
-		tableName = body
-		objectName = "table"
+		parsed.tableName = body
+		parsed.objectName = "table"
+	case "rename":
+		source, destination, ok := strings.Cut(body, "_to_")
+		if !ok || strings.LastIndex(body, "_to_") != len(source) {
+			return migrationName{}, fmt.Errorf("rename migration name %s must contain one _to_ separator", arg)
+		}
+		if err := validateIdentifier("new table name", destination); err != nil {
+			return migrationName{}, fmt.Errorf("%s in %s", err, arg)
+		}
+		if source == destination {
+			return migrationName{}, fmt.Errorf("rename requires different table names in %s", arg)
+		}
+		parsed.tableName = source
+		parsed.newTableName = destination
+		parsed.objectName = "table"
 	}
 
-	if err := validateIdentifier("table name", tableName); err != nil {
-		return "", "", "", "", fmt.Errorf("%s in %s", err, arg)
+	if err := validateIdentifier("table name", parsed.tableName); err != nil {
+		return migrationName{}, fmt.Errorf("%s in %s", err, arg)
 	}
-	// create/update/drop table 没有列名；其余形态的列名此前已校验非空.
-	if columnName != "" {
-		if err := validateIdentifier("column name", columnName); err != nil {
-			return "", "", "", "", fmt.Errorf("%s in %s", err, arg)
+	if parsed.columnName != "" {
+		if err := validateIdentifier("column name", parsed.columnName); err != nil {
+			return migrationName{}, fmt.Errorf("%s in %s", err, arg)
 		}
 	}
 
-	return action, objectName, tableName, columnName, nil
+	return parsed, nil
 }
 
 // cutSeparator 按 sep 把迁移名主体切成"目标 + 表名".
@@ -460,6 +522,8 @@ func migrationStubName(action, objectName string) string {
 	switch action {
 	case "create":
 		return "migration_create"
+	case "rename":
+		return "migration_rename"
 	case "add":
 		if objectName == "index" {
 			return "addindex"

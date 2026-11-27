@@ -1,13 +1,13 @@
 # migrate
 
-基于 GORM + Cobra 的 Go 数据库迁移工具，支持 MySQL、PostgreSQL、SQLite。
+基于 GORM + Cobra 的 Go 数据库迁移工具。官方支持与发版实库验收范围仅为 MySQL。
 
-> **方言说明**：迁移执行引擎（up/down/锁/记录表）完整支持三种数据库；`make migration` 生成的模板 SQL 当前为 **MySQL 语法**（反引号、`AFTER` 子句、`ALGORITHM`/`LOCK` 在线 DDL 子句），PostgreSQL/SQLite 项目生成后需按方言调整。`migrate lint` 的在线 DDL 规则仅对 MySQL 数据库生效。每个迁移的 Up/Down 与其账本记录在**同一事务**内执行，迁移函数里只能使用允许在事务块内运行的语句（PostgreSQL 的 `CREATE INDEX CONCURRENTLY` 等语句会因此报错）。
+`make migration` 的模板 SQL 使用 MySQL 语法。`migrate lint` 会检查 MySQL 的在线 DDL 策略。
 
 ## 特性
 
 - 迁移文件按时间戳排序，支持 up / down / reset / refresh / fresh
-- Advisory Lock 防止多实例并发迁移冲突（MySQL `GET_LOCK`、PostgreSQL `pg_advisory_lock`）
+- 使用 MySQL `GET_LOCK` 防止多实例并发迁移冲突
 - `pending` 命令预览待执行迁移（dry-run）
 - `lint` 命令检查 migration 文件、registry 和已执行记录漂移
 - 结构化日志接口，可注入 zap / zerolog 等
@@ -144,7 +144,7 @@ func setupMigrate(db *gorm.DB) {
 | `WithDDLDir` | `database/ddl` | DDL SQL 输出目录 |
 | `WithDDLModels` | 空 | 注册可用于 `make ddl` / `make ddl diff` 的模型 |
 | `WithTimeout` | `5m` | `migrate` 命令执行超时 |
-| `WithLockName` | MySQL 派生 / PostgreSQL `migrate_lock` | 分布式 advisory lock 名称。MySQL 缺省按 `migrate:<数据库名>:<账本表名>` 派生（超 64 字符截断并追加哈希），同一实例上不同库、不同账本表互不阻塞；显式锁名在 MySQL 上不得超过 64 字符，超长时迁移命令直接报错 |
+| `WithLockName` | 按库名和账本表名派生 | MySQL advisory lock 名称。默认按 `migrate:<数据库名>:<账本表名>` 派生（超 64 字符截断并追加哈希），同一实例上不同库、不同账本表互不阻塞。显式锁名不得超过 64 字符，超长时迁移命令直接报错 |
 | `WithLockTimeout` | `10s` | 获取迁移锁的最长等待时间 |
 | `WithMigrationsTable` | `migrations` | 迁移记录表名（多项目共库时各用独立表；仅字母/数字/下划线、≤63 字符，空白或非法值 `Setup` 直接报错） |
 | `WithAllowFresh` | 禁用 | 显式授权 `fresh`（删库内全部表）；仅本项目独占数据库时才应开启 |
@@ -212,6 +212,9 @@ myapp make migration create_users_table
 # 修改表
 myapp make migration update_users_table
 
+# 重命名表，自动生成正向和反向操作
+myapp make migration rename_users_to_accounts_table
+
 # 添加字段到表
 myapp make migration add_email_to_users_table
 
@@ -245,8 +248,9 @@ myapp make migration drop_index_email_from_users_table --columns email
 | 模式 | 示例 | 生成行为 |
 |------|------|----------|
 | `create_<table>_table` | `create_users_table` | 生成建表 migration（自包含快照 struct，基础字段 + `TODO`），并自动生成 model/repository |
-| `create_<table>_table --from-model` | `create_users_table --from-model` | 从 `WithDDLModels` 中表名为 `users` 的 model 反射生成快照 struct 的全部导出字段与 tag（匿名嵌入展平、`gorm:"-"` 跳过），不含 `TODO`，不生成脚手架；找不到匹配 model 时报错不落盘 |
+| `create_<table>_table --from-model` | `create_users_table --from-model` | 从 `WithDDLModels` 中匹配 `users` 的 model 生成快照，保留导出字段、GORM 标签和嵌入前缀。匹配失败时报错且不落盘 |
 | `update_<table>_table` | `update_users_table` | 生成 up/down 各一段 raw `ALTER TABLE` 骨架，`TODO` 待补全 |
+| `rename_<old>_to_<new>_table` | `rename_users_to_accounts_table` | 生成两次方向相反的 `RenameTable` 调用，固定旧表名和新表名 |
 | `add_<column>_to_<table>_table` | `add_email_to_users_table` | 生成 **raw SQL** 加列 migration，列类型/约束以 `TODO` 占位待补全 |
 | `add_<column>_to_<table>_table --type <T> [--not-null] [--default <expr>] [--comment <c>]` | `add_email_to_users_table --type 'VARCHAR(128)' --not-null --default "''" --comment '邮箱'` | 生成完整可执行的 `ADD COLUMN`，不含 `TODO`；`--not-null`/`--default`/`--comment` 必须与 `--type` 同时给出，否则报错 |
 | `add_<column>_to_<table>_table --after <col>` | `add_email_to_users_table --after phone` | 在 `ADD COLUMN` 后追加 `AFTER <col>` 子句（MySQL 列定位），可与 `--type` 组合 |
@@ -261,9 +265,9 @@ myapp make migration drop_index_email_from_users_table --columns email
 >
 > `modify_*` 与 `update_*` 是待补全骨架，**不预填**策略子句：`MODIFY COLUMN` 只有少数场景（如 VARCHAR 扩容）支持 `ALGORITHM=INPLACE`，缩短长度或跨类型转换都要求 `ALGORITHM=COPY`，预填一个多数情况下会报错的值比不填更糟。策略由你按实际变更决定，`migrate lint` 的 `missing_online_ddl` 会提醒。
 >
-> 表名、列名、索引名统一按标识符白名单校验（字母、数字、下划线，不以数字开头，不超过 64 字符），不合法时生成期直接报错、不落盘。以数字开头的表名虽然 MySQL 允许，但无法用于 `create` 的快照 struct 名，故一并拒绝；这类表请手写迁移。
+> 迁移 SQL、快照和存在性检查使用命令中指定的物理表名。表名、列名、索引名统一按标识符白名单校验（字母、数字、下划线，不以数字开头，不超过 64 字符），不合法时生成期直接报错、不落盘。以数字开头的表名虽然 MySQL 允许，但无法用于 `create` 的快照 struct 名，故一并拒绝；这类表请手写迁移。
 >
-> 迁移名里的 `_to_` / `_from_` / `_of_` 出现**多于一次**时无法判断哪一段是表名（列名可能自带分隔符如 `reply_to_id`，表名同样可能如 `order_to_shipment`），生成器直接报错，用 `--table <表名>` 显式指定即可：
+> 列或索引迁移名里的 `_to_` / `_from_` / `_of_` 出现**多于一次**时无法判断哪一段是表名（列名可能自带分隔符如 `reply_to_id`，表名同样可能如 `order_to_shipment`），生成器直接报错，用 `--table <表名>` 显式指定即可：
 >
 > ```bash
 > myapp make migration add_ref_to_order_to_shipment_table --table order_to_shipment
@@ -272,17 +276,22 @@ myapp make migration drop_index_email_from_users_table --columns email
 >
 > `--after` 仅对 `add_*` 模式生效，通过在 raw `ALTER TABLE ... ADD COLUMN` 后追加 `AFTER <col>` 实现。注意列的物理顺序在 MySQL 中仅影响展示，不影响功能。
 >
-> `--from-model` 只在生成时读取 model：生成后的迁移文件是唯一事实来源，之后 model 再变化也不会回写它。model 字段若使用了业务包内的自定义类型（如枚举 `models.Status`），快照会原样 import 该包并被 `migrate lint` 判为非自包含，此时把该字段改为基础类型（如 `int8`）即可。所有生成的 `.go` 文件都经过 gofmt。
+> `--from-model` 只在生成时读取 model：生成后的迁移文件是唯一事实来源，之后 model 再变化也不会回写它。model 字段若使用了业务包内的自定义类型（如枚举 `models.Status`），快照会原样 import 该包并被 `migrate lint` 判为非自包含，此时把该字段改为基础类型（如 `int8`）即可。无法从迁移包引用的字段类型会在写文件前报错。所有生成的 `.go` 文件都经过 gofmt。
 
 执行后会在 `database/migrations/` 下生成形如 `2026_03_17_120000_create_users_table.go` 的文件。
+
+新生成的 MySQL 建表、加列和加索引迁移会核对现有定义。对象缺失时执行创建，定义一致时保留对象并登记为已应用。定义不同、读取失败或无法确认一致时，迁移报错并保持待执行。登记后，回滚按迁移文件里的 Down 删除对应对象，包括原先已存在的对象。
+
+重命名命令使用两个不同的物理表名和一个 `_to_` 分隔符。生成的 Up 和 Down 可直接执行，目标表名已存在时会返回数据库错误。业务模型的 `TableName()` 由应用在切换到新表时更新。
 
 不同 action 使用不同的 migration 模板：
 
 | action | up 行为 | down 行为 |
 |--------|---------|-----------|
-| `create` | 快照 struct `CreateTable`（带存在性检查） | `DropTable` |
+| `create` | 快照 struct `CreateTable`，同名时返回数据库错误 | `DropTable` |
 | `update` | raw `ALTER TABLE` 骨架（TODO 待补全） | raw 反向 `ALTER` 骨架（TODO 待补全） |
-| `add`（列） | raw `ADD COLUMN`（带存在性检查；无 `--type` 时列定义为 TODO） | raw `DROP COLUMN`（带存在性检查） |
+| `rename` | 将旧表名改为新表名 | 将新表名改回旧表名 |
+| `add`（列） | raw `ADD COLUMN`，同名时返回数据库错误。无 `--type` 时列定义待补全 | raw `DROP COLUMN`（带存在性检查） |
 | `add_index` | raw `ADD INDEX`（带存在性检查） | raw `DROP INDEX`（带存在性检查） |
 | `modify` | raw `MODIFY COLUMN`（无 `--type` 时列定义为 TODO） | raw `MODIFY COLUMN` 骨架，旧定义为 TODO |
 | `drop`（表） | `DropTable`（带存在性检查） | 标记为不可逆，需人工补全 |
@@ -315,10 +324,6 @@ func (userV20260317120000) TableName() string { return "users" }
 
 func init() {
     up := func(db *gorm.DB) error {
-        // 幂等：表已存在则跳过（MySQL 半失败后重跑 up 可自愈）。
-        if db.Migrator().HasTable("users") {
-            return nil
-        }
         return db.Migrator().CreateTable(&userV20260317120000{})
     }
 
@@ -335,7 +340,7 @@ func init() {
 注意：
 
 - 生成器会尽量推断字段名和表名，但缩写字段如 `UserID`、`URL` 这类场景仍建议人工检查。
-- `drop column` / `drop index` / 某些 `update` migration 默认会用 `migration.Irreversible(...)` 显式提示“需要人工写 down”，这是有意为之，避免生产误回滚。
+- 未提供反向定义的删表、删列和删索引迁移通过 `migration.AddIrreversible(name, up, reason)` 注册。回滚命令在运行首个 `Down` 前检查整批，遇到这类声明会拒绝执行。若后来补齐反向逻辑，改用 `migration.Add(name, up, down)` 注册。
 
 ### 3.3 覆盖默认生成目录
 
@@ -402,9 +407,7 @@ myapp migrate fresh --force
 >
 > `fresh` 有双层保护：`--force` 只防误触命令；它还会删除库内**全部**用户表（含其他项目的表），默认禁用，必须在 `Setup` 时用 `WithAllowFresh()` 显式授权（仅限本项目独占的数据库），否则直接报错拒绝。
 >
-> `fresh` 的清理范围包含表与视图；**PostgreSQL 仅清理 `public` schema**，其他 schema 的对象不受影响（多 schema 项目需自行清理其余 schema）。
->
-> `down-to <version>` 的目标必须是真实已应用的版本；`mark-applied --to <version>` 的目标必须是已注册的迁移名；`RollbackSteps` 的步数必须为正数——否则直接报错，不会误回滚全部或标记错误范围。
+> `down-to <version>` 的目标必须是真实已应用的版本，先按版本筛选，然后按账本的实际应用顺序倒序执行。`mark-applied --to <version>` 的目标必须是已注册的迁移名；`RollbackSteps` 的步数必须为正数——否则直接报错，不会误回滚全部或标记错误范围。
 
 各命令语义：
 
@@ -415,11 +418,11 @@ myapp migrate fresh --force
 | `down` | 回滚最后一个 batch；`--step N` 改为回滚最新 N 条 | 测试 / 谨慎用于生产 |
 | `reset` | 从后往前回滚所有 migration | 测试环境 |
 | `refresh` | `reset` 后重新 `up` | 测试环境 |
-| `fresh` | 删除库里所有表与视图再跑 migration（需 `WithAllowFresh` 授权；PostgreSQL 仅清理 `public`） | 仅临时测试库 |
+| `fresh` | 删除库里所有用户表与视图再跑 migration（需 `WithAllowFresh` 授权） | 仅临时测试库 |
 | `status` | 查看 migration 是否执行、batch 与应用时间；只读，不加锁、不建账本表 | 所有环境 |
 | `lint` | 检查漂移、回滚风险、registry/file 不一致 | 所有环境，推荐 CI |
 
-`up`、`down`、`reset`、`refresh`、`fresh` 都受 `WithTimeout(...)` 控制：这个超时覆盖**整条命令**——等锁、每一个迁移的 DDL 执行与账本写入共用同一预算（默认 5 分钟）。超时触发时驱动会关闭连接中断正在执行的 DDL，MySQL 服务端会终止该语句，但客户端拿不到确定结果，需按下文「生产注意事项」人工核对。生产环境请按最长一次迁移的实际耗时设置 `WithTimeout`（大表 ALTER 建议放到 30 分钟以上，或拆成单独的迁移批次执行）。
+`up`、`down`、`reset`、`refresh`、`fresh` 都受 `WithTimeout(...)` 控制：这个超时覆盖**整条命令**——等锁、每一个迁移的 DDL 执行与账本写入共用同一预算（默认 5 分钟）。MySQL 在持有迁移锁的专属连接上运行迁移事务，使用 GORM `DropTable` 的旧回调可从连接池取得另一条连接。超时触发时驱动会关闭连接中断正在执行的 DDL，MySQL 服务端会终止该语句，但客户端拿不到确定结果，需按下文「生产注意事项」人工核对。生产环境请按最长一次迁移的实际耗时设置 `WithTimeout`（大表 ALTER 建议放到 30 分钟以上，或拆成单独的迁移批次执行）。
 
 #### 4.1 `migrate lint`
 
@@ -447,7 +450,7 @@ lint 当前会检查：
 - binary 已注册 migration，但磁盘文件不存在
 - migration 缺失 `up`
 - migration 缺失 `down`
-- migration 明确标记为 `Irreversible(...)`
+- migration 用 `AddIrreversible(...)` 声明不可逆，或在回调中返回 `Irreversible(...)`
 - 多个 migration 共享相同时间戳前缀
 - 数据库里已执行 migration，但源码/磁盘已经找不到
 - 迁移残留未补全的 `TODO` 占位（error）,`update_*` 与 `modify_*` 的骨架默认就带 `TODO`，补全后才能执行
@@ -725,10 +728,6 @@ func (UserV20260920120000) TableName() string {
 
 func init() {
 	up := func(db *gorm.DB) error {
-		// 幂等：表已存在则跳过（MySQL DDL 已提交但记录未写的半失败状态下，重跑 up 可自愈）。
-		if db.Migrator().HasTable("users") {
-			return nil
-		}
 		return db.Migrator().CreateTable(&UserV20260920120000{})
 	}
 
@@ -743,7 +742,7 @@ func init() {
 要点：
 
 - 快照 struct 是 model **此刻**的复制品，之后 model 再改也不会回写这个文件。表结构变更一律新建迁移。
-- 反射规则：只取导出字段；匿名嵌入的 struct（如自定义 `BaseModel`、`gorm.Model`）展平成一级字段；`gorm:"-"` 跳过；tag 原样保留；`[]byte` 按惯例渲染。实现了 `driver.Valuer` 的匿名嵌入（如 `gorm.DeletedAt`）视为单列不展平。
+- 快照复制导出字段及其标签，跳过 `gorm:"-"`。没有 GORM 标签的普通匿名嵌入会展开。带 `embedded` 或 `embeddedPrefix` 等标签的内嵌结构会内联到快照，保留嵌入选项。时间类型和实现了 `driver.Valuer` 的匿名字段按单列保留。
 - 迁移名里的 `<table>` 必须与 model 的实际表名一致（`TableName()` 或命名策略得出的），否则报错并列出已注册的表名，不落盘。
 - model 字段若用了业务包内的自定义类型（如 `models.Status` 枚举），快照会 import 该包，`migrate lint` 会以 `non_self_contained` 报 error。把该字段改为底层基础类型（如 `int8`）即可。
 - 不带 `--from-model` 时生成基础字段 + `TODO` 占位，并同时生成 model/repository 脚手架，适合从零开始一个新实体。
@@ -814,16 +813,17 @@ myapp make migration add_index_email_to_users_table --index-name uk_users_email
 ```go
 func init() {
 	up := func(db *gorm.DB) error {
-		// 幂等：索引已存在则跳过，重复执行无副作用。
-		if db.Migrator().HasIndex("users", "idx_users_email") {
-			return nil
+		exists, err := migration.MySQLIndexMatches(db, "users", "idx_users_email", false, "email")
+		if err != nil || exists {
+			return err
 		}
 		return db.Exec("ALTER TABLE `users` ADD INDEX `idx_users_email` (`email`), ALGORITHM=INPLACE, LOCK=NONE").Error
 	}
 
 	down := func(db *gorm.DB) error {
-		if !db.Migrator().HasIndex("users", "idx_users_email") {
-			return nil
+		exists, err := migration.MySQLIndexMatches(db, "users", "idx_users_email", false, "email")
+		if err != nil || !exists {
+			return err
 		}
 		return db.Exec("ALTER TABLE `users` DROP INDEX `idx_users_email`, ALGORITHM=INPLACE, LOCK=NONE").Error
 	}
@@ -836,7 +836,7 @@ func init() {
 
 - 默认索引名 `idx_<表>_<列...>` 与 GORM 的默认命名策略一致：从 model tag 建表产出的索引名和这里对得上，`--index-name` 可覆盖。索引名超过 64 字符时生成期直接报错。
 - up 与 down 都默认标注 `ALGORITHM=INPLACE, LOCK=NONE`。`LOCK=NONE` 的意义是：MySQL 若无法在不阻塞写入的前提下建这个索引，会**直接报错**而不是悄悄锁表。生产上这是更安全的默认；确实需要接受锁表时，改生成的 SQL 即可。
-- 加索引天然可逆，`down` 是真正的 `DROP INDEX`，不像删索引/删表那样标记为 `Irreversible`。
+- 加索引会核对同名索引的唯一性、列顺序、前缀、排序方向和索引方式。定义一致时可继续登记半成功的迁移。账本无法记录索引来源，后续 `down` 会删除这个等价索引。定义不同会报错，账本保持原样。
 - `--unique` 建唯一索引；表中已有重复值时 `up` 会失败，这是预期行为，先清理数据再执行。
 - 写错形态会直接报错而不是生成错东西：`add_unique_index_*` 提示改用 `--unique`；给加列迁移传 `--unique`、给加索引迁移传 `--type` 都会报错。
 
@@ -916,7 +916,7 @@ myapp migrate mark-applied --to 2026_09_20_120000_create_users_table --force
 ```
 
 - 回滚前先 `status` 看清批次与应用时间。回滚遇到 `Irreversible`、registry 里找不到的记录、重复注册名时整体拒绝，不会回滚一半。
-- MySQL 的 DDL 隐式提交：迁移中途失败留下"结构已变、记录未写"时，先人工核对真实表结构。生成模板的 up 都带存在性检查，单条 DDL 的迁移直接重跑 `up` 即可自愈；多条 DDL 的迁移手工补齐或回退后再重跑。
+- MySQL 的 DDL 隐式提交：迁移中途失败留下"结构已变、记录未写"时，新生成的建表、加列和加索引迁移可在确认定义一致后登记。复杂或多步迁移仍需人工核对完整结果，再用 `mark-applied` 显式登记，或回退已完成的 DDL 后重跑。
 - `up` 日志的 `migrated ... duration=` 字段是大表 DDL 耗时的第一手数据，`WithTimeout` 按它来定。
 - 程序化调用时用 `errors.Is` 区分 `migration.ErrLockNotAcquired`（另一实例在迁移，可重试）、`ErrRegistryDrift`（账本与 binary 不一致，需人工介入）、`ErrNoMigrations`（漏 import 迁移包）、`ErrDuplicateRegistration`（两个包注册了同名迁移）。
 
@@ -937,10 +937,10 @@ myapp migrate lint --strict
 myapp make ddl diff --all
 ```
 
-如果 CI 有真实数据库，再额外加：
+如果 CI 配置了 MySQL 测试库，再运行实库用例：
 
 ```bash
-go test -tags=integration ./migration -run 'TestMigrator(MySQL|Postgres)Integration'
+GOWORK=off MIGRATE_TEST_REQUIRE_DATABASES=1 go test -tags=integration -race -count=1 ./migration -run '^Test(Migrator)?MySQL'
 ```
 
 ### 8. 命令输出示例
@@ -982,16 +982,16 @@ Summary: 0 error(s), 1 warning(s)
 
 ## 生产注意事项：MySQL 迁移的原子性与故障恢复
 
-MySQL 的 `CREATE TABLE`/`ALTER TABLE` 等 DDL 会**隐式提交、无法回滚**（PostgreSQL、SQLite 支持事务型 DDL，本工具会把 DDL 与迁移记录放同一事务、失败整体回滚；MySQL 属其固有限制）。这带来两点必须知晓的行为，本工具**不会也无法**替 MySQL 消除：
+每个迁移在同一事务块内执行回调和账本操作。MySQL 的 `CREATE TABLE`、`ALTER TABLE` 等 DDL 会隐式提交。
 
 - **迁移不是原子的**：一个迁移里若有多条 DDL，执行到中途失败时，前面的 DDL 已经提交、留下「半张表」；DDL 提交后、写迁移记录前若进程崩溃或超时，也会出现「结构已变更但记录未写」。
-- **故障需人工恢复**：出现上述情况时，请**先人工核对真实表结构**，再决定：把该迁移手工补完（并用 `mark-applied` 将其记入），或把已生效的 DDL 手工回退后重跑。工具不会自动修复半成品。生成模板的 up 都带存在性检查（`create` 查 `HasTable`，`add` 查 `HasColumn`，`drop_*` 查目标是否存在），单条 DDL 的迁移在「DDL 已提交、记录未写」后直接重跑 `up` 即可自愈。
+- **多条 DDL 部分提交时需人工恢复**：先核对真实表结构，再决定手工补完迁移并用 `mark-applied` 登记，或回退已生效的 DDL 后重跑。生成的建表、加列和加索引模板仅在定义一致时登记已存在的对象。后续回滚按迁移文件里的 Down 处理已登记对象。
 
 - **应用回滚窗口**：`up`/`status`/`pending` 默认对"已应用但当前 binary 未注册"的迁移记录 fail-closed 报错——新版本已写入账本后回滚到旧版本 binary，旧 binary 的 `up` 会失败。若服务在启动期调用 `Up`，请在 `Setup` 时加 `WithAllowUnknownApplied()`：旧 binary 对每条未知记录记 Warn 后继续执行自己已注册的迁移；`mark-applied` 与所有回滚命令不受该选项影响，仍严格拒绝。
 
 降低风险的实践：
 
-- **一个迁移只做一件事**，MySQL 迁移尽量写成**单条、幂等**的 DDL（生成模板已带 `HasColumn`/`HasTable` 存在性检查）。
+- **一个迁移只做一件事**，MySQL 迁移尽量写成单条 DDL，便于确认失败时数据库已经执行到哪一步。
 - 大表结构变更走 gh-ost / pt-online-schema-change，或在 raw SQL 里标注 `ALGORITHM`/`LOCK`（`migrate lint` 会对缺失项告警）。
 - 发布前先 `migrate lint` + `migrate pending` 人工确认；破坏性命令（`down`/`down-to`/`reset`/`refresh`/`fresh`）已强制 `--force`，核心生产建议在组装 CLI 时干脆不注册它们。
 
@@ -999,25 +999,18 @@ MySQL 的 `CREATE TABLE`/`ALTER TABLE` 等 DDL 会**隐式提交、无法回滚*
 
 ## 集成测试
 
-MySQL/Postgres 集成测试默认不参与普通 `go test`，需要显式指定 `integration` build tag 和数据库 DSN：
+v2 发版实库门禁默认要求 `MIGRATE_TEST_MYSQL_DSN`。缺少测试库或 MySQL 用例被跳过时，门禁失败。使用 `INTEGRATION=off` 可显式跳过实库门禁。
 
 ```bash
 export MIGRATE_TEST_MYSQL_DSN='user:pass@tcp(127.0.0.1:3306)/migrate_test?parseTime=true'
-export MIGRATE_TEST_POSTGRES_DSN='host=127.0.0.1 user=postgres password=postgres dbname=migrate_test sslmode=disable'
-
-go test -tags=integration ./migration -run 'TestMigratorMySQL|TestMigratorPostgres'
+GOWORK=off MIGRATE_TEST_REQUIRE_DATABASES=1 go test -tags=integration -race -count=1 ./migration -run '^Test(Migrator)?MySQL'
 ```
 
-MySQL 侧覆盖：端到端迁移/回滚、`GET_LOCK` 竞争与超时（`TestMigratorMySQLLockContention`）、`fresh` 删表的外键检查同连接处理（`TestMigratorMySQLForeignKeyChecksRestored`）。
+实库用例覆盖端到端迁移与回滚、`GET_LOCK` 竞争与超时（`TestMigratorMySQLLockContention`），以及 `fresh` 成功或删表中途失败时在同一 MySQL 会话恢复 `foreign_key_checks` 原值（`TestMigratorMySQLForeignKeyChecksRestored`，覆盖初始开启和关闭）。
+
+`fresh` 用例还会验证删表连接断开或恢复语句被 MySQL 拒绝后，故障会话从服务端退出，且连接池补充新会话。
 
 为了降低误操作风险，测试默认要求数据库名包含 `test`；如果你确实要对其他库运行，请显式设置 `MIGRATE_TEST_ALLOW_ANY_DB=1`。
-
-如果你只想跑单个数据库：
-
-```bash
-go test -tags=integration ./migration -run 'TestMigratorMySQL'
-go test -tags=integration ./migration -run TestMigratorPostgresIntegration
-```
 
 ## 自定义日志
 
@@ -1034,6 +1027,25 @@ type Logger interface {
 ```
 
 签名兼容 `zap.SugaredLogger` 的 key-value 风格。
+
+### 接入 gtkit/logger
+
+执行器在每条 `Up` 或 `Down` 开始时记录迁移名和批次，事务返回后记录成功或失败和耗时。只需在应用入口通过 `WithLogger` 注入适配器，生成的回调可以直接返回执行错误。
+
+```go
+import gtkitlog "github.com/gtkit/logger/v2"
+
+type migrationLogger struct {
+    logger *gtkitlog.Logger
+}
+
+func (l migrationLogger) Info(msg string, kv ...any)  { l.logger.Infow(msg, kv...) }
+func (l migrationLogger) Warn(msg string, kv ...any)  { l.logger.Warnw(msg, kv...) }
+func (l migrationLogger) Error(msg string, kv ...any) { l.logger.Errorw(msg, kv...) }
+
+// 在应用初始化日志后，使用已配置的 appLogger。
+err := migrate.Setup(db, migrate.WithLogger(migrationLogger{logger: appLogger}))
+```
 
 ### 接入 zap
 
@@ -1116,6 +1128,8 @@ migrate.Setup(db,
 - **跨项目外键 / 共享表需要串行化**：独立锁名意味着两个项目可以并发执行各自的 DDL。若项目间存在跨项目外键或共享表，请给相关项目配置**相同的** `WithLockName`，用同一把锁把迁移串行化。
 
 ## 编程式调用
+
+历史 `Down` 回调返回 `ErrIrreversible` 时会停止执行。此前已成功撤销的迁移会保留各自的结果。新迁移可在注册时调用 `AddIrreversible`，在整批回滚开始前拒绝执行。
 
 除了 CLI 命令，也可以在代码中直接调用 Migrator：
 

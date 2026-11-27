@@ -1,19 +1,30 @@
 package migrations
 
 import (
-	"{{ProjectName}}/internal/models"
-	"gorm.io/gorm"
+	"time"
 
 	"github.com/gtkit/migrate/migration"
+	"gorm.io/gorm"
 )
 
 func init() {
 	up := func(db *gorm.DB) error {
-		return db.Migrator().CreateTable(&models.{{StructName}}{})
+		// 在首次应用前补齐字段，固定这次建表的结构。
+		type snapshot struct {
+			ID        int64          `gorm:"column:id;primaryKey;autoIncrement;comment:主键编码"`
+			CreatedAt time.Time      `gorm:"column:created_at;type:datetime;index;comment:创建时间"`
+			UpdatedAt time.Time      `gorm:"column:updated_at;type:datetime;index;comment:最后更新时间"`
+			DeletedAt gorm.DeletedAt `gorm:"column:deleted_at;type:datetime;index;comment:删除时间"`
+		}
+		exists, err := migration.MySQLTableMatches(db, "{{TableName}}", &snapshot{})
+		if err != nil || exists {
+			return err
+		}
+		return db.Table("{{TableName}}").Migrator().CreateTable(&snapshot{})
 	}
 
 	down := func(db *gorm.DB) error {
-		return db.Migrator().DropTable(&models.{{StructName}}{})
+		return db.Migrator().DropTable("{{TableName}}")
 	}
 
 	migration.Add("{{FileName}}", up, down)

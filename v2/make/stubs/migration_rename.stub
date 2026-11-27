@@ -1,0 +1,19 @@
+package migrations
+
+import (
+	"gorm.io/gorm"
+
+	"github.com/gtkit/migrate/v2/migration"
+)
+
+func init() {
+	up := func(db *gorm.DB) error {
+		return db.Migrator().RenameTable("{{TableName}}", "{{NewTableName}}")
+	}
+
+	down := func(db *gorm.DB) error {
+		return db.Migrator().RenameTable("{{NewTableName}}", "{{TableName}}")
+	}
+
+	migration.Add("{{FileName}}", up, down)
+}

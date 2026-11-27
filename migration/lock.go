@@ -2,6 +2,8 @@ package migration
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"hash/fnv"
 	"time"
@@ -52,35 +54,34 @@ type mysqlLock struct {
 }
 
 func (l *mysqlLock) Acquire(ctx context.Context) (func(), error) {
-	// GET_LOCK 的超时参数以秒为单位，至少为 1 秒.
-	timeoutSec := max(1, int(l.timeout.Seconds()))
-
-	// 通过 Begin 拿到专属连接，确保获取锁和释放锁在同一连接上
-	session := l.db.WithContext(ctx).Session(&gorm.Session{PrepareStmt: false})
-	tx := session.Begin()
-	if tx.Error != nil {
-		return nil, fmt.Errorf("begin lock session: %w", tx.Error)
+	wait, cancel := context.WithTimeout(ctx, l.timeout)
+	defer cancel()
+	conn, err := reserveMigrationConn(wait, l.db)
+	if err != nil {
+		return nil, err
 	}
-
-	var result int
-	if err := tx.Raw("SELECT GET_LOCK(?, ?)", l.lockName, timeoutSec).Scan(&result).Error; err != nil {
-		tx.Rollback()
+	var result sql.NullInt64
+	if err := conn.QueryRowContext(wait, "SELECT GET_LOCK(?, ?)", l.lockName, l.timeout.Seconds()).Scan(&result); err != nil {
+		discardMigrationConn(conn)
 		return nil, fmt.Errorf("acquire mysql lock %q: %w", l.lockName, err)
 	}
-	if result != 1 {
-		tx.Rollback()
-		return nil, fmt.Errorf("failed to acquire mysql advisory lock %q (timeout %ds)", l.lockName, timeoutSec)
+	if !result.Valid || result.Int64 != 1 {
+		_ = conn.Close()
+		return nil, fmt.Errorf("mysql advisory lock %q was not acquired", l.lockName)
 	}
-
-	release := func() {
-		_ = tx.Exec("SELECT RELEASE_LOCK(?)", l.lockName).Error
-		tx.Rollback() // 释放连接回连接池
-	}
-	return release, nil
+	return func() {
+		release, cancel := context.WithTimeout(context.Background(), defaultLockTimeout)
+		defer cancel()
+		var unlocked sql.NullInt64
+		if err := conn.QueryRowContext(release, "SELECT RELEASE_LOCK(?)", l.lockName).Scan(&unlocked); err != nil || !unlocked.Valid || unlocked.Int64 != 1 {
+			discardMigrationConn(conn)
+			return
+		}
+		_ = conn.Close()
+	}, nil
 }
 
-// postgresLock 使用 PostgreSQL pg_advisory_lock 实现的迁移锁.
-// 重要：pg_advisory_lock 绑定到连接，必须使用同一个连接获取和释放.
+// postgresLock 用独立事务持有 PostgreSQL advisory lock，事务结束时释放.
 type postgresLock struct {
 	db      *gorm.DB
 	lockKey int64
@@ -88,30 +89,52 @@ type postgresLock struct {
 }
 
 func (l *postgresLock) Acquire(ctx context.Context) (func(), error) {
-	// 通过 Begin 拿到专属连接
-	tx := l.db.WithContext(ctx).Begin()
-	if tx.Error != nil {
-		return nil, fmt.Errorf("begin lock session: %w", tx.Error)
+	wait, cancel := context.WithTimeout(ctx, l.timeout)
+	defer cancel()
+	conn, err := reserveMigrationConn(wait, l.db)
+	if err != nil {
+		return nil, err
 	}
-
-	// pg_advisory_lock 不受 lock_timeout 约束，用 statement_timeout 给这次获取锁的语句加超时，
-	// 避免另一个实例正在执行长迁移时本实例无限阻塞. SET LOCAL 仅作用于当前事务连接.
-	timeoutMS := max(int64(1), l.timeout.Milliseconds())
-	if err := tx.Exec(fmt.Sprintf("SET LOCAL statement_timeout = %d", timeoutMS)).Error; err != nil {
-		tx.Rollback()
-		return nil, fmt.Errorf("set postgres lock statement_timeout: %w", err)
+	// 锁的生命周期由 release 控制，即使业务被取消也保持互斥直到退出。
+	if _, err := conn.ExecContext(wait, "BEGIN"); err != nil {
+		discardMigrationConn(conn)
+		return nil, fmt.Errorf("begin postgres lock transaction: %w", err)
 	}
-
-	if err := tx.Exec("SELECT pg_advisory_lock(?)", l.lockKey).Error; err != nil {
-		tx.Rollback()
-		return nil, fmt.Errorf("acquire postgres lock (key=%d, timeout %dms): %w", l.lockKey, timeoutMS, err)
-	}
-
 	release := func() {
-		_ = tx.Exec("SELECT pg_advisory_unlock(?)", l.lockKey).Error
-		tx.Rollback() // 释放连接回连接池
+		cleanup, cancel := context.WithTimeout(context.Background(), defaultLockTimeout)
+		defer cancel()
+		if _, err := conn.ExecContext(cleanup, "ROLLBACK"); err != nil {
+			discardMigrationConn(conn)
+			return
+		}
+		_ = conn.Close()
+	}
+	if _, err := conn.ExecContext(wait, fmt.Sprintf("SET LOCAL statement_timeout = %d", max(int64(1), l.timeout.Milliseconds()))); err != nil {
+		release()
+		return nil, fmt.Errorf("set postgres lock timeout: %w", err)
+	}
+	if _, err := conn.ExecContext(wait, "SELECT pg_advisory_xact_lock($1)", l.lockKey); err != nil {
+		release()
+		return nil, fmt.Errorf("acquire postgres migration lock: %w", err)
 	}
 	return release, nil
+}
+
+func reserveMigrationConn(ctx context.Context, db *gorm.DB) (*sql.Conn, error) {
+	pool, err := db.DB()
+	if err != nil {
+		return nil, fmt.Errorf("get migration connection pool: %w", err)
+	}
+	conn, err := pool.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reserve migration connection: %w", err)
+	}
+	return conn, nil
+}
+
+func discardMigrationConn(conn *sql.Conn) {
+	_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+	_ = conn.Close()
 }
 
 // noopLock 空锁实现，用于不支持 advisory lock 的数据库.

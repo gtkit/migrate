@@ -15,10 +15,6 @@ func init() {
 		return db.Migrator().DropTable("{{TableName}}")
 	}
 
-	down := func(db *gorm.DB) error {
-		// 删表无法自动回滚：如需回滚，请对照删除当时的表结构补全建表逻辑。
-		return migration.Irreversible("fill in the table recreation for {{FileName}} manually")
-	}
-
-	migration.Add("{{FileName}}", up, down)
+	// 如需回滚，补全重建逻辑后用 migration.Add 注册。
+	migration.AddIrreversible("{{FileName}}", up, "fill in the table recreation for {{FileName}} manually")
 }

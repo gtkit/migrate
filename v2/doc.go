@@ -1,6 +1,6 @@
 // Package migrate 提供基于 GORM + Cobra 的数据库迁移工具，
-// 以 Laravel 风格的命令组织迁移的创建、执行、回滚与检查，
-// 支持 MySQL、PostgreSQL、SQLite（代码生成模板当前为 MySQL 语法）.
+// 以 Laravel 风格的命令组织迁移的创建、执行、回滚与检查。
+// 官方支持与发版实库验收范围仅为 MySQL。
 //
 // 使用前必须调用 Setup 注入数据库连接与配置，然后把 CmdMigrate、
 // make.CmdMake 挂载到应用的 Cobra 根命令：
@@ -18,10 +18,9 @@
 // `_ "yourapp/database/migrations"` 空导入）.
 //
 // 破坏性命令双层保护：down/reset/refresh/fresh 运行时必须加 --force；
-// fresh 会删除库内全部用户表与视图（PostgreSQL 仅 public schema），
+// fresh 会删除 MySQL 库内全部用户表与视图，
 // 额外要求 Setup 时经 WithAllowFresh 显式授权（仅限本项目独占的数据库），
 // 否则直接拒绝执行.
 //
-// 并发安全：多实例同时执行迁移时通过数据库 advisory lock 串行化
-// （MySQL GET_LOCK / PostgreSQL pg_advisory_lock；SQLite 无锁，仅限单进程）.
+// 多实例通过 MySQL GET_LOCK 串行执行迁移。
 package migrate

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,7 +45,11 @@ func writeMigrationFile(t *testing.T, dir, name, content string) {
 }
 
 func TestMigratorUpAndRollback(t *testing.T) {
-	db := openExecTestDB(t, "migrator_up_rollback")
+	testMigratorUpAndRollback(t, openExecTestDB(t, "migrator_up_rollback"), "")
+}
+
+func testMigratorUpAndRollback(t *testing.T, db *gorm.DB, lockName string) {
+	t.Helper()
 	dir := t.TempDir()
 
 	file := "2026_03_24_120000_create_exec_test_users_table"
@@ -57,7 +62,7 @@ func TestMigratorUpAndRollback(t *testing.T) {
 		return tx.Migrator().DropTable(&execTestUser{})
 	})
 
-	m := NewMigrator(dir, db, WithRegistry(registry), WithLockTimeout(2*time.Second))
+	m := NewMigrator(dir, db, WithRegistry(registry), WithLockName(lockName), WithLockTimeout(2*time.Second))
 
 	if err := m.Up(t.Context()); err != nil {
 		t.Fatalf("up: %v", err)
@@ -149,5 +154,146 @@ func TestMigratorUpRollsBackOnPanic(t *testing.T) {
 
 	if db.Migrator().HasTable(&execTestUser{}) {
 		t.Fatalf("expected table creation to be rolled back on panic")
+	}
+}
+
+func TestDestructiveReplayPreflight(t *testing.T) {
+	const applied = "2026_03_24_120000_create_exec_test_users_table"
+	const pending = "2026_03_24_120001_pending"
+	for _, command := range []string{"fresh", "refresh"} {
+		for _, condition := range []string{"missing-directory", "empty-directory", "unregistered-file", "nil-up", "valid"} {
+			t.Run(command+"/"+condition, func(t *testing.T) {
+				db := openExecTestDB(t, "preflight_"+command+condition)
+				dir := t.TempDir()
+				calls := 0
+				registry := NewRegistry()
+				registry.Add(applied, func(tx *gorm.DB) error {
+					return tx.Migrator().CreateTable(&execTestUser{})
+				}, func(tx *gorm.DB) error {
+					calls++
+					return tx.Migrator().DropTable(&execTestUser{})
+				})
+				writeMigrationFile(t, dir, applied, "package migrations\n")
+				m := NewMigrator(dir, db, WithRegistry(registry))
+				if err := m.Up(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Create(&execTestUser{Name: "keep"}).Error; err != nil {
+					t.Fatal(err)
+				}
+				switch condition {
+				case "missing-directory":
+					m.Folder = filepath.Join(dir, "missing")
+				case "empty-directory":
+					m.Folder = t.TempDir()
+				case "unregistered-file":
+					writeMigrationFile(t, dir, pending, "package migrations\n")
+				case "nil-up":
+					writeMigrationFile(t, dir, pending, "package migrations\n")
+					registry.Add(pending, nil, nil)
+				}
+				run := m.Fresh
+				if command == "refresh" {
+					run = m.Refresh
+				}
+				err := run(t.Context())
+				if (err == nil) != (condition == "valid") {
+					t.Fatalf("replay: %v", err)
+				}
+				var rows int64
+				if err := db.Model(&execTestUser{}).Count(&rows).Error; err != nil {
+					t.Fatal(err)
+				}
+				if condition == "valid" && rows != 0 {
+					t.Fatalf("expected rebuilt table to be empty, found %d rows", rows)
+				}
+				if condition != "valid" && (rows != 1 || calls != 0) {
+					t.Fatalf("invalid replay changed business rows or called Down: rows=%d calls=%d", rows, calls)
+				}
+				if err := db.Model(&Migration{}).Count(&rows).Error; err != nil || rows != 1 {
+					t.Fatalf("expected one ledger row: count=%d err=%v", rows, err)
+				}
+			})
+		}
+	}
+}
+
+func TestRollbackPreflightsWholeSelection(t *testing.T) {
+	db := openExecTestDB(t, "rollback_preflight")
+	dir := t.TempDir()
+	registry := NewRegistry()
+	calls := 0
+	for i, name := range []string{"2026_03_24_120000_old", "2026_03_24_120001_new"} {
+		writeMigrationFile(t, dir, name, "package migrations\n")
+		var down MigrateFunc
+		if i == 1 {
+			down = func(*gorm.DB) error { calls++; return nil }
+		}
+		registry.Add(name, func(*gorm.DB) error { return nil }, down)
+	}
+	m := NewMigrator(dir, db, WithRegistry(registry))
+	if err := m.Up(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RollbackSteps(t.Context(), -1); err == nil {
+		t.Fatal("expected negative step error")
+	}
+	if err := m.RollbackSteps(t.Context(), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Rollback(t.Context()); err == nil {
+		t.Fatal("expected missing Down error")
+	}
+	var rows int64
+	if err := db.Model(&Migration{}).Count(&rows).Error; err != nil || rows != 2 || calls != 0 {
+		t.Fatalf("rollback changed ledger or invoked Down: count=%d calls=%d err=%v", rows, calls, err)
+	}
+}
+
+type lifecycleLog struct {
+	NopLogger
+	success []string
+	failed  []string
+}
+
+func (l *lifecycleLog) Info(msg string, fields ...any) {
+	if msg == "migrated" || msg == "rolled back" {
+		l.success = append(l.success, msg+" "+formatKV(fields))
+	}
+}
+
+func (l *lifecycleLog) Error(msg string, fields ...any) {
+	l.failed = append(l.failed, msg+" "+formatKV(fields))
+}
+
+func TestMigratorLogsTransactionOutcome(t *testing.T) {
+	db := openExecTestDB(t, "lifecycle_log")
+	dir := t.TempDir()
+	const name = "2026_03_24_120000_log_outcome"
+	writeMigrationFile(t, dir, name, "package migrations\n")
+	registry := NewRegistry()
+	downErr := errors.New("failed to revert")
+	registry.Add(name, func(*gorm.DB) error { return nil }, func(*gorm.DB) error { return downErr })
+	logger := &lifecycleLog{}
+	m := NewMigrator(dir, db, WithRegistry(registry), WithLogger(logger))
+	if err := m.Up(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Rollback(t.Context()); !errors.Is(err, downErr) {
+		t.Fatalf("expected callback failure, got %v", err)
+	}
+	if len(logger.success) != 1 || !strings.HasPrefix(logger.success[0], "migrated file="+name+" batch=1 duration=") {
+		t.Fatalf("unexpected success events: %v", logger.success)
+	}
+	if len(logger.failed) != 1 || !strings.HasPrefix(logger.failed[0], "rollback failed file="+name+" batch=1 duration=") ||
+		!strings.Contains(logger.failed[0], "failed to revert") {
+		t.Fatalf("unexpected failure events: %v", logger.failed)
+	}
+	downErr = nil
+	if err := m.Rollback(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(logger.success) != 2 || !strings.HasPrefix(logger.success[1], "rolled back file="+name+" batch=1 duration=") {
+		t.Fatalf("unexpected rollback success events: %v", logger.success)
 	}
 }

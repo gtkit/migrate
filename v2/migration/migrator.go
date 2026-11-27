@@ -2,6 +2,7 @@ package migration
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"regexp"
@@ -18,16 +19,17 @@ import (
 // 构造后写入不影响迁移执行——迁移、记录读写与加锁始终以 NewMigrator
 // 传入的值为唯一真实来源，避免"旧库持锁、新库跑迁移"的分裂.
 type Migrator struct {
-	Folder      string
-	DB          *gorm.DB
-	folder      string   // 迁移目录唯一真实来源
-	db          *gorm.DB // 数据库唯一真实来源，与 dbType、lock 构造期绑定
-	dbType      DBType
-	lock        migrationLock
-	lockName    string
-	lockTimeout time.Duration
-	tableName   string
-	allowFresh  bool // Fresh 删全库表，必须经 WithAllowFresh 显式授权
+	Folder        string
+	DB            *gorm.DB
+	folder        string    // 迁移目录唯一真实来源
+	db            *gorm.DB  // 数据库唯一真实来源，与 dbType、lock 构造期绑定
+	executionConn *sql.Conn // 只在持有 MySQL 会话锁的本次调用副本中设置
+	dbType        DBType
+	lock          migrationLock
+	lockName      string
+	lockTimeout   time.Duration
+	tableName     string
+	allowFresh    bool // Fresh 删全库表，必须经 WithAllowFresh 显式授权
 	// 容忍"已应用但当前 binary 未注册"的记录（应用回滚窗口），必须经 WithAllowUnknownApplied 显式授权
 	allowUnknownApplied bool
 	configErr           error // 构造期配置错误（如非法表名），所有执行入口 fail-closed 返回
@@ -189,7 +191,7 @@ func (m *Migrator) Setup(ctx context.Context) error {
 	if m.db == nil {
 		return errDBRequired
 	}
-	db := m.db.WithContext(ctx)
+	db := m.executionDB(ctx)
 	if db.Migrator().HasTable(m.tableName) {
 		return nil
 	}
@@ -206,7 +208,7 @@ func (m *Migrator) Setup(ctx context.Context) error {
 // records 返回绑定迁移记录表与上下文的查询入口.
 // 所有迁移记录的读写统一经此走配置表名，避免散落的默认表名查询.
 func (m *Migrator) records(ctx context.Context) *gorm.DB {
-	return m.db.WithContext(ctx).Table(m.tableName)
+	return m.executionDB(ctx).Table(m.tableName)
 }
 
 // Up 执行所有未迁移的文件.
@@ -216,7 +218,7 @@ func (m *Migrator) Up(ctx context.Context) error {
 	}
 
 	// 获取迁移锁
-	release, err := m.acquireLock(ctx)
+	m, release, err := m.acquireExecution(ctx)
 	if err != nil {
 		return err
 	}
@@ -252,7 +254,7 @@ func (m *Migrator) Rollback(ctx context.Context) error {
 		return err
 	}
 
-	release, err := m.acquireLock(ctx)
+	m, release, err := m.acquireExecution(ctx)
 	if err != nil {
 		return err
 	}
@@ -291,7 +293,7 @@ func (m *Migrator) RollbackSteps(ctx context.Context, steps int) error {
 		return err
 	}
 
-	release, err := m.acquireLock(ctx)
+	m, release, err := m.acquireExecution(ctx)
 	if err != nil {
 		return err
 	}
@@ -314,7 +316,7 @@ func (m *Migrator) Reset(ctx context.Context) error {
 		return err
 	}
 
-	release, err := m.acquireLock(ctx)
+	m, release, err := m.acquireExecution(ctx)
 	if err != nil {
 		return err
 	}
@@ -344,7 +346,7 @@ func (m *Migrator) Refresh(ctx context.Context) error {
 		return err
 	}
 
-	release, err := m.acquireLock(ctx)
+	m, release, err := m.acquireExecution(ctx)
 	if err != nil {
 		return err
 	}
@@ -388,14 +390,14 @@ func (m *Migrator) Fresh(ctx context.Context) error {
 		return err
 	}
 
-	release, err := m.acquireLock(ctx)
+	m, release, err := m.acquireExecution(ctx)
 	if err != nil {
 		return err
 	}
 	defer release()
 
 	// 携带 ctx：删表 DDL 与库名查询同样受外部取消/超时约束.
-	dbname := CurrentDatabase(m.db.WithContext(ctx))
+	dbname := CurrentDatabase(m.executionDB(ctx))
 	m.logger.Warn("dropping all tables", "database", dbname)
 
 	if err := DeleteAllTables(m.db.WithContext(ctx)); err != nil {
@@ -491,7 +493,7 @@ func (m *Migrator) MarkApplied(ctx context.Context, toFile string) ([]string, er
 		return nil, err
 	}
 
-	release, err := m.acquireLock(ctx)
+	m, release, err := m.acquireExecution(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -534,7 +536,7 @@ func (m *Migrator) MarkApplied(ctx context.Context, toFile string) ([]string, er
 	}
 
 	// 同一事务写入所有 baseline 记录，全成或全败，不留部分标记.
-	if err := m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	if err := m.executionDB(ctx).Transaction(func(tx *gorm.DB) error {
 		for _, name := range toMark {
 			if err := tx.Table(m.tableName).Create(&Migration{Migration: name, Batch: batch}).Error; err != nil {
 				return fmt.Errorf("mark %s applied: %w", name, err)
@@ -551,11 +553,14 @@ func (m *Migrator) MarkApplied(ctx context.Context, toFile string) ([]string, er
 // RollbackTo 回滚所有版本高于 targetFile 的已应用迁移（不含 targetFile 本身）.
 // targetFile 为空时等价于 Reset（回滚全部）.
 func (m *Migrator) RollbackTo(ctx context.Context, targetFile string) error {
+	if targetFile == "" {
+		return m.Reset(ctx)
+	}
 	if err := m.Setup(ctx); err != nil {
 		return err
 	}
 
-	release, err := m.acquireLock(ctx)
+	m, release, err := m.acquireExecution(ctx)
 	if err != nil {
 		return err
 	}
@@ -563,25 +568,17 @@ func (m *Migrator) RollbackTo(ctx context.Context, targetFile string) error {
 
 	// targetFile 非空时必须是真实已应用版本，否则（如传 "0" 或早于首个版本的字符串）
 	// 会命中"全部已应用"而误回滚全部.
-	if targetFile != "" {
-		var count int64
-		if err := m.records(ctx).
-			Where("migration = ?", targetFile).Count(&count).Error; err != nil {
-			return fmt.Errorf("check target migration: %w", err)
-		}
-		if count == 0 {
-			return fmt.Errorf("target migration %q is not an applied migration", targetFile)
-		}
+	var count int64
+	if err := m.records(ctx).
+		Where("migration = ?", targetFile).Count(&count).Error; err != nil {
+		return fmt.Errorf("check target migration: %w", err)
 	}
-
-	// 按迁移文件名（版本）倒序回滚，保证后应用的先回滚.
-	query := m.records(ctx).Order("migration DESC")
-	if targetFile != "" {
-		query = query.Where("migration > ?", targetFile)
+	if count == 0 {
+		return fmt.Errorf("target migration %q is not an applied migration", targetFile)
 	}
 
 	var migrations []Migration
-	if err := query.Find(&migrations).Error; err != nil {
+	if err := m.records(ctx).Where("migration > ?", targetFile).Order("id DESC").Find(&migrations).Error; err != nil {
 		return fmt.Errorf("get migrations to rollback: %w", err)
 	}
 
@@ -590,18 +587,39 @@ func (m *Migrator) RollbackTo(ctx context.Context, targetFile string) error {
 
 // --- 内部方法 ---
 
-// acquireLock 校验连接池容量后获取迁移锁.
-// 任何持锁方法都应经此获取：锁会占用一条连接，后续操作还需另一条，
-// MaxOpenConns=1（非 SQLite）时会阻塞到超时，故先快速拒绝.
-func (m *Migrator) acquireLock(ctx context.Context) (func(), error) {
+// executionDB 只在 MySQL 持锁调用内绑定专属连接，保留原连接池供旧回调使用。
+func (m *Migrator) executionDB(ctx context.Context) *gorm.DB {
+	db := m.db.WithContext(ctx)
+	if m.executionConn != nil {
+		db.Statement.ConnPool = m.executionConn
+	}
+	return db
+}
+
+func (m *Migrator) acquireExecution(ctx context.Context) (*Migrator, func(), error) {
 	if err := m.ensureConcurrentConns(); err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	// 调用方已提供事务时，继续使用该事务，避免把迁移移到事务之外。
+	lock, mysql := m.lock.(*mysqlLock)
+	var callerTransaction bool
+	if m.db.Statement != nil {
+		_, callerTransaction = m.db.Statement.ConnPool.(gorm.TxCommitter)
+	}
+	if mysql && !callerTransaction {
+		conn, release, err := lock.acquireConn(ctx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("acquire migration lock: %w", err)
+		}
+		execution := *m
+		execution.executionConn = conn
+		return &execution, release, nil
 	}
 	release, err := m.lock.Acquire(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("acquire migration lock: %w", err)
+		return nil, nil, fmt.Errorf("acquire migration lock: %w", err)
 	}
-	return release, nil
+	return m, release, nil
 }
 
 // ensureConcurrentConns 确保连接池允许并发连接.
@@ -655,10 +673,10 @@ func (m *Migrator) upWithoutLock(ctx context.Context) error {
 		m.logger.Info("migrating", "file", mfile.FileName, "batch", batch)
 		start := time.Now()
 		if err := m.runUpMigration(ctx, mfile, batch); err != nil {
-			m.logger.Error("migration failed", "file", mfile.FileName, "error", err)
+			m.logger.Error("migration failed", "file", mfile.FileName, "batch", batch, "duration", time.Since(start).Round(time.Millisecond), "error", err)
 			return fmt.Errorf("migration %s failed: %w", mfile.FileName, err)
 		}
-		m.logger.Info("migrated", "file", mfile.FileName, "duration", time.Since(start).Round(time.Millisecond))
+		m.logger.Info("migrated", "file", mfile.FileName, "batch", batch, "duration", time.Since(start).Round(time.Millisecond))
 		ran = true
 	}
 
@@ -687,7 +705,7 @@ func (m *Migrator) runUpMigration(ctx context.Context, mfile MigrationFile, batc
 		}
 	}()
 
-	return m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return m.executionDB(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := mfile.Up(tx); err != nil {
 			return fmt.Errorf("execute up: %w", err)
 		}
@@ -717,6 +735,9 @@ func (m *Migrator) rollbackMigrations(ctx context.Context, migrations []Migratio
 		if !ok {
 			return fmt.Errorf("%w: rollback aborted, migration %q not found in registry", ErrRegistryDrift, record.Migration)
 		}
+		if reason, ok := m.registry.irreversibleReason(record.Migration); ok {
+			return fmt.Errorf("rollback aborted for %q: %w", record.Migration, Irreversible(reason))
+		}
 		if mfile.Down == nil {
 			return fmt.Errorf("rollback aborted: migration %q has no down function", record.Migration)
 		}
@@ -728,10 +749,10 @@ func (m *Migrator) rollbackMigrations(ctx context.Context, migrations []Migratio
 		m.logger.Info("rolling back", "file", record.Migration, "batch", record.Batch)
 		start := time.Now()
 		if err := m.runDownMigration(ctx, mfile, record); err != nil {
-			m.logger.Error("rollback failed", "file", record.Migration, "error", err)
+			m.logger.Error("rollback failed", "file", record.Migration, "batch", record.Batch, "duration", time.Since(start).Round(time.Millisecond), "error", err)
 			return err
 		}
-		m.logger.Info("rolled back", "file", record.Migration, "duration", time.Since(start).Round(time.Millisecond))
+		m.logger.Info("rolled back", "file", record.Migration, "batch", record.Batch, "duration", time.Since(start).Round(time.Millisecond))
 	}
 
 	return nil
@@ -746,7 +767,7 @@ func (m *Migrator) runDownMigration(ctx context.Context, mfile MigrationFile, re
 		}
 	}()
 
-	return m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return m.executionDB(ctx).Transaction(func(tx *gorm.DB) error {
 		// fail-closed：无 Down 函数不能删记录，否则表还在、记录没了=账本损坏.
 		// "不可回滚"应显式用 Irreversible（非 nil、返回 error）表达.
 		if mfile.Down == nil {
@@ -783,27 +804,23 @@ func (m *Migrator) getMigratedMap(ctx context.Context) (map[string]Migration, er
 	if err := m.records(ctx).Find(&migrations).Error; err != nil {
 		return nil, err
 	}
+	return migrationMap(migrations), nil
+}
 
+func migrationMap(migrations []Migration) map[string]Migration {
 	result := make(map[string]Migration, len(migrations))
 	for _, mg := range migrations {
 		result[mg.Migration] = mg
 	}
-	return result, nil
+	return result
 }
 
-// readMigratedMap 只读地获取已执行记录：不创建账本表，表不存在时返回空映射.
-// 供 Status/Pending/IsUpToDate 等诊断入口使用，使它们能在只读账号或新库上运行.
 func (m *Migrator) readMigratedMap(ctx context.Context) (map[string]Migration, error) {
-	if m.configErr != nil {
-		return nil, m.configErr
+	records, err := m.readLedger(ctx)
+	if err != nil {
+		return nil, err
 	}
-	if m.db == nil {
-		return nil, errDBRequired
-	}
-	if !m.db.WithContext(ctx).Migrator().HasTable(m.tableName) {
-		return map[string]Migration{}, nil
-	}
-	return m.getMigratedMap(ctx)
+	return migrationMap(records), nil
 }
 
 // registeredFiles 返回编译期 registry 中的全部迁移，按文件名（时间戳前缀）升序.

@@ -1,8 +1,11 @@
 package migration
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1054,8 +1057,9 @@ func TestMigratorRollbackRecoversFromDownPanic(t *testing.T) {
 // captureLogger 记录 Info/Warn 调用，用于断言日志可观测性（容忍未知记录的 Warn、迁移耗时字段）.
 type captureLogger struct {
 	NopLogger
-	infos []string
-	warns []string
+	infos  []string
+	warns  []string
+	errors []string
 }
 
 func (l *captureLogger) Info(msg string, keysAndValues ...any) {
@@ -1064,6 +1068,10 @@ func (l *captureLogger) Info(msg string, keysAndValues ...any) {
 
 func (l *captureLogger) Warn(msg string, keysAndValues ...any) {
 	l.warns = append(l.warns, msg+" "+formatKV(keysAndValues))
+}
+
+func (l *captureLogger) Error(msg string, keysAndValues ...any) {
+	l.errors = append(l.errors, msg+" "+formatKV(keysAndValues))
 }
 
 // TestMigratorAllowUnknownAppliedTolerates 验证 WithAllowUnknownApplied 的作用边界：
@@ -1229,17 +1237,31 @@ func TestMigratorDiagnosticsAreReadOnly(t *testing.T) {
 func TestMigratorLogsDuration(t *testing.T) {
 	db := openExecTestDB(t, "logs_duration")
 	registry := NewRegistry()
-	registry.Add("2026_03_24_120000_a", func(*gorm.DB) error { return nil }, func(*gorm.DB) error { return nil })
+	downErr := errors.New("failed to revert")
+	registry.Add("2026_03_24_120000_a", func(*gorm.DB) error { return nil }, func(*gorm.DB) error { return downErr })
 	logger := &captureLogger{}
 	m := NewMigrator(t.TempDir(), db, WithRegistry(registry), WithLogger(logger))
 
 	if err := m.Up(t.Context()); err != nil {
 		t.Fatalf("up: %v", err)
 	}
+	if err := m.Rollback(t.Context()); !errors.Is(err, downErr) {
+		t.Fatalf("expected callback failure, got %v", err)
+	}
+	for _, line := range logger.infos {
+		if strings.HasPrefix(line, "rolled back ") {
+			t.Fatalf("failed Down was logged as successful: %s", line)
+		}
+	}
+	if len(logger.errors) != 1 || !strings.Contains(logger.errors[0], "batch=1 duration=") ||
+		!strings.Contains(logger.errors[0], "failed to revert") {
+		t.Fatalf("expected contextual failure log, got %q", logger.errors)
+	}
+	downErr = nil
 	if err := m.Rollback(t.Context()); err != nil {
 		t.Fatalf("rollback: %v", err)
 	}
-	durationLine := regexp.MustCompile(`^(migrated|rolled back) file=2026_03_24_120000_a duration=\d+(\.\d+)?[a-zµ]+$`)
+	durationLine := regexp.MustCompile(`^(migrated|rolled back) file=2026_03_24_120000_a batch=1 duration=\d+(\.\d+)?[a-zµ]+$`)
 	matched := 0
 	for _, line := range logger.infos {
 		if durationLine.MatchString(line) {
@@ -1368,5 +1390,125 @@ func TestMigratorRejectsLongMySQLLockName(t *testing.T) {
 	sqlite := openExecTestDB(t, "long_lock_sqlite")
 	if m := NewMigrator(t.TempDir(), sqlite, WithRegistry(registry), WithLockName(strings.Repeat("x", 100))); m.configErr != nil {
 		t.Fatalf("lock name length limit is MySQL-only, got %v", m.configErr)
+	}
+}
+
+func TestLedgerDiagnosticsReportReadFailures(t *testing.T) {
+	const name = "2026_03_24_120000_create_users_table"
+	for _, state := range []string{"canceled", "closed", "invalid-ledger"} {
+		t.Run(state, func(t *testing.T) {
+			db := openExecTestDB(t, "ledger_read_"+state)
+			dir := t.TempDir()
+			writeMigrationFile(t, dir, name, "package migrations\n")
+			registry := NewRegistry()
+			registry.Add(name, func(*gorm.DB) error { return nil }, func(*gorm.DB) error { return nil })
+			m := NewMigrator(dir, db, WithRegistry(registry))
+			ctx := t.Context()
+			switch state {
+			case "canceled":
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			case "closed":
+				pool, err := db.DB()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := pool.Close(); err != nil {
+					t.Fatal(err)
+				}
+			case "invalid-ledger":
+				if err := db.Exec("CREATE TABLE migrations (id INTEGER PRIMARY KEY)").Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, pendingErr := m.Pending(ctx)
+			_, statusErr := m.Status(ctx)
+			_, latestErr := m.IsUpToDate(ctx)
+			_, lintErr := m.Lint(ctx, LintOptions{})
+			for i, err := range []error{pendingErr, statusErr, latestErr, lintErr} {
+				if err == nil || (state == "canceled" && !errors.Is(err, context.Canceled)) {
+					t.Errorf("diagnostic %d returned unexpected error: %v", i, err)
+				}
+			}
+			if _, err := m.Lint(ctx, LintOptions{SkipDatabase: true}); err != nil {
+				t.Errorf("offline lint failed: %v", err)
+			}
+		})
+	}
+}
+
+func TestRollbackToReversesActualApplicationOrder(t *testing.T) {
+	const (
+		a = "2026_03_24_120000_a"
+		b = "2026_03_24_120001_b"
+		c = "2026_03_24_120002_c"
+	)
+	for _, target := range []string{"", a} {
+		t.Run(target, func(t *testing.T) {
+			db := openExecTestDB(t, "rollback_order_"+target)
+			registry := NewRegistry()
+			var calls []string
+			add := func(name string) {
+				registry.Add(name, func(*gorm.DB) error { return nil }, func(*gorm.DB) error {
+					calls = append(calls, name)
+					return nil
+				})
+			}
+			add(a)
+			add(c)
+			m := NewMigrator(t.TempDir(), db, WithRegistry(registry))
+			if err := m.Up(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			add(b)
+			if err := m.Up(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.RollbackTo(t.Context(), target); err != nil {
+				t.Fatal(err)
+			}
+			want := []string{b, c}
+			if target == "" {
+				want = append(want, a)
+			}
+			if !slices.Equal(calls, want) {
+				t.Fatalf("Down order = %v, want %v", calls, want)
+			}
+		})
+	}
+}
+
+func TestDeclaredIrreversiblePreflightsWholeRollback(t *testing.T) {
+	const old = "2026_03_24_120000_no_down"
+	const newer = "2026_03_24_120001_new"
+	for _, declared := range []bool{true, false} {
+		t.Run(fmt.Sprint(declared), func(t *testing.T) {
+			db := openExecTestDB(t, "irreversible_"+fmt.Sprint(declared))
+			registry := NewRegistry()
+			up := func(*gorm.DB) error { return nil }
+			if declared {
+				registry.AddIrreversible(old, up, "requires manual restore")
+			} else {
+				registry.Add(old, up, func(*gorm.DB) error { return Irreversible("requires manual restore") })
+			}
+			calls := 0
+			registry.Add(newer, up, func(*gorm.DB) error { calls++; return nil })
+			m := NewMigrator(t.TempDir(), db, WithRegistry(registry))
+			if err := m.Up(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.Rollback(t.Context()); !errors.Is(err, ErrIrreversible) {
+				t.Fatalf("expected ErrIrreversible, got %v", err)
+			}
+			want := 1
+			if declared {
+				want = 0
+			}
+			var count int64
+			if err := db.Model(&Migration{}).Count(&count).Error; err != nil || calls != want || count != int64(2-want) {
+				t.Fatalf("Down calls=%d ledger=%d err=%v", calls, count, err)
+			}
+		})
 	}
 }

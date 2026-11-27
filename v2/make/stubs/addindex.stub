@@ -8,16 +8,17 @@ import (
 
 func init() {
 	up := func(db *gorm.DB) error {
-		// 幂等：索引已存在则跳过，重复执行无副作用。
-		if db.Migrator().HasIndex("{{TableName}}", "{{IndexName}}") {
-			return nil
+		exists, err := {{IndexMatch}}
+		if err != nil || exists {
+			return err
 		}
 		return db.Exec({{AddIndexSQL}}).Error
 	}
 
 	down := func(db *gorm.DB) error {
-		if !db.Migrator().HasIndex("{{TableName}}", "{{IndexName}}") {
-			return nil
+		exists, err := {{IndexMatch}}
+		if err != nil || !exists {
+			return err
 		}
 		return db.Exec({{DropIndexSQL}}).Error
 	}

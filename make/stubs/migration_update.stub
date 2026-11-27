@@ -1,20 +1,22 @@
 package migrations
 
 import (
-	"{{ProjectName}}/internal/models"
-	"gorm.io/gorm"
+	"errors"
 
 	"github.com/gtkit/migrate/migration"
+	"gorm.io/gorm"
 )
 
 func init() {
 	up := func(db *gorm.DB) error {
-		return db.AutoMigrate(&models.{{StructName}}{})
+		// 填写对 {{TableName}} 的显式 DDL。
+		const statement = ""
+		if statement == "" {
+			return errors.New("fill in the schema change for {{TableName}}")
+		}
+		return db.Exec(statement).Error
 	}
 
-	down := func(db *gorm.DB) error {
-		return migration.Irreversible("fill in the down migration for {{FileName}} manually")
-	}
-
-	migration.Add("{{FileName}}", up, down)
+	// 补齐并验证反向 SQL 后，在此注册 Down。
+	migration.Add("{{FileName}}", up, nil)
 }

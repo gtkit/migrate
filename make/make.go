@@ -4,6 +4,10 @@ package make
 import (
 	"embed"
 	"fmt"
+	"go/format"
+	"maps"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/gtkit/migrate/console"
@@ -86,7 +90,7 @@ func createFileFromStub(filePath, stubName string, model Model, variables ...any
 	replaces := make(map[string]string)
 	if len(variables) > 0 {
 		if m, ok := variables[0].(map[string]string); ok {
-			replaces = m
+			maps.Copy(replaces, m)
 		}
 	}
 
@@ -104,8 +108,6 @@ func createFileFromStub(filePath, stubName string, model Model, variables ...any
 		console.Exit(err.Error())
 	}
 
-	modelStub := string(modelData)
-
 	// 默认替换变量
 	replaces["{{VariableName}}"] = model.VariableName
 	replaces["{{VariableNamePlural}}"] = model.VariableNamePlural
@@ -117,11 +119,20 @@ func createFileFromStub(filePath, stubName string, model Model, variables ...any
 	replaces["{{ProjectName}}"] = model.ProjectName
 	replaces["{{ColumnName}}"] = model.ColumnName
 
-	for search, replace := range replaces {
-		modelStub = strings.ReplaceAll(modelStub, search, replace)
+	pairs := make([]string, 0, 2*len(replaces))
+	for name, value := range replaces {
+		pairs = append(pairs, name, value)
 	}
-
-	if err := file.Put([]byte(modelStub), filePath); err != nil {
+	data, err := format.Source([]byte(strings.NewReplacer(pairs...).Replace(string(modelData))))
+	if err != nil {
+		console.Exit(fmt.Sprintf("format generated %s: %v", filePath, err))
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
+		console.Exit(fmt.Sprintf("create directory for %s: %v", filePath, err))
+		return
+	}
+	if err := file.Put(data, filePath); err != nil {
 		console.Exit(err.Error())
 	}
 
